@@ -1,0 +1,82 @@
+{
+  "post_id": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
+  "title": "99. Co-design with Pinar Guvenc",
+  "link": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
+  "published_parsed": "2025-04-08T08:39:00+00:00",
+  "html_body": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people...",
+  "audio_url": "https://www.machine-ethics.net/site/assets/files/1573/pinar-guvenc-machine-ethics-podcast.mp3",
+  "image_url": "https://www.machine-ethics.net/site/assets/files/1572/pinar-illustration.1400x1400.jpg",
+  "authors_list": [
+    "Ben Byford with Pinar Guvenc"
+  ],
+  "tags": [],
+  "source_name": "Machine Ethics Podcast",
+  "raw_entry": {
+    "itunes_episodetype": "full",
+    "itunes_title": "Co-design with Pinar Guvenc",
+    "title": "99. Co-design with Pinar Guvenc",
+    "title_detail": {
+      "type": "text/plain",
+      "language": null,
+      "base": "https://www.machine-ethics.net/itunes-rss-feed/",
+      "value": "99. Co-design with Pinar Guvenc"
+    },
+    "links": [
+      {
+        "rel": "alternate",
+        "type": "text/html",
+        "href": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/"
+      },
+      {
+        "length": "71301583",
+        "type": "audio/mp3",
+        "href": "https://www.machine-ethics.net/site/assets/files/1573/pinar-guvenc-machine-ethics-podcast.mp3",
+        "rel": "enclosure"
+      }
+    ],
+    "link": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
+    "itunes_episode": "99",
+    "authors": [
+      {
+        "name": "Ben Byford with Pinar Guvenc"
+      }
+    ],
+    "author": "Ben Byford with Pinar Guvenc",
+    "author_detail": {
+      "name": "Ben Byford with Pinar Guvenc"
+    },
+    "subtitle": "Ninety Ninth episode of Machine Ethics podcast with Pinar Guvenc",
+    "subtitle_detail": {
+      "type": "text/plain",
+      "language": null,
+      "base": "https://www.machine-ethics.net/itunes-rss-feed/",
+      "value": "Ninety Ninth episode of Machine Ethics podcast with Pinar Guvenc"
+    },
+    "summary": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people...",
+    "summary_detail": {
+      "type": "text/html",
+      "language": null,
+      "base": "https://www.machine-ethics.net/itunes-rss-feed/",
+      "value": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people..."
+    },
+    "published": "Tue, 08 Apr 2025 09:39:00 +0100",
+    "published_parsed": [
+      2025,
+      4,
+      8,
+      8,
+      39,
+      0,
+      1,
+      98,
+      0
+    ],
+    "image": {
+      "href": "https://www.machine-ethics.net/site/assets/files/1572/pinar-illustration.1400x1400.jpg"
+    },
+    "itunes_duration": "49:27",
+    "id": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
+    "guidislink": false,
+    "itunes_explicit": null
+  }
+}

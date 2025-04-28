@@ -1,0 +1,78 @@
+{
+  "post_id": "https://futureoflife.org/?post_type=podcast&p=134511",
+  "title": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)",
+  "link": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/",
+  "published_parsed": "2025-04-25T11:55:20+00:00",
+  "html_body": "",
+  "audio_url": null,
+  "image_url": null,
+  "authors_list": [
+    "Support"
+  ],
+  "tags": [
+    "AI"
+  ],
+  "source_name": "FLI Podcast",
+  "raw_entry": {
+    "title": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)",
+    "title_detail": {
+      "type": "text/plain",
+      "language": null,
+      "base": "https://futureoflife.org/podcast/feed/",
+      "value": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)"
+    },
+    "links": [
+      {
+        "rel": "alternate",
+        "type": "text/html",
+        "href": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/"
+      }
+    ],
+    "link": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/",
+    "authors": [
+      {
+        "name": "Support"
+      }
+    ],
+    "author": "Support",
+    "author_detail": {
+      "name": "Support"
+    },
+    "published": "Fri, 25 Apr 2025 11:55:20 +0000",
+    "published_parsed": [
+      2025,
+      4,
+      25,
+      11,
+      55,
+      20,
+      4,
+      115,
+      0
+    ],
+    "tags": [
+      {
+        "term": "AI",
+        "scheme": null,
+        "label": null
+      }
+    ],
+    "id": "https://futureoflife.org/?post_type=podcast&p=134511",
+    "guidislink": false,
+    "summary": "",
+    "summary_detail": {
+      "type": "text/html",
+      "language": null,
+      "base": "https://futureoflife.org/podcast/feed/",
+      "value": ""
+    },
+    "content": [
+      {
+        "type": "text/html",
+        "language": null,
+        "base": "https://futureoflife.org/podcast/feed/",
+        "value": ""
+      }
+    ]
+  }
+}
