@@ -120,3 +120,18 @@ cython_debug/
 
 # PyPI config file
 .pypirc
+
+# Google Cloud Keys
+google_cloud_keys.json
+
+# Output files
+parsed_tweets_raw_graphql.json
+parsed_tweets_raw.json
+
+# Ignore all files in the output directory
+output/*
+episode_samples/*
+temp_audio/*
+
+twitter_state.json
+

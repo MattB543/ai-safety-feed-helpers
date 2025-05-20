@@ -1,10 +1,10 @@
 {
-  "post_id": "6805a3794c1756d49cb8dc88",
-  "title": "How DOGE is Using AI in Government",
-  "link": "https://shows.acast.com/tech-tank/episodes/how-doge-is-using-ai-in-government",
-  "published_parsed": "2025-04-21T09:00:00+00:00",
-  "html_body": "There is talk of “unleashing AI” and removing burdensome regulations on its use within the new Trump administration. Staff members associated with the Department of Government Efficiency are using AI to analyze agency operations, gaining extraordinary access to government data. In this episode, co-host Darrell West speaks with Professor Allison Stanger on how DOGE is using AI in government and the risks presented by its access to government information.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>",
-  "audio_url": "https://sphinx.acast.com/p/open/s/5f2827aa17f940498f691817/e/6805a3794c1756d49cb8dc88/media.mp3",
+  "post_id": "682b24aaee813e8be2f7d66e",
+  "title": "What experts and the public think about AI",
+  "link": "https://shows.acast.com/tech-tank/episodes/what-experts-and-the-public-think-about-ai",
+  "published_parsed": "2025-05-19T12:31:38+00:00",
+  "html_body": "&nbsp;A recent report from Pew Research Center analyzed how U.S. adults and tech experts feel about AI, finding areas where the two groups were widely apart and where there was consensus. In this episode, co-host Nicol Turner lee speaks with author of the study Monica Anderson from Pew about these opinions on AI and where these groups want to see more policies.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>",
+  "audio_url": "https://sphinx.acast.com/p/open/s/5f2827aa17f940498f691817/e/682b24aaee813e8be2f7d66e/media.mp3",
   "image_url": "https://assets.pippa.io/shows/undefined/1596466876834-2fde16f63b158b50ccdd1353dea99205.jpeg",
   "authors_list": [
     "TechTank Podcast"
@@ -12,60 +12,60 @@
   "tags": [],
   "source_name": "TechTank Podcast",
   "raw_entry": {
-    "title": "How DOGE is Using AI in Government",
+    "title": "What experts and the public think about AI",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://feeds.acast.com/public/shows/5f2827aa17f940498f691817",
-      "value": "How DOGE is Using AI in Government"
+      "value": "What experts and the public think about AI"
     },
-    "itunes_title": "How DOGE is Using AI in Government",
-    "published": "Mon, 21 Apr 2025 09:00:00 GMT",
+    "itunes_title": "What experts and the public think about AI",
+    "published": "Mon, 19 May 2025 12:31:38 GMT",
     "published_parsed": [
       2025,
-      4,
-      21,
-      9,
+      5,
+      19,
+      12,
+      31,
+      38,
       0,
-      0,
-      0,
-      111,
+      139,
       0
     ],
-    "itunes_duration": "26:51",
+    "itunes_duration": "26:29",
     "links": [
       {
-        "length": "38694430",
+        "length": "38176554",
         "type": "audio/mpeg",
-        "href": "https://sphinx.acast.com/p/open/s/5f2827aa17f940498f691817/e/6805a3794c1756d49cb8dc88/media.mp3",
+        "href": "https://sphinx.acast.com/p/open/s/5f2827aa17f940498f691817/e/682b24aaee813e8be2f7d66e/media.mp3",
         "rel": "enclosure"
       },
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://shows.acast.com/tech-tank/episodes/how-doge-is-using-ai-in-government"
+        "href": "https://shows.acast.com/tech-tank/episodes/what-experts-and-the-public-think-about-ai"
       }
     ],
-    "id": "6805a3794c1756d49cb8dc88",
+    "id": "682b24aaee813e8be2f7d66e",
     "guidislink": false,
     "itunes_explicit": null,
-    "link": "https://shows.acast.com/tech-tank/episodes/how-doge-is-using-ai-in-government",
-    "acast_episodeid": "6805a3794c1756d49cb8dc88",
+    "link": "https://shows.acast.com/tech-tank/episodes/what-experts-and-the-public-think-about-ai",
+    "acast_episodeid": "682b24aaee813e8be2f7d66e",
     "acast_showid": "5f2827aa17f940498f691817",
-    "acast_episodeurl": "how-doge-is-using-ai-in-government",
-    "acast_settings": "FYjHyZbXWHZ7gmX8Pp1rmbKbhgrQiwYShz70Q9/ffXZMTtedvdcRQbP4eiLMjXzCKLPjEYLpGj+NMVKa+5C8pL4u/EOj1Vw4h5MMJYp0lCcFAe0fnxBJy/1ju4Qxy1fh8gO4DvlGA40yms2g0/hOkcrfHIopjTygHFqGwwOPKFIai4SuTvs86Lx3UYCyl6ZsChkUIJgJEQ3GQ28/wxtDbsPv/v/uRvjW53FVZjNZttL8R7yAyz/Re1f3jEKoof0dr1c7xvpBz6Uuc0ksDITwutLxNhf+FPpsbAzne61urRaHFFS6eXfTQYxxRcAHxTR5",
+    "acast_episodeurl": "what-experts-and-the-public-think-about-ai",
+    "acast_settings": "FYjHyZbXWHZ7gmX8Pp1rmbKbhgrQiwYShz70Q9/ffXZMTtedvdcRQbP4eiLMjXzCKLPjEYLpGj+NMVKa+5C8pL4u/EOj1Vw4h5MMJYp0lCcd/6Zr+cVfcRaf343nFFLv6o1eR1KsWb19Dsx2a9RKIOm4Np6QyW3Mq3s23GjV/RoTt8QPjzjT9r8DbDHcRJxIPOUSSn9PXzM2KpcziqSWjAZEd+GNHTn1C9tkBMjSwCpTbdOCCvUv7c09Hh/L0xagLcGD+J5d8jyinMqZY+baB1ja6QX9F4LVFP297zuGFvlcTRgcme3eQKvYYG871YH6jD1roeQ09An+yR75t3T/7g==",
     "itunes_episodetype": "full",
     "itunes_season": "5",
-    "itunes_episode": "18",
+    "itunes_episode": "20",
     "image": {
       "href": "https://assets.pippa.io/shows/undefined/1596466876834-2fde16f63b158b50ccdd1353dea99205.jpeg"
     },
-    "summary": "There is talk of “unleashing AI” and removing burdensome regulations on its use within the new Trump administration. Staff members associated with the Department of Government Efficiency are using AI to analyze agency operations, gaining extraordinary access to government data. In this episode, co-host Darrell West speaks with Professor Allison Stanger on how DOGE is using AI in government and the risks presented by its access to government information.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>",
+    "summary": "&nbsp;A recent report from Pew Research Center analyzed how U.S. adults and tech experts feel about AI, finding areas where the two groups were widely apart and where there was consensus. In this episode, co-host Nicol Turner lee speaks with author of the study Monica Anderson from Pew about these opinions on AI and where these groups want to see more policies.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>",
     "summary_detail": {
       "type": "text/html",
       "language": null,
       "base": "https://feeds.acast.com/public/shows/5f2827aa17f940498f691817",
-      "value": "There is talk of “unleashing AI” and removing burdensome regulations on its use within the new Trump administration. Staff members associated with the Department of Government Efficiency are using AI to analyze agency operations, gaining extraordinary access to government data. In this episode, co-host Darrell West speaks with Professor Allison Stanger on how DOGE is using AI in government and the risks presented by its access to government information.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>"
+      "value": "&nbsp;A recent report from Pew Research Center analyzed how U.S. adults and tech experts feel about AI, finding areas where the two groups were widely apart and where there was consensus. In this episode, co-host Nicol Turner lee speaks with author of the study Monica Anderson from Pew about these opinions on AI and where these groups want to see more policies.<hr /><p style=\"color: grey; font-size: 0.75em;\"> Hosted on Acast. See <a href=\"https://acast.com/privacy\" rel=\"noopener noreferrer\" style=\"color: grey;\" target=\"_blank\">acast.com/privacy</a> for more information.</p>"
     }
   }
 }

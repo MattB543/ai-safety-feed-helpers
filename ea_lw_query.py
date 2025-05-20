@@ -27,9 +27,12 @@ from markdownify import markdownify
 from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2 import extras # Explicit import for batch insertion
+from pgvector.psycopg2 import register_vector # <<< ADD THIS IMPORT
 from dotenv import load_dotenv
 from google import genai as genai
 from google.genai import types # Explicit import for types
+from openai import OpenAI # Add OpenAI import
+from openai import APIError, RateLimitError # Optional: for more specific error handling
 
 # ================================================================
 #                      Environment & Setup
@@ -39,6 +42,7 @@ load_dotenv()  # Load .env BEFORE using env vars
 # --- Essential Environment Variables ---
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL   = os.environ.get("AI_SAFETY_FEED_DB_URL")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # <<< ADD THIS
 
 # --- Initial Checks ---
 if not GEMINI_API_KEY:
@@ -49,9 +53,19 @@ if not DATABASE_URL:
     print("CRITICAL ERROR: AI_SAFETY_FEED_DB_URL environment variable not set. Cannot connect to database.")
     sys.exit(1) # Exit if DB URL is missing
 
+if not OPENAI_API_KEY: # <<< ADD THIS CHECK
+    print("CRITICAL ERROR: OPENAI_API_KEY environment variable not set. Cannot generate embeddings.")
+    logging.critical("CRITICAL ERROR: OPENAI_API_KEY environment variable not set. Cannot generate embeddings.") # Also log
+    sys.exit(1) # Exit if OpenAI key is missing
+
 # --- Logging Configuration (Optional but recommended) ---
 # Basic logging setup - consider more advanced config for production
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.getLogger("google.generativeai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING) # Added for requests/urllib3 noise
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING) # Suppress OpenAI logs if needed
 
 # ================================================================
 #                     Forum‑specific constants
@@ -65,7 +79,7 @@ LW_AI_SAFETY_TAG_ID = "yBXKqk8wEg6eM8w5y"
 AF_API_URL = "https://www.alignmentforum.org/graphql"  # AF uses 'top' view, no specific tag filter needed here
 
 DEFAULT_LIMIT = 3000 # Max posts to fetch per source initially
-BATCH_SIZE    = 10   # Rows per database INSERT batch
+BATCH_SIZE    = 3   # Rows per database INSERT batch
 
 # Ingest only posts published on/after this date (UTC, inclusive)
 CUTOFF_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -106,7 +120,9 @@ DB_COLS = (
     "source_url", "title", "source_type", "authors", "published_date",
     "topics", "score", "image_url", "sentence_summary", "paragraph_summary",
     "key_implication", "full_content", "full_content_markdown",
-    "comment_count", "cluster_tag"
+    "comment_count", "cluster_tag",
+    "embedding_short",
+    "embedding_full"
 )
 NUM_DB_COLS = len(DB_COLS) # Calculate number of placeholders needed
 
@@ -116,6 +132,22 @@ INSERT INTO content ({', '.join(DB_COLS)})
 VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
+
+# SQL and helper for recording skipped posts
+SKIP_INSERT_SQL = """
+INSERT INTO skipped_posts (post_id, title_norm, source_url)
+VALUES (%s, %s, %s)
+ON CONFLICT (title_norm) DO NOTHING;
+"""
+
+def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
+    """Insert one row into skipped_posts (no commit)."""
+    # Ensure post_id and source_url are strings, handle None for source_url
+    cur.execute(SKIP_INSERT_SQL, (
+        str(post_id) if post_id is not None else 'N/A',
+        str(title_norm),
+        str(source_url) if source_url is not None else None
+    ))
 
 # ================================================================
 #                          Gemini Helpers
@@ -434,6 +466,62 @@ Remember: return only JSON with "cluster" and "tags".
         return {"error": f"Unexpected error processing cluster tag response: {e}"}
 
 # ================================================================
+#                     OpenAI Embedding Helper
+# ================================================================
+
+def generate_embeddings(openai_client, short_text: str, full_text: str, model="text-embedding-3-small") -> tuple[list[float] | None, list[float] | None]:
+    """
+    Generates short and full embeddings for the given texts using OpenAI.
+
+    Args:
+        openai_client: Initialized OpenAI client.
+        short_text: Text to embed for the 'short' version (e.g., title).
+        full_text: Text to embed for the 'full' version (e.g., title + summaries).
+        model: The OpenAI embedding model to use.
+
+    Returns:
+        A tuple containing (embedding_short, embedding_full).
+        Returns (None, None) if the client is not available or if API call fails.
+    """
+    if not openai_client:
+        logging.warning("OpenAI client not initialized (should have been caught earlier). Skipping embedding generation.")
+        return None, None
+
+    # Ensure inputs are strings, even if empty
+    short_text = short_text or ""
+    full_text = full_text or ""
+
+    # Avoid API call if both inputs are effectively empty
+    if not short_text.strip() and not full_text.strip():
+        logging.debug("Skipping embedding generation: Both short and full texts are empty.")
+        return None, None
+
+    try:
+        logging.debug(f"  -> Generating OpenAI embeddings using model '{model}'...")
+        # Use the globally initialized client
+        response = openai_client.embeddings.create(
+            model=model,
+            input=[short_text, full_text] # Send both texts in one request
+        )
+        # response.data should contain two embedding objects
+        if len(response.data) == 2:
+            embedding_short = response.data[0].embedding
+            embedding_full = response.data[1].embedding
+            logging.debug(f"  -> OpenAI embeddings generated successfully.")
+            return embedding_short, embedding_full
+        else:
+            logging.warning(f"Unexpected number of embeddings received from OpenAI API: {len(response.data)}")
+            return None, None
+    except (APIError, RateLimitError) as e:
+        logging.error(f"OpenAI API error during embedding generation: {e}")
+        print(f"ERROR: OpenAI API error during embedding generation: {e}") # Also print
+        return None, None
+    except Exception as e:
+        logging.error(f"Unexpected error during OpenAI embedding generation: {e}", exc_info=True)
+        print(f"ERROR: Unexpected error during OpenAI embedding generation: {e}") # Also print
+        return None, None
+
+# ================================================================
 #                         Utility Helpers
 # ================================================================
 
@@ -493,6 +581,12 @@ def safe_int_or_zero(value: any) -> int:
         return int(value)
     except (ValueError, TypeError):
         return 0
+
+def safe_join(separator: str, items: list[str | None]) -> str:
+    """
+    Joins a list of strings or None with a separator, skipping None or empty/whitespace items.
+    """
+    return separator.join(item for item in items if item and isinstance(item, str) and item.strip())
 
 # ================================================================
 #                      GraphQL Fetching Logic
@@ -863,14 +957,22 @@ def main():
     failed_analysis_count = 0 # Track posts where *any* analysis step failed/skipped
     batch_data = [] # List to hold data tuples for batch insert
     total_db_failures = 0 # Track rows in failed batches
+    embedding_failures_count = 0 # Track embedding generation failures
+    total_skipped_recorded_in_db_count = 0 # New counter for skips recorded in DB
 
     try:
         print("\n--- Connecting to Database ---")
         logging.info(f"Connecting to database using URL: {DATABASE_URL[:20]}...") # Log partial URL
         conn = psycopg2.connect(DATABASE_URL)
         conn.autocommit = False # Ensure transactions are handled manually
+        register_vector(conn) # <<< REGISTER VECTOR TYPE HANDLER
         print("Database connection successful.")
         logging.info("Database connection successful.")
+
+        # Initialize OpenAI client here
+        print("Initializing OpenAI client...")
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logging.info("OpenAI client initialized.")
 
         # -------- 5. Fetch Existing Titles --------
         with conn.cursor() as cur: # Use 'with' for automatic cursor closing
@@ -882,6 +984,13 @@ def main():
             print(f"--> Found {len(existing_titles):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_titles)} existing titles.")
 
+            # Fetch already skipped titles
+            print("Fetching already skipped normalized titles from database...")
+            cur.execute("SELECT title_norm FROM skipped_posts")
+            already_skipped = {r[0] for r in cur.fetchall()}
+            print(f"--> Found {len(already_skipped):,} already skipped titles in the database.")
+            logging.info(f"Fetched {len(already_skipped)} already skipped titles.")
+
             # -------- 6. Process Posts & Perform Analysis --------
             print(f"\n--- Starting Processing and Analysis for {total_unique_count} Unique Posts ---")
             for i, post in enumerate(unique_posts):
@@ -892,11 +1001,15 @@ def main():
                 print(f"\n[{processed_count}/{total_unique_count}] Processing Post: '{title[:70]}...' (ID: {post_id})")
                 logging.info(f"Processing post {processed_count}/{total_unique_count}: ID {post_id}, Title: {title[:70]}...")
 
-                # --- 6a. Early Skip: Check if already in DB ---
+                # --- 6a. Early Skip: Check if already in DB or marked as skipped ---
                 norm_title = normalise_title(title)
+                if norm_title in already_skipped: # Check this first
+                    print(f"  -> Skipping (already marked as skipped or failed this run): Normalized title '{norm_title}'.")
+                    logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - already marked as skipped (in skipped_posts or this run).")
+                    continue # Skip to the next post
                 if norm_title in existing_titles:
-                    print(f"  -> Skipping: Normalized title already exists in database.")
-                    logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - already in DB.")
+                    print(f"  -> Skipping (already in content table): Normalized title '{norm_title}'.")
+                    logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - already in content table.")
                     continue # Skip to the next post
 
                 # --- 6b. Initialize Analysis Variables ---
@@ -907,6 +1020,8 @@ def main():
                 db_cluster = None   # Store the extracted cluster string for DB
                 db_tags = None      # Store the extracted tags list for DB
                 full_content_markdown = None # Initialize markdown content
+                embedding_short_vector = None # Initialize short embedding
+                embedding_full_vector = None  # Initialize full embedding
 
                 # --- 6c. Extract & Clean Content ---
                 print("  -> Cleaning HTML and converting to Markdown...")
@@ -930,87 +1045,99 @@ def main():
                         print("  -> HTML cleaning successful.")
                     except Exception as e:
                         logging.error(f"BeautifulSoup cleaning failed for post ID {post_id} ('{title[:50]}...'). Error: {e}", exc_info=True)
-                        print(f"  ERROR: HTML cleaning failed: {e}. Analysis will be skipped.")
-                        analysis_successful_flag = False # Mark analysis as failed
-                        # Keep cleaned_html as ""
+                        print(f"  ERROR: HTML cleaning failed: {e}. Marking for skip and continuing.")
+                        record_skip(cur, post_id, norm_title, url)
+                        conn.commit() # Commit the skip record
+                        already_skipped.add(norm_title)
+                        total_skipped_recorded_in_db_count += 1
+                        continue # Skip this post
                 else:
-                    print("  -> Post has no HTML body content.")
-                    analysis_successful_flag = False # Cannot analyze empty content
+                    print("  -> Post has no HTML body content. Marking for skip and continuing.")
+                    logging.warning(f"Post ID {post_id} ('{title[:50]}...') has no HTML body. Marking for skip.")
+                    record_skip(cur, post_id, norm_title, url)
+                    conn.commit() # Commit the skip record
+                    already_skipped.add(norm_title)
+                    total_skipped_recorded_in_db_count += 1
+                    continue # Skip this post
 
-                # Convert cleaned HTML to Markdown (only if cleaning succeeded)
-                if analysis_successful_flag:
-                    try:
-                        full_content_markdown = markdownify(cleaned_html, heading_style="ATX", bullets="-")
-                        print("  -> Markdown conversion successful.")
-                    except Exception as e:
-                        logging.error(f"Markdownify conversion failed for post ID {post_id} ('{title[:50]}...'). Error: {e}", exc_info=True)
-                        print(f"  ERROR: Markdown conversion failed: {e}. Analysis will be skipped.")
-                        full_content_markdown = "" # Ensure it's empty on error
-                        analysis_successful_flag = False # Mark analysis as failed
+                # Convert cleaned HTML to Markdown (only if cleaning succeeded and body existed)
+                # If we reach here, HTML processing was okay.
+                try:
+                    full_content_markdown = markdownify(cleaned_html, heading_style="ATX", bullets="-")
+                    print("  -> Markdown conversion successful.")
+                except Exception as e:
+                    logging.error(f"Markdownify conversion failed for post ID {post_id} ('{title[:50]}...'). Error: {e}", exc_info=True)
+                    print(f"  ERROR: Markdown conversion failed: {e}. Marking for skip and continuing.")
+                    record_skip(cur, post_id, norm_title, url)
+                    conn.commit() # Commit the skip record
+                    already_skipped.add(norm_title)
+                    total_skipped_recorded_in_db_count += 1
+                    continue # Skip this post
 
-                # --- 6d. Perform Gemini Analyses (only if content available) ---
-                if analysis_successful_flag and full_content_markdown:
-                    print("  -> Performing Gemini analyses...")
+                # --- 6d. Perform Gemini Analyses (only if content available and markdown conversion succeeded) ---
+                # If we reach here, full_content_markdown should be populated and valid.
+                print("  -> Performing Gemini analyses...")
 
-                    # 1. Sentence Summary
-                    print("    - Generating sentence summary...")
-                    sentence_summary = summarize_text(full_content_markdown)
-                    if sentence_summary.startswith("Error:") or sentence_summary.startswith("Analysis skipped") or sentence_summary == "Content was empty.":
-                        print(f"    - Sentence summary failed or skipped: {sentence_summary}")
-                        logging.warning(f"Sentence summary failed/skipped for post ID {post_id}: {sentence_summary}")
-                        sentence_summary = None # Set to None for DB
-                        analysis_successful_flag = False # Mark overall analysis as failed for this post
-                    else:
-                        print("    - Sentence summary generated.")
+                # 1. Sentence Summary
+                print("    - Generating sentence summary...")
+                sentence_summary = summarize_text(full_content_markdown)
+                if sentence_summary.startswith("Error:") or sentence_summary.startswith("Analysis skipped") or sentence_summary == "Content was empty.":
+                    print(f"    - Sentence summary failed or skipped: {sentence_summary}")
+                    logging.warning(f"Sentence summary failed/skipped for post ID {post_id}: {sentence_summary}")
+                    sentence_summary = None # Set to None for DB
+                    analysis_successful_flag = False # Mark overall analysis as failed for this post
+                else:
+                    print("    - Sentence summary generated.")
 
-                    # 2. Paragraph Summary (Proceed even if previous failed, but flag overall failure)
-                    print("    - Generating paragraph summary...")
-                    paragraph_summary = generate_paragraph_summary(full_content_markdown)
-                    if paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Analysis skipped") or paragraph_summary == "Content was empty.":
-                        print(f"    - Paragraph summary failed or skipped: {paragraph_summary}")
-                        logging.warning(f"Paragraph summary failed/skipped for post ID {post_id}: {paragraph_summary}")
-                        paragraph_summary = None
-                        analysis_successful_flag = False
-                    else:
-                        print("    - Paragraph summary generated.")
+                # 2. Paragraph Summary (Proceed even if previous failed, but flag overall failure)
+                print("    - Generating paragraph summary...")
+                paragraph_summary = generate_paragraph_summary(full_content_markdown)
+                if paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Analysis skipped") or paragraph_summary == "Content was empty.":
+                    print(f"    - Paragraph summary failed or skipped: {paragraph_summary}")
+                    logging.warning(f"Paragraph summary failed/skipped for post ID {post_id}: {paragraph_summary}")
+                    paragraph_summary = None
+                    analysis_successful_flag = False
+                else:
+                    print("    - Paragraph summary generated.")
 
-                    # 3. Key Implication (Proceed even if previous failed)
-                    print("    - Generating key implication...")
-                    key_implication = generate_key_implication(full_content_markdown)
-                    if key_implication.startswith("Error:") or key_implication.startswith("Analysis skipped") or key_implication == "Content was empty.":
-                        print(f"    - Key implication failed or skipped: {key_implication}")
-                        logging.warning(f"Key implication failed/skipped for post ID {post_id}: {key_implication}")
-                        key_implication = None
-                        analysis_successful_flag = False
-                    else:
-                        print("    - Key implication generated.")
+                # 3. Key Implication (Proceed even if previous failed)
+                print("    - Generating key implication...")
+                key_implication = generate_key_implication(full_content_markdown)
+                if key_implication.startswith("Error:") or key_implication.startswith("Analysis skipped") or key_implication == "Content was empty.":
+                    print(f"    - Key implication failed or skipped: {key_implication}")
+                    logging.warning(f"Key implication failed/skipped for post ID {post_id}: {key_implication}")
+                    key_implication = None
+                    analysis_successful_flag = False
+                else:
+                    print("    - Key implication generated.")
 
-                    # 4. Cluster Tag (Proceed even if previous failed)
-                    print("    - Generating cluster and tags...")
-                    original_tags = [t.get("name", "N/A") for t in post.get("tags", []) if t]
-                    cluster_info = generate_cluster_tag(title, original_tags, full_content_markdown)
-                    if isinstance(cluster_info, dict) and "error" in cluster_info:
-                         print(f"    - Cluster/tag generation failed or skipped: {cluster_info['error']}")
-                         logging.warning(f"Cluster/tag generation failed/skipped for post ID {post_id}: {cluster_info['error']}")
-                         # db_cluster and db_tags remain None
+                # 4. Cluster Tag (Proceed even if previous failed)
+                print("    - Generating cluster and tags...")
+                original_tags = [t.get("name", "N/A") for t in post.get("tags", []) if t]
+                cluster_info = generate_cluster_tag(title, original_tags, full_content_markdown)
+                if isinstance(cluster_info, dict) and "error" in cluster_info:
+                     print(f"    - Cluster/tag generation failed or skipped: {cluster_info['error']}")
+                     logging.warning(f"Cluster/tag generation failed/skipped for post ID {post_id}: {cluster_info['error']}")
+                     # db_cluster and db_tags remain None
+                     analysis_successful_flag = False
+                elif isinstance(cluster_info, dict): # Check it's a dict (already validated in function)
+                     db_cluster = cluster_info.get("cluster") # Already validated as string
+                     db_tags = cluster_info.get("tags")     # Already validated as list of strings
+                     # Additional validation for None values (though unlikely)
+                     if db_cluster is None or db_tags is None:
+                         logging.warning(f"Cluster/tag generation returned None values unexpectedly for post ID {post_id}. Cluster: {db_cluster}, Tags: {db_tags}")
                          analysis_successful_flag = False
-                    elif isinstance(cluster_info, dict): # Check it's a dict (already validated in function)
-                         db_cluster = cluster_info.get("cluster") # Already validated as string
-                         db_tags = cluster_info.get("tags")     # Already validated as list of strings
+                     else:
                          print(f"    - Cluster/tags generated: Cluster='{db_cluster}', Tags={db_tags}")
-                    # else case should not happen due to validation in generate_cluster_tag
-
-                elif not full_content_markdown:
-                    print("  -> Skipping Gemini analyses due to empty or failed content preparation.")
-                    analysis_successful_flag = False # Ensure flag is false if no content
-                else: # analysis_successful_flag was already False from cleaning/markdown steps
-                     print("  -> Skipping Gemini analyses due to earlier errors.")
+                else: # Should not happen due to validation in generate_cluster_tag, but handle defensively
+                    logging.warning(f"Cluster/tag generation returned unexpected type for post ID {post_id}: {type(cluster_info)}")
+                    analysis_successful_flag = False
 
                 # Increment count if any analysis step failed for this post
                 if not analysis_successful_flag:
                     failed_analysis_count += 1
 
-                # --- 6e. Extract Other Metadata ---
+                # --- 6f. Extract Other Metadata ---
                 print("  -> Extracting remaining metadata...")
                 source_type = post.get('source_type', 'Unknown')
                 score = post.get('baseScore') # Keep as number (or None)
@@ -1041,7 +1168,38 @@ def main():
                 published_date = iso_to_dt(post.get('postedAt'))
                 print(f"    - Published Date: {published_date}")
 
-                # --- 6f. Prepare Data Tuple for Insertion ---
+                # --- 6e. Generate Embeddings (After Gemini, uses title & results) ---
+                print("  -> Generating OpenAI embeddings...")
+                # Prepare text inputs for embeddings
+                short_text_input = title or "" # Use title for short embedding
+
+                # Combine title and available analysis results for full embedding
+                # Use the top-level safe_join helper
+                full_text_parts = [
+                    title,
+                    f"Authors: {', '.join(authors_list)}", # <<< FORMATTED AUTHORS USED HERE
+                    sentence_summary,
+                    paragraph_summary,  
+                    key_implication
+                ]
+                full_text_input = safe_join("\n\n", full_text_parts) # Join with double newline
+
+                # Call the embedding function (uses global openai_client)
+                embedding_short_vector, embedding_full_vector = generate_embeddings(
+                    openai_client, short_text_input, full_text_input
+                )
+
+                # Check for embedding failure
+                if embedding_short_vector is None or embedding_full_vector is None:
+                    print(f"    - Embedding generation failed or skipped for post ID {post_id}.")
+                    logging.warning(f"Embedding generation failed/skipped for post ID {post_id}")
+                    embedding_failures_count += 1
+                    # Keep vectors as None, don't mark analysis_successful_flag as False here
+                    # as Gemini analysis might have succeeded.
+                else:
+                    print("    - Embeddings generated successfully.")
+
+                # --- 6g. Prepare Data Tuple for Insertion ---
                 # Ensure the order matches DB_COLS exactly!
                 data_tuple = (
                     url,                            # source_url
@@ -1058,10 +1216,26 @@ def main():
                     html_body,                      # full_content (original HTML, maybe with prepended title)
                     full_content_markdown,          # full_content_markdown (str or None)
                     comment_count,                  # comment_count (int)
-                    db_cluster                      # cluster_tag (AI generated cluster or None)
+                    db_cluster,                     # cluster_tag (AI generated cluster or None)
+                    embedding_short_vector,         # embedding_short (list[float] or None)
+                    embedding_full_vector           # embedding_full (list[float] or None)
                 )
 
-                # --- 6g. Add to Batch ---
+                # <<< ADD THIS DEBUGGING >>>
+                # Added flush=True to help ensure output appears before potential crash
+                print(f"  DEBUG (Loop Item): Tuple length: {len(data_tuple)}, Expected: {NUM_DB_COLS}", flush=True)
+                print(f"  DEBUG (Loop Item): authors_list type: {type(authors_list)}, content: {authors_list}", flush=True)
+                print(f"  DEBUG (Loop Item): db_tags type: {type(db_tags)}, content: {db_tags}", flush=True)
+                print(f"  DEBUG (Loop Item): embedding_short type: {type(embedding_short_vector)}, len: {len(embedding_short_vector) if embedding_short_vector is not None else 'None'}", flush=True)
+                print(f"  DEBUG (Loop Item): embedding_full type: {type(embedding_full_vector)}, len: {len(embedding_full_vector) if embedding_full_vector is not None else 'None'}", flush=True)
+                if len(data_tuple) != NUM_DB_COLS:
+                    print(f"  ERROR (Loop Item): Tuple length mismatch for post ID {post_id}!", flush=True)
+                    print(f"  DEBUG (Loop Item): Tuple content (first 500 chars): {str(data_tuple)[:500]}...", flush=True) # Print partial tuple content
+                    # Optionally skip adding the bad tuple:
+                    # continue
+                # <<< END DEBUGGING >>>
+
+                # --- 6h. Add to Batch ---
                 batch_data.append(data_tuple)
                 print(f"  -> Added post '{title[:50]}...' to batch (Batch size: {len(batch_data)}).")
 
@@ -1072,7 +1246,7 @@ def main():
                     try:
                         # Use extras.execute_batch for efficient insertion
                         # The INSERT_SQL already handles ON CONFLICT DO NOTHING
-                        extras.execute_batch(cur, INSERT_SQL, batch_data)
+                        cur.executemany(INSERT_SQL, batch_data)
                         conn.commit() # Commit the transaction for this batch
                         batch_insert_successful = True
                         print(f"--- Batch insert successful. {len(batch_data)} rows processed (inserted or skipped on conflict). ---")
@@ -1096,10 +1270,27 @@ def main():
 
             # -------- 8. Insert Final Batch --------
             if batch_data:
-                print(f"\n--- Executing final database batch insert ({len(batch_data)} posts) ---")
+                print(f"\n--- Executing final database batch insert ({len(batch_data)} posts) ---", flush=True)
+                # <<< ADD DETAILED PRINTING >>>
+                print("\\nDEBUG (Final Batch - BEFORE EXECUTION):")
+                print(f"  INSERT SQL: {INSERT_SQL}")
+                for idx, item_tuple in enumerate(batch_data):
+                    print(f"\\n  --- Data Tuple {idx} ---")
+                    if len(item_tuple) == NUM_DB_COLS:
+                        for col_name, value in zip(DB_COLS, item_tuple):
+                            value_str = str(value)
+                            print(f"    Column: {col_name}")
+                            print(f"      Type: {type(value)}")
+                            # Print first 500 chars, add ellipsis if longer
+                            print(f"      Value (≤500 chars): {value_str[:500]}{'...' if len(value_str) > 500 else ''}")
+                    else:
+                         print(f"    ERROR: Tuple length mismatch! Expected {NUM_DB_COLS}, got {len(item_tuple)}")
+                         print(f"    Raw Tuple (≤500 chars): {str(item_tuple)[:500]}...")
+                print("DEBUG (Final Batch - END PRINTING)\\n")
+                # <<< END DETAILED PRINTING >>>
                 final_batch_successful = False
                 try:
-                    extras.execute_batch(cur, INSERT_SQL, batch_data)
+                    cur.executemany(INSERT_SQL, batch_data)
                     conn.commit() # Commit the final batch
                     final_batch_successful = True
                     print(f"--- Final batch insert successful. {len(batch_data)} rows processed. ---")
@@ -1152,13 +1343,15 @@ def main():
     print(f"Total posts initially combined from filtered sources: {initial_filtered_count}")
     print(f"Unique posts after deduplication: {total_unique_count}")
     print(f"Posts processed (attempted analysis/DB insert): {processed_count}")
-    print(f"Posts with at least one failed/skipped analysis step: {failed_analysis_count}")
+    print(f"Posts with failed/skipped Gemini analysis step(s): {failed_analysis_count}")
+    print(f"Posts with failed/skipped OpenAI embedding generation: {embedding_failures_count}")
+    print(f"Posts recorded in 'skipped_posts' table this run: {total_skipped_recorded_in_db_count}") # New summary line
     print(f"Total rows processed in successful DB batches: {affected_rows_count}")
     print(f"Estimated rows in failed DB batches: {total_db_failures}")
     print(f"Script finished at {datetime.now(timezone.utc)}")
     print(f"Total execution time: {duration:.2f} seconds")
     print("================================================================")
-    logging.info(f"Script finished. Duration: {duration:.2f}s. Processed: {processed_count}. DB Success: {affected_rows_count}. DB Fail: {total_db_failures}. Analysis Fail: {failed_analysis_count}.")
+    logging.info(f"Script finished. Duration: {duration:.2f}s. Processed: {processed_count}. DB Success: {affected_rows_count}. DB Fail: {total_db_failures}. Analysis Fail: {failed_analysis_count}. Embedding Fail: {embedding_failures_count}. Recorded Skips: {total_skipped_recorded_in_db_count}.")
 
 
 if __name__ == "__main__":

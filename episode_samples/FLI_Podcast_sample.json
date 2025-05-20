@@ -1,8 +1,8 @@
 {
-  "post_id": "https://futureoflife.org/?post_type=podcast&p=134511",
-  "title": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)",
-  "link": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/",
-  "published_parsed": "2025-04-25T11:55:20+00:00",
+  "post_id": "https://futureoflife.org/?post_type=podcast&p=134684",
+  "title": "Will Future AIs Be Conscious? (with Jeff Sebo)",
+  "link": "https://futureoflife.org/podcast/will-future-ais-be-conscious-with-jeff-sebo/",
+  "published_parsed": "2025-05-16T13:12:02+00:00",
   "html_body": "",
   "audio_url": null,
   "image_url": null,
@@ -14,21 +14,21 @@
   ],
   "source_name": "FLI Podcast",
   "raw_entry": {
-    "title": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)",
+    "title": "Will Future AIs Be Conscious? (with Jeff Sebo)",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://futureoflife.org/podcast/feed/",
-      "value": "Inside China’s AI Strategy: Innovation, Diffusion, and US Relations (with Jeffrey Ding)"
+      "value": "Will Future AIs Be Conscious? (with Jeff Sebo)"
     },
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/"
+        "href": "https://futureoflife.org/podcast/will-future-ais-be-conscious-with-jeff-sebo/"
       }
     ],
-    "link": "https://futureoflife.org/podcast/inside-chinas-ai-strategy-innovation-diffusion-and-us-relations-with-jeffrey-ding/",
+    "link": "https://futureoflife.org/podcast/will-future-ais-be-conscious-with-jeff-sebo/",
     "authors": [
       {
         "name": "Support"
@@ -38,16 +38,16 @@
     "author_detail": {
       "name": "Support"
     },
-    "published": "Fri, 25 Apr 2025 11:55:20 +0000",
+    "published": "Fri, 16 May 2025 13:12:02 +0000",
     "published_parsed": [
       2025,
+      5,
+      16,
+      13,
+      12,
+      2,
       4,
-      25,
-      11,
-      55,
-      20,
-      4,
-      115,
+      136,
       0
     ],
     "tags": [
@@ -57,7 +57,7 @@
         "label": null
       }
     ],
-    "id": "https://futureoflife.org/?post_type=podcast&p=134511",
+    "id": "https://futureoflife.org/?post_type=podcast&p=134684",
     "guidislink": false,
     "summary": "",
     "summary_detail": {
