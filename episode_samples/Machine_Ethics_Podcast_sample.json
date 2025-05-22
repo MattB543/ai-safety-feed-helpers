@@ -1,81 +1,82 @@
 {
-  "post_id": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
-  "title": "99. Co-design with Pinar Guvenc",
-  "link": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
-  "published_parsed": "2025-04-08T08:39:00+00:00",
-  "html_body": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people...",
-  "audio_url": "https://www.machine-ethics.net/site/assets/files/1573/pinar-guvenc-machine-ethics-podcast.mp3",
-  "image_url": "https://www.machine-ethics.net/site/assets/files/1572/pinar-illustration.1400x1400.jpg",
+  "post_id": "https://www.machine-ethics.net/podcast/deepdive-ai-and-the-environment/",
+  "title": "100. DeepDive: AI and the Environment",
+  "link": "https://www.machine-ethics.net/podcast/deepdive-ai-and-the-environment/",
+  "published_parsed": "2025-05-20T08:33:00+00:00",
+  "html_body": "This is our 100th episode! A super special look at AI and the Environment, we interviewed 4 experts for this DeepDive episode. We chatted about water stress, the energy usage of AI systems and data centres, using AI for fossil fuel discovery, the geo-political nature of AI, GenAI vs other ML alogrithms for energy use, demanding transparency on energy usage for training and operating AI, more AI regulation for carbon consumption, things we can change today like picking renewable hosting solutions, publishing your data, when doing &quot;responsible AI&quot; you must include the environment, considering who are the controllers of the technology and what do they want, and more...",
+  "audio_url": "https://www.machine-ethics.net/site/assets/files/1578/ai-and-the-environment.mp3",
+  "image_url": "https://www.machine-ethics.net/site/assets/files/1576/eco-thumb-1.1400x1400.jpg",
   "authors_list": [
-    "Ben Byford with Pinar Guvenc"
+    "Ben Byford with Hannah Smith, Boris Gamazaychikov, Will Alpine",
+    "Mél Hogan"
   ],
   "tags": [],
   "source_name": "Machine Ethics Podcast",
   "raw_entry": {
     "itunes_episodetype": "full",
-    "itunes_title": "Co-design with Pinar Guvenc",
-    "title": "99. Co-design with Pinar Guvenc",
+    "itunes_title": "DeepDive: AI and the Environment",
+    "title": "100. DeepDive: AI and the Environment",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://www.machine-ethics.net/itunes-rss-feed/",
-      "value": "99. Co-design with Pinar Guvenc"
+      "value": "100. DeepDive: AI and the Environment"
     },
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/"
+        "href": "https://www.machine-ethics.net/podcast/deepdive-ai-and-the-environment/"
       },
       {
-        "length": "71301583",
+        "length": "44144820",
         "type": "audio/mp3",
-        "href": "https://www.machine-ethics.net/site/assets/files/1573/pinar-guvenc-machine-ethics-podcast.mp3",
+        "href": "https://www.machine-ethics.net/site/assets/files/1578/ai-and-the-environment.mp3",
         "rel": "enclosure"
       }
     ],
-    "link": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
-    "itunes_episode": "99",
+    "link": "https://www.machine-ethics.net/podcast/deepdive-ai-and-the-environment/",
+    "itunes_episode": "100",
     "authors": [
       {
-        "name": "Ben Byford with Pinar Guvenc"
+        "name": "Ben Byford with Hannah Smith, Boris Gamazaychikov, Will Alpine and Mél Hogan"
       }
     ],
-    "author": "Ben Byford with Pinar Guvenc",
+    "author": "Ben Byford with Hannah Smith, Boris Gamazaychikov, Will Alpine and Mél Hogan",
     "author_detail": {
-      "name": "Ben Byford with Pinar Guvenc"
+      "name": "Ben Byford with Hannah Smith, Boris Gamazaychikov, Will Alpine and Mél Hogan"
     },
-    "subtitle": "Ninety Ninth episode of Machine Ethics podcast with Pinar Guvenc",
+    "subtitle": "one Hundredth episode of Machine Ethics podcast with Hannah Smith, Boris Gamazaychikov, Will Alpine and Mél Hogan",
     "subtitle_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://www.machine-ethics.net/itunes-rss-feed/",
-      "value": "Ninety Ninth episode of Machine Ethics podcast with Pinar Guvenc"
+      "value": "one Hundredth episode of Machine Ethics podcast with Hannah Smith, Boris Gamazaychikov, Will Alpine and Mél Hogan"
     },
-    "summary": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people...",
+    "summary": "This is our 100th episode! A super special look at AI and the Environment, we interviewed 4 experts for this DeepDive episode. We chatted about water stress, the energy usage of AI systems and data centres, using AI for fossil fuel discovery, the geo-political nature of AI, GenAI vs other ML alogrithms for energy use, demanding transparency on energy usage for training and operating AI, more AI regulation for carbon consumption, things we can change today like picking renewable hosting solutions, publishing your data, when doing &quot;responsible AI&quot; you must include the environment, considering who are the controllers of the technology and what do they want, and more...",
     "summary_detail": {
       "type": "text/html",
       "language": null,
       "base": "https://www.machine-ethics.net/itunes-rss-feed/",
-      "value": "This episode we&#039;re chat with Pinar Guvenc on “What&#039;s Wrong With” podcast, co-design, is AI ready for society and is society ready for AI? What is design? co-creation with AI as a stakeholder, bias in design, small language models, is AI making us lazy? human experience, digital life and our attention, and talking to diverse people..."
+      "value": "This is our 100th episode! A super special look at AI and the Environment, we interviewed 4 experts for this DeepDive episode. We chatted about water stress, the energy usage of AI systems and data centres, using AI for fossil fuel discovery, the geo-political nature of AI, GenAI vs other ML alogrithms for energy use, demanding transparency on energy usage for training and operating AI, more AI regulation for carbon consumption, things we can change today like picking renewable hosting solutions, publishing your data, when doing &quot;responsible AI&quot; you must include the environment, considering who are the controllers of the technology and what do they want, and more..."
     },
-    "published": "Tue, 08 Apr 2025 09:39:00 +0100",
+    "published": "Tue, 20 May 2025 09:33:00 +0100",
     "published_parsed": [
       2025,
-      4,
+      5,
+      20,
       8,
-      8,
-      39,
+      33,
       0,
       1,
-      98,
+      140,
       0
     ],
     "image": {
-      "href": "https://www.machine-ethics.net/site/assets/files/1572/pinar-illustration.1400x1400.jpg"
+      "href": "https://www.machine-ethics.net/site/assets/files/1576/eco-thumb-1.1400x1400.jpg"
     },
-    "itunes_duration": "49:27",
-    "id": "https://www.machine-ethics.net/podcast/co-design-with-pinar-guvenc/",
+    "itunes_duration": "30:39",
+    "id": "https://www.machine-ethics.net/podcast/deepdive-ai-and-the-environment/",
     "guidislink": false,
     "itunes_explicit": null
   }

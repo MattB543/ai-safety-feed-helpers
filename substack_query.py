@@ -492,7 +492,7 @@ def generate_embeddings(openai_client, short_text: str, full_text: str, model="t
 # --- Gemini Flash helper (yes/no classifier) -------------------------------
 def is_ai_safety_post(title: str, html_body: str,
                       model="gemini-2.5-flash-preview-04-17",
-                      max_chars=3500) -> bool:
+                      max_chars=5000) -> bool:
     """
     Fast yes/no guard-rail: returns True iff Gemini Flash says the post's
     *primary topic* is AI-safety-related (alignment, governance, x-risk, etc.)

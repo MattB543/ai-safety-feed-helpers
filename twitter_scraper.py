@@ -2,7 +2,7 @@
 """
 Twitter Timeline Scraper for AI‑Safety Feed (MVP)
 =================================================
-Scrapes up to ~1000 tweets from the logged‑in "For You" timeline of a
+Scrapes up to ~1000 tweets from the logged‑in "Following (chronological)" timeline of a
  dedicated AI‑safety Twitter/X account, extracts rich metadata, optionally
 expands author threads, and stores the data in PostgreSQL with upsert.
 
@@ -40,6 +40,7 @@ import time
 import random
 import argparse
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import logging
@@ -47,25 +48,57 @@ import logging
 from dotenv import load_dotenv
 from playwright.sync_api import Playwright, sync_playwright, BrowserContext, Page, TimeoutError as PWTimeoutError
 import psycopg2
-from psycopg2.extras import execute_values, register_default_json
+from psycopg2.extras import execute_values
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-TWEET_TARGET: int = 100                # approx. tweets per run
-SCROLL_PAUSE_RANGE = (1.5, 3.0)         # seconds – random to mimic humans
-THREAD_EXPANSION_LIMIT = 10            # max # of timeline tweets whose threads we open
+SCROLL_PAUSE_RANGE = (2.6, 6.1)         # seconds – random to mimic humans
+THREAD_EXPANSION_LIMIT = 100            # max # of timeline tweets whose threads we open
 BROWSER_HEADLESS = True                 # set False for debugging
 PLAYWRIGHT_STATE_FILE = Path(os.getenv("PLAYWRIGHT_STATE_PATH", "twitter_state.json"))
 
 DB_URL = None  # loaded in main()
 
-# Regex helpers
-ID_RE = re.compile(r"/status/(\d+)")
-HANDLE_RE = re.compile(r"@([A-Za-z0-9_]{1,15})")
+# --- NEW: GraphQL API Constants for Tweet Detail Fetching ---
+# WARNING: These values (especially Query ID and Features) can change with Twitter updates.
+# They may need to be periodically verified and updated.
+BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+# Using TweetResultByRestId for fetching tweet details and replies.
+# Query ID for TweetResultByRestId (example, verify from network requests if issues arise)
+# Common IDs: 0hWvD_eA4fBnR72kWA_X3A, GazOgl_O_Kj0Y244X6gV1A, Q4M330Yn8OXPv2ZDPP8gvw etc.
+TWEET_DETAIL_QUERY_ID = "0hWvD_eA4fBnR72kWA_X3A" 
+TWEET_DETAIL_OPERATION_NAME = "TweetResultByRestId" # This operation usually pairs with such Query IDs
+GRAPHQL_API_URL = f"https://twitter.com/i/api/graphql/{TWEET_DETAIL_QUERY_ID}/{TWEET_DETAIL_OPERATION_NAME}"
 
-# If you *store* any json columns, use:
-# register_default_json(globally=True, loads=json.loads)
+# Standard features often sent with GraphQL requests. This is a known common set.
+DEFAULT_GRAPHQL_FEATURES = {
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "tweetypie_unmention_optimization_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "view_counts_everywhere_api_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": False,
+    "tweet_awards_web_tipping_enabled": False,
+    "responsive_web_home_pinned_timelines_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_action_policy_enabled": True,
+    "responsive_web_media_download_video_enabled": False,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "verified_phone_label_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_live_event_timeline_management_enabled": True,
+    "vibe_api_enabled": True,
+    "responsive_web_text_conversations_enabled": False,
+    "blue_business_profile_image_shape_enabled": True,
+    "interactive_text_enabled": True,
+    "responsive_web_enhance_cards_enabled": False
+}
 
 # ---------------------------------------------------------------------------
 # NEW: Global variables for capturing network responses
@@ -103,6 +136,10 @@ def ensure_storage_state(playwright: Playwright, force_login: bool = False) -> B
     # Browser was launched with headless=False if interactive_login_required was true.
     print("[!] Opening a browser to perform (re)login · log in to twitter.com then close the window …")
     context = browser.new_context()
+    
+    # Clear cookies only when doing a fresh login to avoid hitting Twitter's cookie limit
+    context.clear_cookies()
+    
     page = context.new_page()
     page.goto("https://twitter.com/login", timeout=0)
     print("[*] Waiting for user to finish login… (Ctrl+C to abort)")
@@ -126,22 +163,22 @@ def ensure_storage_state(playwright: Playwright, force_login: bool = False) -> B
 # ---------------------------------------------------------------------------
 
 def scroll_timeline(page: Page, num_scrolls: int) -> None:
-    """Scroll the home timeline a fixed number of times."""
-    print(f"[*] Starting timeline scroll ({num_scrolls} times)...")
+    """Scroll the timeline a fixed number of times without violating CSP."""
+    logging.info(f"[*] Starting timeline scroll ({num_scrolls} times)...")
     for i in range(num_scrolls):
-        page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
-        print(f"    Scroll {i+1}/{num_scrolls} completed.")
-        random_pause()
-    print("[+] Timeline scroll finished.")
+        page.mouse.wheel(0, 6_000) # Use mouse wheel for scrolling
+        random_pause() # Call random_pause after each scroll
+        logging.info("    Scroll %d/%d completed.", i + 1, num_scrolls)
+    logging.info("[+] Timeline scroll finished.")
 
 
 # --- NEW: Network response capture ------------------------------------------
 
 def _capture_response(resp):
-    if resp.request.resource_type != "xhr" or not resp.ok:
+    if resp.request.resource_type not in ("xhr", "fetch") or not resp.ok:
         return
     url = resp.url
-    if "HomeTimeline" in url:
+    if "HomeLatestTimeline" in url or "HomeTimeline" in url:   # safer
         try:
             home_chunks.append(resp.json())
         except Exception as e:
@@ -149,15 +186,19 @@ def _capture_response(resp):
     elif "TweetDetail" in url or "TweetResultByRestId" in url:
         try:
             data = resp.json()
-            # focalTweetId query param appears only on TweetDetail calls initiated by clicking "Show this thread"
-            # or by directly navigating to a tweet URL.
-            # For TweetResultByRestId, the tweet ID is usually in the path or variables.
-            # We need a robust way to get the ID of the main tweet this detail response is for.
-            # The provided diff uses a regex on the URL, which is a good starting point for focalTweetId.
-            m = re.search(r'focalTweetId":"(\d+)"', url) # From original user diff
+
+            m = re.search(r'[?&](?:focalTweetId|tweetId|rest_id)=(\d+)', url) # From original user diff
             
-            # If focalTweetId is not in URL, try to find it in the variables part of the GraphQL query
-            # This is a common pattern for TweetDetail/TweetResultByRestId
+            # NEW: Fallback to query string parameters if regex fails
+            if not m:
+                parsed_url = urlparse(url)
+                query_params = parse_qs(parsed_url.query)
+                focal_tweet_id_from_query = query_params.get("focalTweetId", [None])[0] or \
+                                            query_params.get("tweetId", [None])[0] or \
+                                            query_params.get("rest_id", [None])[0]
+                if focal_tweet_id_from_query:
+                    m = re.match(r"(\d+)", str(focal_tweet_id_from_query)) # ensure it's digits
+
             if not m and resp.request.post_data:
                 try:
                     post_data_json = json.loads(resp.request.post_data)
@@ -201,9 +242,16 @@ def _parse_tweet_result_json(tweet_result: Dict[str, Any]) -> Optional[Dict[str,
     legacy = tweet_data.get("legacy")
     core_user_results = tweet_data.get("core", {}).get("user_results", {}).get("result", {})
     
-    if not legacy or not core_user_results or not core_user_results.get("legacy"):
-        # logging.debug(f"Skipping item due to missing legacy or user data: {tweet_data.get('rest_id', 'N/A')}")
-        return None # Essential data missing
+    usr_legacy = core_user_results.get("legacy")
+
+    # Abort early if mandatory author fields are absent
+    if (
+        not legacy
+        or not usr_legacy
+        or not usr_legacy.get("screen_name")
+        or not usr_legacy.get("name")
+    ):
+        return None   # skip ads, tombstones, withheld tweets
 
     usr_legacy = core_user_results.get("legacy", {})
     tweet_id_str = tweet_data.get("rest_id")
@@ -211,6 +259,10 @@ def _parse_tweet_result_json(tweet_result: Dict[str, Any]) -> Optional[Dict[str,
     if not tweet_id_str or not tweet_id_str.isdigit():
         # logging.debug(f"Skipping item due to invalid or missing rest_id: {tweet_id_str}")
         return None # Essential tweet ID missing
+
+    full_text_content = legacy.get("full_text")
+    if full_text_content:
+        full_text_content = full_text_content.replace('\u2028', '').replace('\u2029', '')
 
     timestamp_str = legacy.get("created_at")
     timestamp_dt = None
@@ -226,7 +278,7 @@ def _parse_tweet_result_json(tweet_result: Dict[str, Any]) -> Optional[Dict[str,
         'conversation_id': int(legacy.get("conversation_id_str", tweet_id_str)), # Fallback to tweet_id if not present
         'author_username': usr_legacy.get("screen_name"),
         'author_name': usr_legacy.get("name"),
-        'content': legacy.get("full_text"),
+        'content': full_text_content,
         'timestamp': timestamp_dt,
         'like_count': legacy.get("favorite_count", 0),
         'retweet_count': legacy.get("retweet_count", 0),
@@ -234,9 +286,6 @@ def _parse_tweet_result_json(tweet_result: Dict[str, Any]) -> Optional[Dict[str,
         'quote_count': legacy.get("quote_count", 0), # Often 0 in timeline, updated from detail
         'media_urls': [m.get("media_url_https") for m in legacy.get("extended_entities", {}).get("media", []) if m.get("media_url_https")],
         'external_links': [u.get("expanded_url") for u in legacy.get("entities", {}).get("urls", []) if u.get("expanded_url")],
-        'has_thread': False, # This might be harder to determine reliably from JSON alone without specific indicators.
-                           # Can be approximated if tweet_id != conversation_id_str or if a "show thread" CTA exists in raw data.
-                           # For now, let's simplify and rely on explicit thread expansion.
     }
 
 def parse_home_chunk(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -253,6 +302,7 @@ def parse_home_chunk(chunk: Dict[str, Any]) -> List[Dict[str, Any]]:
                         parsed_tweets.append(parsed_tweet)
                 elif entry.get("entryId", "").startswith("promoted-tweet-") or \
                      entry.get("entryId", "").startswith("promotedTweet"): # Promoted tweets
+                    continue                      # drop ads ASAP
                     content = entry.get("content", {}).get("itemContent", {}).get("tweet_results", {}).get("result")
                     # content might also be under entry.content.itemContent.promoted_tweet_results.result
                     if not content and entry.get("content", {}).get("itemContent", {}).get("promoted_tweet_results", {}):
@@ -272,20 +322,13 @@ def parse_thread(detail_json: Dict[str, Any], root_tweet_id: int, root_author_us
     thread_tweets = []
     instructions = detail_json.get("data", {}).get("threaded_conversation_with_injections_v2", {}).get("instructions", [])
     if not instructions: # Fallback for different TweetDetail structures (e.g. TweetResultByRestId might have a different path)
-        # Attempt to find entries in a structure similar to HomeTimeline for simplicity,
-        # as TweetResultByRestId can have various forms.
-        # This part may need adjustment based on actual observed JSON for TweetResultByRestId.
         results_container = detail_json.get("data", {}).get("tweetResult", {}).get("result", {}) # A common path for single tweet result
         if results_container and results_container.get("__typename") == "TweetWithVisibilityResults": # Ensure it's a tweet container
              results_container = results_container.get("tweet", {})
 
         if results_container and results_container.get("legacy"): # if it's a single tweet object itself
-             # This case might not be a thread but a single tweet fetched.
-             # This function expects a list of tweets in a thread.
-             # For now, if it's just one tweet, we won't process it as a "thread".
              pass
-        # A more common structure for threads might still use 'instructions' or 'entries' like HomeTimeline or older TweetDetail
-        # If the primary 'threaded_conversation_with_injections_v2' path fails, we look for generic TimelineAddEntries
+
         elif detail_json.get("data"): # Check if data exists
             for key, value in detail_json["data"].items(): # Iterate through top-level keys in data
                 if isinstance(value, dict) and "instructions" in value: # Find a dict with 'instructions'
@@ -321,8 +364,6 @@ def parse_thread(detail_json: Dict[str, Any], root_tweet_id: int, root_author_us
                         continue # Handled 'items' entry, move to next top-level entry
 
                 if not content: # If not found through specific conversation thread paths or items
-                    # Fallback to a more generic check if it's a direct tweet result within an entry
-                    # (less common for threads but good for robustness with varying API responses)
                     if entry.get("content", {}).get("itemContent", {}).get("tweet_results", {}).get("result"):
                          content = entry.get("content", {}).get("itemContent", {}).get("tweet_results", {}).get("result")
                     # Check for a direct result if the entry itself is the tweet (e.g. in TweetResultByRestId)
@@ -334,18 +375,12 @@ def parse_thread(detail_json: Dict[str, Any], root_tweet_id: int, root_author_us
                     parsed_tweet = _parse_tweet_result_json(content)
                     if parsed_tweet and \
                        parsed_tweet['author_username'] == root_author_username and \
-                       parsed_tweet['tweet_id'] != root_tweet_id: # Exclude the root tweet itself
+                       parsed_tweet['tweet_id'] != root_tweet_id and \
+                       parsed_tweet.get('conversation_id') == root_tweet_id: # Check conversation_id matches root
                         
-                        # Update conversation_id for all thread tweets to be the root tweet's ID
-                        parsed_tweet['conversation_id'] = root_tweet_id 
+                        # The 'conversation_id' is already correct due to the check above and parsing logic.
                         thread_tweets.append(parsed_tweet)
                         
-                        # Additionally, if this thread tweet is the root_tweet_id, update its quote count from the detail view
-                        # This is a bit redundant if parse_tweet_result_json already handles quote_count well,
-                        # but detail views *sometimes* have more accurate quote counts for the focal tweet.
-                        # However, the main purpose of parse_thread is to get *other* tweets in the thread.
-                        # The root tweet's quote count update should ideally happen to the existing entry from HomeTimeline.
-                        # For now, we rely on the quote_count from _parse_tweet_result_json.
                         
     # Deduplicate within the thread itself before returning, just in case
     if thread_tweets:
@@ -365,20 +400,23 @@ def db_insert_many(tweets: Sequence[Dict[str, Any]]) -> None:
         rows = [(
             t['tweet_id'], t['conversation_id'], t['author_username'], t['author_name'], t['content'], t['timestamp'],
             t['like_count'], t['retweet_count'], t['reply_count'], t['quote_count'],
-            t['media_urls'] or None, t['external_links'] or None
+            t['media_urls'] or None, t['external_links'] or None,
+            f"https://x.com/i/web/status/{t['tweet_id']}",  # Added URL
+            t.get('is_thread', False) # is_thread
         ) for t in tweets]
 
-        execute_values(cur, """
+        execute_values(cur, '''
             INSERT INTO tweets (
                 tweet_id, conversation_id, author_username, author_name, content, "timestamp",
-                like_count, retweet_count, reply_count, quote_count, media_urls, external_links
+                like_count, retweet_count, reply_count, quote_count, media_urls, external_links, url, is_thread
             ) VALUES %s
             ON CONFLICT (tweet_id) DO UPDATE SET
                 like_count      = EXCLUDED.like_count,
                 retweet_count   = EXCLUDED.retweet_count,
                 reply_count     = EXCLUDED.reply_count,
-                quote_count     = COALESCE(EXCLUDED.quote_count, tweets.quote_count)
-        """, rows)
+                quote_count     = COALESCE(EXCLUDED.quote_count, tweets.quote_count),
+                is_thread       = tweets.is_thread OR EXCLUDED.is_thread
+        ''', rows)
     conn.close()
 
 
@@ -402,24 +440,40 @@ def main() -> None:
 
     with sync_playwright() as pw:
         context = ensure_storage_state(pw, force_login=args.login)
+        
+        # Attach response listener to the context to capture responses from all pages
+        context.on("response", _capture_response)
+        
         page = context.new_page()
 
-        # Attach response listener
-        page.on("response", _capture_response)
-
         page.goto("https://twitter.com/home", timeout=0)
+        # NEW ─ click the "Following" tab
+        try:
+            page.get_by_role("tab", name="Following").click()
+            # Wait to confirm the tab switch actually happened
+            page.wait_for_selector('[role="tab"][aria-selected="true"] >> text=Following', timeout=10000)
+            logging.info("[*] Clicked 'Following' tab using get_by_role and confirmed selection.")
+        except Exception:
+            logging.info("[*] get_by_role(\"tab\", name=\"Following\") failed, trying fallback click.")
+            page.click('a[role="tab"]:has-text("Following")')
+            # Wait to confirm the tab switch actually happened
+            page.wait_for_selector('[role="tab"][aria-selected="true"] >> text=Following', timeout=10000)
+            logging.info("[*] Clicked 'Following' tab using fallback selector and confirmed selection.")
+
         try:
             # Wait for a timeline marker, not necessarily a full tweet,
             # as HomeTimeline API calls might populate faster.
-            page.wait_for_selector('div[aria-label="Timeline: Your Home Timeline"]', timeout=20_000)
-            logging.info("[*] Home timeline marker found.")
+            # UPDATED: Wait until tweets from the Following feed have loaded
+            page.wait_for_selector('div[aria-label^="Timeline:"] [data-testid="tweet"]',
+                                   timeout=20_000)
+            logging.info("[*] Following timeline marker found.")
         except PWTimeoutError:
             logging.error("[!] Timeline marker not found – maybe not logged in or page structure changed? Use --login to refresh.")
             context.close()
             return
 
         logging.info("[*] Scrolling timeline to trigger HomeTimeline API calls...")
-        scroll_timeline(page, 12)  # Increased scroll count
+        scroll_timeline(page, 5)
 
         # Wait an extra bit for last XHRs to complete after scrolling
         logging.info("[*] Waiting for final network responses...")
@@ -458,65 +512,197 @@ def main() -> None:
 
         logging.info(f"[*] Found {len(all_tweets_intermediate)} unique tweets after initial parsing and deduplication from HomeTimeline.")
 
-        # Thread expansion logic
-        expanded_thread_tweets: List[Dict[str, Any]] = []
-        tweets_for_thread_check = [t for t in all_tweets_intermediate if t.get('tweet_id') and t.get('author_username')] # Ensure necessary fields
-        
-        threads_to_expand_count = 0
-        for td in tweets_for_thread_check:
-            if threads_to_expand_count >= THREAD_EXPANSION_LIMIT:
-                logging.info(f"[*] Reached thread expansion limit ({THREAD_EXPANSION_LIMIT}).")
-                break
-
-            # Check if it's potentially part of a thread (tweet_id != conversation_id)
-            # OR if we already have detail_chunks for this tweet_id (might have been fetched e.g. by clicking "show replies")
-            is_potential_thread_root = td['tweet_id'] != td.get('conversation_id', td['tweet_id'])
-            has_detail_data = str(td['tweet_id']) in detail_chunks
-            
-            # Heuristic for 'has_thread' that was previously DOM-based:
-            # Check if legacy.is_quote_status is false and if entities.urls is empty,
-            # and if it's not a reply to someone else (conversation_id_str == id_str implies it's a root of its own convo)
-            # This is complex to replicate perfectly from JSON alone without deeper inspection of API fields that indicate a "Show thread" button.
-            # For now, we expand if tweet_id != conversation_id OR if we have detail_chunks.
-            # The original plan suggested: `if td["tweet_id"] == td["conversation_id"]: continue` (typo, should be != for thread root)
-            # Let's stick to: expand if it's a root of a conversation *that isn't just itself* or if we have details.
-
-            if is_potential_thread_root or has_detail_data:
-                 # Try to get actual detail JSON for this tweet to parse its thread
-                tweet_id_str = str(td['tweet_id'])
-                if tweet_id_str in detail_chunks:
-                    logging.info(f"[*] Expanding thread for tweet {tweet_id_str} using pre-captured detail_chunk.")
-                    thread_specific_tweets = parse_thread(detail_chunks[tweet_id_str], td['tweet_id'], td['author_username'])
-                    if thread_specific_tweets:
-                        expanded_thread_tweets.extend(thread_specific_tweets)
-                        logging.info(f"    Added {len(thread_specific_tweets)} tweets from thread {tweet_id_str}.")
-                    threads_to_expand_count += 1
-                else:
-                    # If not in detail_chunks, we could trigger a fetch, but the current design implies passive capture.
-                    # The original plan didn't explicitly fetch if not in detail_chunks, it relied on what was captured.
-                    # Let's assume for now that if it's not in detail_chunks, we don't expand unless is_potential_thread_root
-                    # was true due to conversation_id mismatch (which implies it's part of a thread but not necessarily the root we want to expand FROM with a new fetch)
-                    # The prompt's diff implies:
-                    # if td["tweet_id"] == td["conversation_id"]: continue -> This would skip expanding tweets that are their own conversation root.
-                    # This seems correct if we only want to expand *continuations* of threads seen on the timeline.
-                    # Let's refine: only expand if detail_chunks has data for it.
-                    # This means we only expand threads the user *might* have clicked on or that auto-loaded details.
-                    # For a more proactive expansion of any tweet that *looks* like a thread head:
-                    # if is_potential_thread_root and not has_detail_data:
-                    # logging.info(f"[*] Tweet {tweet_id_str} is a potential thread root but no detail_chunk captured. Manual navigation would be needed.")
-                    pass # Not fetching actively in this version based on user plan.
-        
-        if expanded_thread_tweets:
-            logging.info(f"[*] Added {len(expanded_thread_tweets)} total tweets from thread expansions.")
-            for t_expanded in expanded_thread_tweets:
-                if t_expanded.get('tweet_id') and t_expanded['tweet_id'] not in seen_tweet_ids:
-                    all_tweets_intermediate.append(t_expanded)
-                    seen_tweet_ids.add(t_expanded['tweet_id'])
-
-        # Final list of tweets after potential thread expansion and deduplication
+        # Final list of tweets after initial parsing and deduplication.
+        # (The passive expansion logic above has been removed, so this list is based on HomeTimeline + detail_chunks quote_count merge only at this point)
         all_tweets_processed = list({t['tweet_id']: t for t in all_tweets_intermediate if t.get('tweet_id')}.values())
-        logging.info(f"[*] Total unique tweets after thread expansion and final deduplication: {len(all_tweets_processed)}")
+        logging.info(f"[*] Total unique tweets after initial processing (before active thread fetching): {len(all_tweets_processed)}")
         
+        # ------------------------------------------------------------------
+        # NEW: actively fetch full threads
+        # ------------------------------------------------------------------
+        # Corrected root detection: tweet_id == conversation_id.
+        # Fallback to tweet_id if conversation_id is missing for some reason.
+        roots = [t for t in all_tweets_processed
+                 if t.get('tweet_id') and t['tweet_id'] == t.get('conversation_id', t['tweet_id'])]
+
+        logging.info(f"[*] Identified {len(roots)} potential thread roots for active fetching.")
+
+        current_tweet_map = {t['tweet_id']: t for t in all_tweets_processed if t.get('tweet_id')}
+
+        def pull_thread(context: BrowserContext, tid: int, author_username: str) -> None:
+            # Check if author_username is valid, otherwise skip
+            if not author_username:
+                logging.warning(f"Skipping pull_thread for {tid} due to missing author_username.")
+                return
+
+            # The global _capture_response will populate detail_chunks[str(tid)]
+            # Ensure detail_chunks is cleared or handled appropriately if this tweet was already visited
+            # For simplicity here, we assume _capture_response appends/overwrites as needed.
+            # If a specific entry for this tid already exists, we might want to clear it
+            # or ensure the new response overwrites it correctly in _capture_response.
+            # Current _capture_response for TweetDetail overwrites based on tid.
+
+            logging.info(f"    Fetching thread for root tweet ID: {tid} via GraphQL API.") # MODIFIED
+            
+            cookies = context.cookies()
+            csrf_token = None
+            for cookie in cookies:
+                if cookie['name'] == 'ct0':
+                    csrf_token = cookie['value']
+                    break
+            
+            if not csrf_token:
+                logging.error(f"    CSRF token (ct0) not found for tweet {tid}. Skipping thread fetch via API.")
+                return
+
+            headers = {
+                "authorization": BEARER_TOKEN,
+                "x-csrf-token": csrf_token,
+                "content-type": "application/json", # Added for POST
+            }
+
+            # Variables for TweetResultByRestId
+            graphql_variables = {
+                "tweetId": str(tid),
+                "withControl": True,
+                "withCommunity": True,
+                "includePromotedContent": False,
+                "withVoice": True,
+                "withBirdwatchNotes": True, # For community notes
+                "withDownvotePerspective": False,
+                "withQuickPromoteEligibilityTweetFields": False,
+                "withReactions": True, # For reaction counts/details
+                "withEditControl": True, # For edit history info
+                "withEditTweetQuoteCount": True,
+                "withTweetQuoteCount": True,
+                "withObservedEdits":True,
+                "withV2Timeline": True, # Crucial for new timeline structures in replies
+                "withSuperFollowsTweetFields": True,
+                "withTrustedFriends": False,
+                "withArticleRichContent": False,
+                "withTextConversation": False, # Added for conversation context
+                "withUserResults": True, # To get user objects in results
+                "withClientEventToken":False, # Usually false
+                "withIsQuoteTweet":True, # To identify quote tweets
+            }
+            
+            # NEW: body for POST request
+            body_payload = {
+                "variables": graphql_variables,
+                "features": DEFAULT_GRAPHQL_FEATURES,
+                "fieldToggles": {"withArticleRichContentState": False} # As per user request
+            }
+            
+            # Exponential backoff parameters
+            max_retries = 3
+            initial_delay = 5  # seconds
+            current_retries = 0
+            success = False
+
+            while current_retries < max_retries:
+                try:
+                    logging.debug(f"Attempting GraphQL call for {tid} (Attempt {current_retries + 1}/{max_retries})")
+                    # MODIFIED: Use post() with data=body_payload, remove params
+                    api_response = context.request.post(
+                        GRAPHQL_API_URL,
+                        headers=headers,
+                        data=json.dumps(body_payload), # Send as JSON string
+                        timeout=20000 # 20s timeout
+                    )
+                    
+                    # api_response.raise_for_status() # Playwright doesn't have this
+                    # data = api_response.json()
+                    if not api_response.ok:
+                        logging.warning(
+                            f"GraphQL call {tid} failed – HTTP {api_response.status}: "
+                            f"{api_response.text()[:200]}" # Changed to use await for async method
+                        )
+                        # Trigger the retry loop by continuing, after logging and delay in finally
+                        # Increment retries and sleep in the finally block before continuing
+                        current_retries += 1
+                        if current_retries < max_retries:
+                             time.sleep(initial_delay)
+                             initial_delay *= 2 # Exponential backoff
+                        continue # Go to next iteration of while loop
+
+                    data = api_response.json() # safe to call now, changed to use await
+                    detail_chunks[str(tid)] = data # Store fetched data for parse_thread
+                    
+                    # Check if the detail_chunks were populated for this tid
+                    if str(tid) in detail_chunks: # Data should be present if no error above
+                        detail_json = detail_chunks[str(tid)]
+                        thread_nodes = parse_thread(detail_json, tid, author_username)
+                        
+                        # Set is_thread for the root tweet
+                        if tid in current_tweet_map:
+                            current_tweet_map[tid]['is_thread'] = True
+                        
+                        newly_added_count = 0
+                        for n in thread_nodes:
+                            n['is_thread'] = True # Set is_thread for each thread node
+                            if n.get('tweet_id') and n['tweet_id'] not in seen_tweet_ids:
+                                all_tweets_processed.append(n) # This list is modified
+                                seen_tweet_ids.add(n['tweet_id']) # This set is modified
+                                current_tweet_map[n['tweet_id']] = n # Keep map updated
+                                newly_added_count += 1
+                        
+                        if newly_added_count > 0:
+                            logging.info(f"        Added {newly_added_count} new nodes from thread of {tid} (via GraphQL API).")
+                        elif thread_nodes: # Even if no new nodes, if thread_nodes were found, it's a success
+                            logging.info(f"        Processed thread for {tid} (via GraphQL API), no new nodes added beyond root.")
+                        else: # No thread nodes found but API call was successful
+                            logging.info(f"        API call for {tid} successful, but no thread content parsed or root already marked (via GraphQL API).")
+
+                        success = True
+                        break # Successfully fetched and processed
+                    else:
+                        # This path should ideally not be hit if data was assigned and no error prior.
+                        logging.warning(f"    TweetDetail for {tid} not found in detail_chunks after API call. Retrying... (Attempt {current_retries + 1}/{max_retries})")
+
+                except Exception as e: # Catches requests.exceptions.HTTPError, JSONDecodeError, PWTimeoutError (from request.get timeout) etc.
+                    logging.warning(f"    GraphQL API call for tweet {tid} failed: {type(e).__name__} - {e}. Retrying in {initial_delay}s... (Attempt {current_retries + 1}/{max_retries})")
+                
+                finally: # Ensure delay happens if not successful and not last retry
+                    if not success and current_retries < max_retries -1 : 
+                         time.sleep(initial_delay)
+                         initial_delay *= 2 # Exponential backoff
+
+                current_retries += 1
+            
+            if not success:
+                logging.error(f"    Max retries reached for tweet {tid} using GraphQL API. Giving up.")
+            
+            # p.close() is no longer needed as we are not creating a new page
+
+        if roots:
+            # Apply the THREAD_EXPANSION_LIMIT
+            limited_roots = roots[:THREAD_EXPANSION_LIMIT]
+            if len(roots) > THREAD_EXPANSION_LIMIT:
+                logging.info(f"[*] Limiting thread expansion to {len(limited_roots)} roots (out of {len(roots)} potential roots, limit is {THREAD_EXPANSION_LIMIT}).")
+            else:
+                logging.info(f"[*] Preparing to expand {len(limited_roots)} thread roots (limit is {THREAD_EXPANSION_LIMIT}).")
+
+            for i, r_tweet in enumerate(limited_roots, 1):
+                # Ensure tweet_id and author_username are present
+                root_tid = r_tweet.get('tweet_id')
+                author = r_tweet.get('author_username')
+                # Fallback for author_username from current_tweet_map if not directly in r_tweet (though it should be)
+                if not author and root_tid in current_tweet_map:
+                    author = current_tweet_map[root_tid].get('author_username')
+
+                if root_tid and author:
+                    delay = random.uniform(3.0, 6.0) # 3-6 s gap – slow but safe
+                    logging.info(f"[{i}/{len(limited_roots)}] Sleeping {delay:.1f}s before thread fetch for {root_tid}")
+                    time.sleep(delay)
+                    pull_thread(context, root_tid, author) # runs in the main thread
+                else:
+                    logging.warning(f"Skipping root tweet for thread fetching due to missing ID or author: {r_tweet.get('tweet_id')}")
+            
+            logging.info("[*] Finished active thread fetching.")
+            # After fetching, re-deduplicate all_tweets_processed as new nodes might have been added
+            all_tweets_processed = list({t['tweet_id']: t for t in all_tweets_processed if t.get('tweet_id')}.values())
+            logging.info(f"[*] Total unique tweets after active thread fetching and final deduplication: {len(all_tweets_processed)}")
+
         # Save all parsed tweet data to a JSON file for inspection
         raw_output_path = Path("parsed_tweets_raw_graphql.json") # New name for GraphQL version
         try:

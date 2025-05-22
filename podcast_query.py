@@ -6,7 +6,7 @@ This script fetches episodes via RSS, attempts to transcribe audio using
 AssemblyAI if an audio URL is present, and falls back to HTML show notes
 if transcription fails or is unavailable. It filters episodes based on date
 and an AI safety guardrail, performs analysis (summarization, implication
-identification, clustering/tagging using Gemini; embeddings using OpenAI)
+identification, clustering/tagging using OpenAI GPT-4o; embeddings using OpenAI)
 on the available content (transcript preferred), and inserts the processed
 data into a PostgreSQL database, handling duplicates based on normalized titles.
 
@@ -37,9 +37,6 @@ from pgvector.psycopg2 import register_vector # <-- ADDED for pgvector
 from dotenv import load_dotenv
 
 # --- AI/ML Libs ---
-import google.generativeai as genai
-from google.api_core import exceptions as google_api_exceptions
-from google.generativeai import types as genai_types
 from openai import OpenAI, APIError as OpenAI_APIError, RateLimitError as OpenAI_RateLimitError
 import assemblyai as aai # <-- ADDED
 from assemblyai import TranscriptStatus # <-- ADDED
@@ -54,25 +51,19 @@ logging.basicConfig(level=logging.INFO, # Changed default to INFO
                     format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s')
 
 # Suppress overly verbose logs from underlying libraries
-logging.getLogger("google.generativeai").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
-logging.getLogger("google.api_core").setLevel(logging.WARNING)
 logging.getLogger("feedparser").setLevel(logging.INFO) # Allow feedparser info logs
 
 
 # --- Essential Environment Variables ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 DATABASE_URL   = os.environ.get("AI_SAFETY_FEED_DB_URL")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY") # <-- ADDED
 
 # --- Initial Checks ---
-if not GEMINI_API_KEY:
-    logging.critical("CRITICAL ERROR: GEMINI_API_KEY environment variable not set. Cannot perform analysis.")
-    sys.exit(1)
 if not DATABASE_URL:
     logging.critical("CRITICAL ERROR: AI_SAFETY_FEED_DB_URL environment variable not set. Cannot connect to database.")
     sys.exit(1)
@@ -87,8 +78,6 @@ if not ASSEMBLYAI_API_KEY: # <-- ADDED Check
 # --- Initialize API Clients ---
 logging.info("Initializing API clients...")
 openai_client = None
-gemini_model_pro = None
-gemini_model_flash = None
 # AssemblyAI configuration (done globally)
 assemblyai_configured = False #
 if ASSEMBLYAI_API_KEY:
@@ -103,23 +92,319 @@ else:
     logging.info("AssemblyAI transcription skipped (no API key).")
 
 try:
-    # Configure Gemini (Newer API Style)
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model_pro = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17") # Updated model
-    gemini_model_flash = genai.GenerativeModel("models/gemini-2.5-flash-preview-04-17") # Updated model
-    logging.info("Gemini API configured and models instantiated.")
-
     # Initialize OpenAI
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     logging.info("OpenAI client initialized.")
 
 
 except Exception as e:
-    logging.critical(f"CRITICAL ERROR initializing API clients (Gemini/OpenAI): {e}", exc_info=True)
+    logging.critical(f"CRITICAL ERROR initializing API clients (OpenAI): {e}", exc_info=True)
     # Decide if script should exit if *any* client fails
     sys.exit(1) # Exit if essential clients fail
 
 logging.info("API client initialization complete.")
+
+# ================================================================
+#    OpenAI Chat Helper  (replaces call_gemini_api)
+# ================================================================
+
+def call_gpt_api(prompt: str,
+                 model: str = "gpt-4.1",      # GPT-4.1 public name
+                 temperature: float = 0.2) -> str:
+    """
+    Sends a single-prompt exchange to OpenAI ChatCompletions and
+    returns the content string (or an 'Error:' string on failure).
+    """
+    if not openai_client:
+        logging.warning("OpenAI client not initialised.")
+        return "Analysis skipped (client missing)."
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system",
+                 "content": "You are a helpful assistant specialised in AI-safety content analysis."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=temperature)
+        # Check if choices is not empty and message content exists
+        if response.choices and response.choices[0].message and response.choices[0].message.content:
+            return response.choices[0].message.content.strip()
+        else:
+            logging.warning("OpenAI API call returned no content or unexpected response structure.")
+            return "Error: OpenAI API returned no content."
+    except (OpenAI_APIError, OpenAI_RateLimitError) as e:
+        logging.error(f"OpenAI API error: {e}")
+        return f"Error: {type(e).__name__}"
+    except Exception as e:
+        logging.error(f"Unexpected error during OpenAI API call: {e}", exc_info=True)
+        return f"Error: {type(e).__name__}"
+
+# ---------- Specific Analysis Functions ----------
+
+def summarize_text(text_to_summarize: str) -> str:
+    """Generates a concise 1-2 sentence summary using the OpenAI GPT model."""
+    if not text_to_summarize or text_to_summarize.isspace():
+        logging.info("Skipping sentence summary: Input content was empty.")
+        return "Content was empty."
+    prompt = f"Summarize the following AI safety content in 2 concise sentences (maximum 50 words). Focus on the core argument, key insight, or main conclusion rather than methodology. Use clear, accessible language while preserving technical accuracy. The summary should be very readable and should help readers quickly understand what makes this content valuable or interesting and decide if they want to read more.\n\nContent to summarize:\n{text_to_summarize}"
+    return call_gpt_api(prompt)
+
+def generate_paragraph_summary(text_to_summarize: str) -> str:
+    """Generates a structured paragraph summary using the OpenAI GPT model."""
+    if not text_to_summarize or text_to_summarize.isspace():
+        logging.info("Skipping paragraph summary: Input content was empty.")
+        return "Content was empty."
+    prompt = f"""
+Generate a structured summary of the following AI safety content so the reader can quickly understand the main points. The summary should consist of:
+
+1. A brief 1-sentence introduction highlighting the main point.
+2. 3-5 bullet points covering key arguments, evidence, or insights. Format EACH bullet point as:
+   * **Key concept or term**: Explanation or elaboration of that point.
+3. A brief 1-sentence conclusion with the author's recommendation or final thoughts.
+
+---
+
+Rules:
+- Make each bullet point concise (1 sentence) and focus on one distinct idea.
+- Bold only the key concept at the start of each bullet, not entire sentences.
+- This format should help readers quickly scan and understand the core content.
+- Only output the summary itself (don't include 'Summary:' or anything else).
+- Use markdown to format the bullet points and to improve readability with bolding and italics.
+- Include a double line break after the introduction and before the conclusion.
+
+Content to summarize:
+{text_to_summarize}
+"""
+    return call_gpt_api(prompt)
+
+def generate_key_implication(text_to_analyze: str) -> str:
+    """Identifies the single most important logical consequence using the OpenAI GPT model."""
+    if not text_to_analyze or text_to_analyze.isspace():
+        logging.info("Skipping key implication: Input content was empty.")
+        return "Content was empty."
+    prompt = f"""
+Based on the AI safety content below, identify the single most important logical consequence or implication in one concise sentence (25-35 words). Focus on:
+
+- What change in thinking, strategy, or priorities follows from accepting this content's conclusions
+- How this might alter our understanding of AI safety or governance approaches
+- A specific actionable insight rather than a general statement of importance
+- The "so what" that would matter to an informed AI safety community member
+
+The implication should represent a direct consequence of the content's argument, not simply restate the main point.
+
+Content to analyze:
+{text_to_analyze}
+"""
+    return call_gpt_api(prompt)
+
+def generate_cluster_tag(title: str, tags_list: List[str], content_markdown: str) -> Dict[str, Any]:
+    """
+    Generates a cluster and canonical tags using the OpenAI GPT model.
+    Returns: dict: Parsed JSON or {"error": "Reason string"}.
+    """
+    if not content_markdown or content_markdown.isspace():
+        logging.info("Skipping cluster tag generation: Input content was empty.")
+        return {"error": "Input content was empty."}
+
+    prompt = f"""
+You are the "AI-Safety-Tagger"—an expert taxonomist for an AI-safety news feed.
+
+---  TASK  ---
+Given one blog-style post, do BOTH of the following:
+
+1. **Pick exactly one "Cluster"** that best captures the *main theme*
+   (see the list of Clusters below).
+
+2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
+   describe the post.
+   • Tags *must* come from the taxonomy.
+   • Prefer the most specific tags that materially help the reader; skip
+     generic or redundant ones.
+   • A tag may be selected even if it appears only in the "Synonyms"
+     column—use its Canonical form in your answer.
+
+Return your answer as valid JSON, with this schema:
+
+{{
+  "cluster": "<one Cluster name>",
+  "tags": ["<Canonical tag 1>", "... up to 4"]
+}}
+
+Do not output anything else.
+
+--- INPUT ---
+
+Title:
+{title}
+
+Original author-supplied tags (may be noisy or missing):
+{tags_list}
+
+Markdown body:
+{content_markdown}
+
+--- TAXONOMY ---
+
+The format is:
+• Cluster
+- Canonical tag (Synonyms; separated by "")
+
+• Core AI Safety & Alignment
+- AI alignment (Human alignment)
+- Existential risk (X-risk)
+- Threat models (AI) (AI threat models)
+- Interpretability (Interpretability (ML & AI); Transparency)
+- Inner alignment
+- Outer alignment
+- Deceptive alignment
+- Eliciting latent knowledge (ELK)
+- Robustness (Adversarial robustness)
+- Alignment field-building (AI alignment field-building)
+- Value learning (Preference learning; Alignment via human values)
+
+• AI Governance & Policy
+- AI governance (GovAI)
+- Compute governance (GPU export controls; Chip governance)
+- AI regulation (Regulation)
+- Standards & auditing (Safety standards; Red-teaming)
+- Responsible scaling (Scaling policies; RSF)
+- International coordination (Geopolitics)
+- Slowing down AI (Slow takeoff; Pause AI)
+- Open-source models (Open-source LLMs)
+- Policy (Public policy (generic))
+- Compute controls (Hardware throttling)
+
+• Technical ML Safety
+- Reinforcement learning (RL)
+- Human feedback (RLHF; RLAIF)
+- Model editing (Model surgery)
+- Scalable oversight (Debate; Tree-of-thought)
+- CoT alignment (CoT alignment)
+- Scaling laws
+- Benchmarks & evals (Safety benchmarks)
+- Mechanistic interpretability
+- Value decomposition (Shard theory)
+
+• Forecasting & World Modeling
+- World modeling
+- Forecasting (Quantitative forecasting)
+- Prediction markets
+
+• Biorisk & Other GCRs
+- Biorisk (Biosecurity; Pandemic preparedness)
+- Nuclear risk (Nuclear war; Nuclear winter)
+- Global catastrophic risk (GCR)
+
+• Effective Altruism & Meta
+- Cause prioritization
+- Effective giving
+- Career choice (Career planning)
+- Community building (Building effective altruism)
+- Field-building (AI)
+- Epistemics & rationality (Rationality)
+
+• Philosophy & Foundations
+- Decision theory (CDT; EDT; UDT)
+- Moral uncertainty
+- Population ethics
+- Agent foundations (Agent foundations research)
+- Value drift
+- Info hazards (Information hazards)
+
+• Org-specific updates
+- Anthropic
+- OpenAI
+- DeepMind
+- Meta
+- ARC (Alignment Research Center)
+
+---
+
+Remember: return only JSON with "cluster" and "tags".
+"""
+    raw_response = call_gpt_api(prompt)
+    if raw_response.startswith("Error:") or raw_response == "Content was empty.":
+        return {"error": raw_response}
+
+    try:
+        # Try to parse the response as JSON
+        json_response = json.loads(raw_response)
+        # Basic validation
+        if not isinstance(json_response, dict):
+            return {"error": "Response was not a JSON object"}
+        if "cluster" not in json_response or "tags" not in json_response:
+            return {"error": "Response missing required fields"}
+        if not isinstance(json_response["tags"], list):
+            return {"error": "Tags field was not a list"}
+        # Return the parsed response
+        return json_response
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse cluster/tag JSON response: {e}")
+        return {"error": f"JSON parse error: {str(e)}"}
+    except Exception as e:
+        logging.error(f"Unexpected error processing cluster/tag response: {e}")
+        return {"error": f"Processing error: {str(e)}"}
+
+def is_ai_safety_post(title: str, html_body: str) -> bool:
+    """
+    Fast yes/no guard-rail: returns True iff the post's title and content
+    are sufficiently focused on AI safety topics to be included in the feed.
+    Uses OpenAI's GPT-4o-mini model for fast classification.
+    """
+    if not openai_client:
+        logging.warning("AI safety guard-rail check skipped: OpenAI client not initialized. Defaulting to True (fail-open).")
+        return True
+
+    # Clean and extract text from HTML if present
+    text_content = ""
+    if html_body:
+        try:
+            soup = BeautifulSoup(html_body, 'html.parser')
+            text_content = soup.get_text(separator=' ', strip=True)
+        except Exception as e:
+            logging.warning(f"Failed to extract text from HTML: {e}")
+            text_content = html_body  # Fall back to raw HTML
+
+    # Prepare content for analysis (first ~500 chars of text + title)
+    analysis_text = f"Title: {title}\n\nContent excerpt: {text_content[:500]}..."
+
+    prompt = f"""
+Analyze this podcast episode's title and content excerpt to determine if it is sufficiently focused on AI safety topics to be included in an AI safety content feed.
+
+Content to analyze:
+{analysis_text}
+
+Rules for inclusion:
+1. The content must substantially discuss AI safety, AI alignment, AI governance, AI policy, etc.
+2. Very general AI/ML technical content is NOT sufficient - there must be a clear safety/ethics/governance/etc. angle.
+3. Brief mentions of AI safety in otherwise unrelated content is NOT sufficient.
+
+Respond with ONLY "yes" or "no". Use "yes" if you are reasonably confident the content meets the criteria, otherwise use "no".
+"""
+    
+    response = call_gpt_api(
+        prompt=prompt,
+        model="gpt-4.1",  # Use the fast model for this guardrail
+        temperature=0.1   # Low temperature for more consistent yes/no
+    )
+
+    # Clean and validate response
+    if response.startswith("Error:"):
+        logging.warning(f"AI safety guard-rail check failed: {response}. Defaulting to True (fail-open).")
+        return True
+
+    response = response.strip().lower()
+    is_relevant = response == "yes"
+
+    # Log the decision
+    if is_relevant:
+        logging.debug(f"Guard-rail: Content accepted as AI safety relevant.")
+    else:
+        logging.info(f"Guard-rail: Content rejected as not sufficiently AI safety focused.")
+
+    return is_relevant
 
 # ================================================================
 #                         Constants
@@ -251,432 +536,6 @@ def get_hostname_from_url(url: str) -> Optional[str]:
         return None
 
 # ================================================================
-#                          Gemini Helpers
-# ================================================================
-
-# --- Configuration for Gemini API calls ---
-GENERATION_CONFIG = genai_types.GenerationConfig(temperature=0.2)
-SAFETY_SETTINGS = {
-    genai_types.HarmCategory.HARM_CATEGORY_HARASSMENT: genai_types.HarmBlockThreshold.BLOCK_NONE,
-    genai_types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: genai_types.HarmBlockThreshold.BLOCK_NONE,
-    genai_types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: genai_types.HarmBlockThreshold.BLOCK_NONE,
-    genai_types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: genai_types.HarmBlockThreshold.BLOCK_NONE,
-}
-
-def call_gemini_api(model: genai.GenerativeModel, prompt: str, generation_config: Optional[genai_types.GenerationConfig] = None) -> str:
-    """
-    Calls the Gemini API using a pre-configured model instance.
-
-    Args:
-        model: The initialized genai.GenerativeModel instance.
-        prompt: The text prompt to send.
-        generation_config: Optional generation configuration to use. If None,
-                           the global GENERATION_CONFIG is used.
-
-    Returns:
-        The generated text content as a string, or an error message
-        string starting with "Error:" or "Analysis skipped".
-    """
-    if not model:
-        logging.warning("Gemini model not initialized. Skipping API call.")
-        return "Analysis skipped (model not initialized)."
-
-    current_config = generation_config if generation_config is not None else GENERATION_CONFIG
-
-    logging.debug(f"Calling Gemini ({model.model_name}). Prompt length: {len(prompt)} chars.")
-    try:
-        response = model.generate_content(
-            contents=prompt,
-            generation_config=current_config, # Use current_config
-            safety_settings=SAFETY_SETTINGS
-        )
-
-        # --- Robust Response Parsing (Newer API) ---
-        # 1. Check for blocks based on prompt feedback
-        if response.prompt_feedback and response.prompt_feedback.block_reason:
-            reason = response.prompt_feedback.block_reason.name
-            logging.warning(f"Gemini API call blocked for prompt. Reason: {reason}")
-            return f"Error: Analysis blocked by API (Reason: {reason})."
-
-        # 2. Check if candidates exist and have content parts
-        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
-             result = "".join(part.text for part in response.candidates[0].content.parts).strip()
-             if result:
-                 logging.debug(f"Gemini API call successful. Response length: {len(result)} chars.")
-                 return result
-             else:
-                 # Response part was empty, check finish reason
-                 finish_reason = response.candidates[0].finish_reason.name if response.candidates[0].finish_reason else "UNKNOWN"
-                 logging.warning(f"Gemini API call returned empty content. Finish Reason: {finish_reason}")
-                 return f"Error: Analysis returned empty content (Finish Reason: {finish_reason})."
-
-        # 3. If no parts, check finish reason (e.g., SAFETY, RECITATION, STOP)
-        finish_reason = "UNKNOWN"
-        if response.candidates and response.candidates[0].finish_reason:
-            finish_reason = response.candidates[0].finish_reason.name
-        logging.warning(f"Gemini API call returned no valid content parts. Finish Reason: {finish_reason}")
-        return f"Error: Analysis failed or stopped (Finish Reason: {finish_reason})."
-
-    except Exception as e:
-        logging.error(f"Unexpected error during Gemini API call ({type(e).__name__}): {e}", exc_info=True)
-        return f"Error during analysis: {type(e).__name__}"
-
-# ---------- Specific Analysis Functions ----------
-
-def summarize_text(text_to_summarize: str) -> str:
-    """Generates a concise 1-2 sentence summary using the Gemini Pro model."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        logging.info("Skipping sentence summary: Input content was empty.")
-        return "Content was empty."
-    prompt = f"Summarize the following AI safety content in 2 concise sentences (maximum 50 words). Focus on the core argument, key insight, or main conclusion rather than methodology. Use clear, accessible language while preserving technical accuracy. The summary should be very readable and should help readers quickly understand what makes this content valuable or interesting and decide if they want to read more.\\n\\nContent to summarize:\\n{text_to_summarize}"
-    return call_gemini_api(gemini_model_pro, prompt)
-
-def generate_paragraph_summary(text_to_summarize: str) -> str:
-    """Generates a structured paragraph summary using the Gemini Pro model."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        logging.info("Skipping paragraph summary: Input content was empty.")
-        return "Content was empty."
-    prompt = f"""
-Generate a structured summary of the following AI safety content so the reader can quickly understand the main points. The summary should consist of:
-
-1. A brief 1-sentence introduction highlighting the main point.
-2. 3-5 bullet points covering key arguments, evidence, or insights. Format EACH bullet point as:
-   * **Key concept or term**: Explanation or elaboration of that point.
-3. A brief 1-sentence conclusion with the author's recommendation or final thoughts.
-
----
-
-Rules:
-- Make each bullet point concise (1 sentence) and focus on one distinct idea.
-- Bold only the key concept at the start of each bullet, not entire sentences.
-- This format should help readers quickly scan and understand the core content.
-- Only output the summary itself (don't include 'Summary:' or anything else).
-- Use markdown to format the bullet points and to improve readability with bolding and italics.
-- Include a double line break after the introduction and before the conclusion.
-
-Content to summarize:
-{text_to_summarize}
-"""
-    return call_gemini_api(gemini_model_pro, prompt)
-
-def generate_key_implication(text_to_analyze: str) -> str:
-    """Identifies the single most important logical consequence using the Gemini Pro model."""
-    if not text_to_analyze or text_to_analyze.isspace():
-        logging.info("Skipping key implication: Input content was empty.")
-        return "Content was empty."
-    prompt = f"""
-Based on the AI safety content below, identify the single most important logical consequence or implication in one concise sentence (25-35 words). Focus on:
-
-- What change in thinking, strategy, or priorities follows from accepting this content's conclusions
-- How this might alter our understanding of AI safety or governance approaches
-- A specific actionable insight rather than a general statement of importance
-- The "so what" that would matter to an informed AI safety community member
-
-The implication should represent a direct consequence of the content's argument, not simply restate the main point.
-
-Content to analyze:
-{text_to_analyze}
-"""
-    return call_gemini_api(gemini_model_pro, prompt)
-
-def generate_cluster_tag(title: str, tags_list: List[str], content_markdown: str) -> Dict[str, Any]:
-    """
-    Generates a cluster and canonical tags using the Gemini Pro model.
-    Returns: dict: Parsed JSON or {"error": "Reason string"}.
-    """
-    if not content_markdown or content_markdown.isspace():
-        logging.info("Skipping cluster/tag generation: Input content was empty.")
-        return {"error": "Content was empty."}
-    if not title: title = "Untitled"
-    if not tags_list: tags_list = ["N/A"]
-
-    # (Taxonomy prompt remains the same as in the original script)
-    prompt = f"""
-You are the "AI-Safety-Tagger"—an expert taxonomist for an AI-safety news feed.
-
----  TASK  ---
-Given one blog-style post, do BOTH of the following:
-
-1. **Pick exactly one "Cluster"** that best captures the *main theme*
-   (see the list of Clusters below).
-
-2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
-   describe the post.
-   • Tags *must* come from the taxonomy.
-   • Prefer the most specific tags that materially help the reader; skip
-     generic or redundant ones.
-   • A tag may be selected even if it appears only in the "Synonyms"
-     column—use its Canonical form in your answer.
-
-Return your answer as valid JSON, with this schema:
-
-{{
-  "cluster": "<one Cluster name>",
-  "tags": ["<Canonical tag 1>", "... up to 4"]
-}}
-
-Do not output anything else.
-
---- INPUT ---
-
-Title:
-{title}
-
-Original author-supplied tags (may be noisy or missing):
-{tags_list}
-
-Markdown body:
-{content_markdown}
-
---- TAXONOMY ---
-
-The format is:
-• Cluster
-- Canonical tag (Synonyms; separated by "")
-
-• Core AI Safety & Alignment
-- AI alignment (Human alignment)
-- Existential risk (X-risk)
-- Threat models (AI) (AI threat models)
-- Interpretability (Interpretability (ML & AI); Transparency)
-- Inner alignment
-- Outer alignment
-- Deceptive alignment
-- Eliciting latent knowledge (ELK)
-- Robustness (Adversarial robustness)
-- Alignment field-building (AI alignment field-building)
-- Value learning (Preference learning; Alignment via human values)
-
-• AI Governance & Policy
-- AI governance (GovAI)
-- Compute governance (GPU export controls; Chip governance)
-- AI regulation (Regulation)
-- Standards & auditing (Safety standards; Red-teaming)
-- Responsible scaling (Scaling policies; RSF)
-- International coordination (Geopolitics)
-- Slowing down AI (Slow takeoff; Pause AI)
-- Open-source models (Open-source LLMs)
-- Policy (Public policy (generic))
-- Compute controls (Hardware throttling)
-
-• Technical ML Safety
-- Reinforcement learning (RL)
-- Human feedback (RLHF; RLAIF)
-- Model editing (Model surgery)
-- Scalable oversight (Debate; Tree-of-thought)
-- CoT alignment (CoT alignment)
-- Scaling laws
-- Benchmarks & evals (Safety benchmarks)
-- Mechanistic interpretability
-- Value decomposition (Shard theory)
-
-• Forecasting & World Modeling
-- World modeling
-- Forecasting (Quantitative forecasting)
-- Prediction markets
-
-• Biorisk & Other GCRs
-- Biorisk (Biosecurity; Pandemic preparedness)
-- Nuclear risk (Nuclear war; Nuclear winter)
-- Global catastrophic risk (GCR)
-
-• Effective Altruism & Meta
-- Cause prioritization
-- Effective giving
-- Career choice (Career planning)
-- Community building (Building effective altruism)
-- Field-building (AI)
-- Epistemics & rationality (Rationality)
-
-• Philosophy & Foundations
-- Decision theory (CDT; EDT; UDT)
-- Moral uncertainty
-- Population ethics
-- Agent foundations (Agent foundations research)
-- Value drift
-- Info hazards (Information hazards)
-
-• Org-specific updates
-- Anthropic
-- OpenAI
-- DeepMind
-- Meta
-- ARC (Alignment Research Center)
-
----
-
-Remember: return only JSON with "cluster" and "tags".
-"""
-    raw_response = call_gemini_api(gemini_model_pro, prompt)
-
-    if raw_response.startswith("Error:") or raw_response.startswith("Analysis skipped"):
-        logging.warning(f"Cluster tag generation failed or skipped: {raw_response}")
-        return {"error": raw_response}
-
-    # --- Robust JSON Parsing ---
-    cleaned_response = raw_response.strip()
-    # Try to find JSON block even if there's surrounding text (e.g., ```json ... ```)
-    json_match = re.search(r'```json\s*(\{.*?\})\s*```|\{(?:[^{}]|\{[^{}]*\})*\}', cleaned_response, re.DOTALL)
-
-    if not json_match:
-        logging.error(f"Error: Could not find valid JSON in cluster tag API response.")
-        logging.debug(f"Cleaned response was: '{cleaned_response}'")
-        return {"error": "Failed to find JSON in response"}
-
-    json_str = json_match.group(1) or json_match.group(0) # Prefer fenced block
-
-    try:
-        parsed_json = json.loads(json_str)
-        if isinstance(parsed_json, dict) and \
-           "cluster" in parsed_json and isinstance(parsed_json["cluster"], str) and \
-           "tags" in parsed_json and isinstance(parsed_json["tags"], list) and \
-           all(isinstance(tag, str) for tag in parsed_json["tags"]):
-            logging.debug(f"Successfully parsed cluster tags: {parsed_json}")
-            return parsed_json
-        else:
-            logging.warning(f"Warning: Parsed JSON from cluster tag API has unexpected structure/types: {parsed_json}")
-            return {"error": "Parsed JSON has unexpected structure or types"}
-    except json.JSONDecodeError as e:
-        logging.error(f"Error: Failed to parse JSON from cluster tag API response. Error: {e}")
-        logging.debug(f"Attempted to parse JSON string: '{json_str}'")
-        return {"error": f"Failed to parse JSON response: {e}"}
-    except Exception as e:
-        logging.error(f"Error: Unexpected error processing cluster tag API response: {e}", exc_info=True)
-        return {"error": f"Unexpected error processing cluster tag response: {e}"}
-
-# --- Gemini Flash Guardrail ---
-def is_ai_safety_post(title: str, html_body: str, max_chars: int = 3000) -> bool:
-    """
-    Fast yes/no guard-rail using Gemini Flash. Returns True if the post's
-    primary topic seems AI-safety-related. Defaults to False on errors.
-    """
-    if not gemini_model_flash:
-        logging.warning("Flash guard-rail check skipped: Gemini Flash model not initialized. Defaulting to False (fail-closed).")
-        return False
-
-    logging.debug(f"Running AI safety guard-rail check for title: '{title[:80]}...'")
-
-    snippet = ""
-    try:
-        # Extract text content more robustly
-        soup = BeautifulSoup(html_body or "", 'html.parser')
-        text_content = soup.get_text(separator='\n', strip=True)
-        snippet = text_content[:max_chars] # Truncate
-        if len(text_content) > max_chars:
-             logging.debug(f"Truncated content snippet to {max_chars} characters for guard-rail check.")
-    except Exception as e:
-        logging.warning(f"Error during snippet extraction for guard-rail: {e}. Using empty snippet.")
-        snippet = ""
-
-    if not snippet.strip():
-        logging.warning(f"Guard-rail check skipped for '{title[:80]}...': Content snippet is empty after cleaning. Defaulting to False.")
-        return False
-
-    prompt = f"""You are an expert AI-safety content curator.
-Your task is to determine if the *primary focus* of the following text is AI safety or a closely related field like AI alignment, AI existential risk (x-risk), AI governance, technical machine learning safety, AI policy, responsible AI development, or the societal impacts *specifically stemming from advanced AI capabilities*.
-
-Analyze the provided title and content snippet.
-
-Answer ONLY with the word YES or the word NO. Do not provide any explanation or surrounding text.
-
-Title: {title[:300]}
-
-Content Snippet:
-{snippet}
-
-Is the PRIMARY FOCUS AI safety or a closely related field? Answer YES or NO (do not include any other text):"""
-
-    # Use a specific config for Flash (faster, cheaper, less critical)
-    flash_config = genai_types.GenerationConfig(temperature=0.0, max_output_tokens=50)
-    flash_safety = {k: genai_types.HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE for k in SAFETY_SETTINGS} # Slightly stricter safety for fast check
-
-    raw_response = call_gemini_api(gemini_model_flash, prompt, generation_config=flash_config) # Use the main helper
-
-    # --- Strict Check (Fail-Closed) ---
-    answer = raw_response.strip().upper()
-    logging.debug(f"Guard-rail check raw response for '{title[:50]}...': '{raw_response}' -> Answer: '{answer}'")
-
-    if answer == "YES":
-        logging.info(f"Guard-rail PASSED for '{title[:80]}...'")
-        return True
-    elif answer == "NO":
-        logging.info(f"Guard-rail FAILED (response was NO) for '{title[:80]}...'")
-        return False
-    else:
-        # Any other response (including errors from call_gemini_api) -> Fail Closed
-        logging.warning(f"Guard-rail check for '{title[:80]}...' yielded non-YES/NO or error: '{raw_response}'. Defaulting to False.")
-        return False
-
-# ================================================================
-#                      OpenAI Embedding Helper
-# ================================================================
-
-def generate_embeddings(short_text: str, full_text: str, model: str = "text-embedding-3-small") -> Tuple[Optional[List[float]], Optional[List[float]]]:
-    """Generates embeddings for short and full text using OpenAI."""
-    if not openai_client:
-        logging.warning("OpenAI embedding generation skipped: client not initialized.")
-        return None, None
-
-    inputs_to_embed = []
-    input_map = {} # Map index back to 'short' or 'full'
-    idx = 0
-
-    # Ensure texts are non-empty before adding
-    short_text_clean = short_text.strip() if short_text else ""
-    full_text_clean = full_text.strip() if full_text else ""
-
-    if short_text_clean:
-        inputs_to_embed.append(short_text_clean)
-        input_map[idx] = "short"
-        idx += 1
-        logging.debug(f"Adding short text for embedding (len={len(short_text_clean)}): '{short_text_clean[:100]}...'")
-    else:
-        logging.debug("Skipping short text embedding: input was empty.")
-
-    if full_text_clean:
-        inputs_to_embed.append(full_text_clean)
-        input_map[idx] = "full"
-        idx += 1
-        logging.debug(f"Adding full text for embedding (len={len(full_text_clean)}): '{full_text_clean[:100]}...'")
-    else:
-         logging.debug("Skipping full text embedding: input was empty.")
-
-    if not inputs_to_embed:
-        logging.warning("OpenAI embedding generation skipped: no non-empty text provided.")
-        return None, None
-
-    short_embedding = None
-    full_embedding = None
-
-    try:
-        logging.debug(f"Calling OpenAI embeddings API ({model}) for {len(inputs_to_embed)} input(s).")
-        response = openai_client.embeddings.create(model=model, input=inputs_to_embed)
-        embeds_data = response.data
-
-        if len(embeds_data) != len(inputs_to_embed):
-             logging.warning(f"OpenAI embedding API returned {len(embeds_data)} embeddings, expected {len(inputs_to_embed)}. Mapping might be incorrect.")
-
-        for i, data in enumerate(embeds_data):
-            if i in input_map:
-                embed_type = input_map[i]
-                if embed_type == "short":
-                    short_embedding = data.embedding
-                elif embed_type == "full":
-                    full_embedding = data.embedding
-            else:
-                logging.warning(f"Received embedding at index {i}, but couldn't map it back to 'short' or 'full'.")
-
-        logging.info(f"OpenAI embedding generation successful. Short generated: {'Yes' if short_embedding else 'No'}, Full generated: {'Yes' if full_embedding else 'No'}")
-        return short_embedding, full_embedding
-
-    except (OpenAI_APIError, OpenAI_RateLimitError) as e:
-        logging.error(f"OpenAI API error during embedding generation: {e}")
-        return None, None
-    except Exception as e:
-        logging.error(f"Unexpected error during OpenAI embedding generation: {e}", exc_info=True)
-        return None, None
-
-# ================================================================
 #                  AssemblyAI Transcription Helper
 # ================================================================
 
@@ -754,6 +613,58 @@ def transcribe_audio_assemblyai(audio_url: str, entry_title: str) -> Optional[st
         # Catch potential network errors, timeouts, SDK issues etc.
         logging.error(f"  Unexpected error during AssemblyAI transcription for '{entry_title[:50]}...': {type(e).__name__} - {e}", exc_info=True)
         return None
+
+# ================================================================
+#                     OpenAI Embedding Helper
+# ================================================================
+
+def generate_embeddings(short_text: str, full_text: str, model="text-embedding-3-small") -> tuple[list[float] | None, list[float] | None]:
+    """
+    Generates short and full embeddings for the given texts using OpenAI.
+
+    Args:
+        short_text: Text to embed for the 'short' version (e.g., title).
+        full_text: Text to embed for the 'full' version (e.g., title + summaries).
+        model: The OpenAI embedding model to use.
+
+    Returns:
+        A tuple containing (embedding_short, embedding_full).
+        Returns (None, None) if the client is not available or if API call fails.
+    """
+    if not openai_client:
+        logging.warning("OpenAI client not initialized. Skipping embedding generation.")
+        return None, None
+
+    # Ensure inputs are strings, even if empty
+    short_text = short_text or ""
+    full_text = full_text or ""
+
+    # Avoid API call if both inputs are effectively empty
+    if not short_text.strip() and not full_text.strip():
+        logging.debug("Skipping embedding generation: Both short and full texts are empty.")
+        return None, None
+
+    try:
+        logging.debug(f"  -> Generating OpenAI embeddings using model '{model}'...")
+        response = openai_client.embeddings.create(
+            model=model,
+            input=[short_text, full_text] # Send both texts in one request
+        )
+        # response.data should contain two embedding objects
+        if len(response.data) == 2:
+            embedding_short = response.data[0].embedding
+            embedding_full = response.data[1].embedding
+            logging.debug(f"  -> OpenAI embeddings generated successfully.")
+            return embedding_short, embedding_full
+        else:
+            logging.warning(f"Unexpected number of embeddings received from OpenAI API: {len(response.data)}")
+            return None, None
+    except (OpenAI_APIError, OpenAI_RateLimitError) as e:
+        logging.error(f"OpenAI API error during embedding generation: {e}")
+        return None, None
+    except Exception as e:
+        logging.error(f"Unexpected error during OpenAI embedding generation: {e}", exc_info=True)
+        return None, None
 
 # ================================================================
 #                      Feed Fetching Iterator
@@ -1211,7 +1122,7 @@ def main():
 
                 if analysis_content and analysis_content.strip(): # This check is now somewhat redundant due to the new skip.
                     logging.info("  -> Performing AI analyses on available content...")
-                    # Gemini Analyses
+                    # OpenAI GPT-4o Analyses
                     sentence_summary = summarize_text(analysis_content)
                     if sentence_summary is None or sentence_summary.startswith("Error:") or sentence_summary == "Content was empty.":
                         logging.warning(f"     Sentence summary failed/skipped: {sentence_summary}")
@@ -1344,40 +1255,9 @@ def main():
          print("\nKeyboard interrupt detected. Shutting down...")
          if conn: conn.rollback() # Rollback any pending transaction
     except Exception as e:
-        logging.critical(f"An unexpected critical error occurred in the main processing loop: {e}", exc_info=True)
-        print(f"CRITICAL ERROR: An unexpected error occurred: {e}")
-        if conn: conn.rollback()
-    finally:
-        # -------- 6. Close Database Connection --------
-        if conn:
-            try:
-                conn.close()
-                print("\nDatabase connection closed.")
-                logging.info("Database connection closed.")
-            except Exception as close_e:
-                logging.error(f"Error closing database connection: {close_e}")
-
-    # -------- 7. Print Final Summary --------
-    end_time = time.time()
-    duration = end_time - start_time
-    print("\n================================================================")
-    print("--- Processing Summary ---")
-    print("================================================================")
-    print(f"Total Feeds Processed: {feed_counter}")
-    print(f"Total Entries Checked Across Feeds: {total_processed_count}")
-    print(f"Total Entries Skipped (Duplicate/Date/Guardrail): {total_skipped_count}")
-    # MODIFIED: Clarified meaning of processed count
-    processed_attempted = total_inserted_count + total_db_insert_failures
-    print(f"Total Entries Processed (Analysis + DB Insert Attempt): {processed_attempted}")
-    print(f"  - Posts with >=1 Failed/Skipped Analysis Step: {total_failed_analysis_count}")
-    # MODIFIED: Updated success/failure counts
-    print(f"Total Successful DB Insert Attempts (or ignored by ON CONFLICT): {total_inserted_count}")
-    print(f"Total Failed DB Insert Attempts: {total_db_insert_failures}")
-    print(f"Script finished at {datetime.now(timezone.utc)}")
-    print(f"Total execution time: {duration:.2f} seconds")
-    print("================================================================")
-    logging.info(f"Script finished. Duration: {duration:.2f}s. Checked: {total_processed_count}. Skipped: {total_skipped_count}. DB Success/Ignored: {total_inserted_count}. DB Fail: {total_db_insert_failures}. Analysis Fail: {total_failed_analysis_count}.")
-
+        logging.critical(f"CRITICAL ERROR initializing API clients (OpenAI): {e}", exc_info=True)
+        # Decide if script should exit if *any* client fails
+        sys.exit(1) # Exit if essential clients fail
 
 if __name__ == "__main__":
     main()
