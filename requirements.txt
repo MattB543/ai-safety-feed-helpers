@@ -1,2 +1,6 @@
 assemblyai
-python-dotenv 
+python-dotenv
+psycopg2-binary
+openai
+cloudinary
+Pillow 
