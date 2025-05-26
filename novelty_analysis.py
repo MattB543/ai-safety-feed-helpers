@@ -240,9 +240,23 @@ def main():
                 # 3️⃣  overlap filter
                 overlap_ids = openai_json(build_overlap_prompt(ref, cands),
                                            temperature=0.0)
+                
                 overlap_int_ids = set()
-                if isinstance(overlap_ids, list):
-                    for item_id in overlap_ids:
+                
+                # Handle both {"ids": [...]} and plain [...] formats
+                ids_to_process = None
+                if isinstance(overlap_ids, dict) and "ids" in overlap_ids:
+                    ids_to_process = overlap_ids["ids"]
+                elif isinstance(overlap_ids, dict) and "result" in overlap_ids:
+                    ids_to_process = overlap_ids["result"]
+                elif isinstance(overlap_ids, list):
+                    ids_to_process = overlap_ids
+                else:
+                    logging.warning("   → Unexpected overlap response format: %s", overlap_ids)
+                    ids_to_process = []
+                
+                if isinstance(ids_to_process, list):
+                    for item_id in ids_to_process:
                         try:
                             overlap_int_ids.add(int(item_id))
                         except (ValueError, TypeError):

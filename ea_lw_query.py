@@ -1170,19 +1170,17 @@ def main():
 
                 # --- 6e. Generate Embeddings (After Gemini, uses title & results) ---
                 print("  -> Generating OpenAI embeddings...")
-                # Prepare text inputs for embeddings
-                short_text_input = title or "" # Use title for short embedding
+                # Prepare text inputs for embeddings to match backfill_embeddings.py flow
+                short_text_input = title or "" # Use title for short embedding (equivalent to cleaned_title)
 
-                # Combine title and available analysis results for full embedding
-                # Use the top-level safe_join helper
+                # Combine analysis results for full embedding (matching backfill pattern)
                 full_text_parts = [
-                    title,
-                    f"Authors: {', '.join(authors_list)}", # <<< FORMATTED AUTHORS USED HERE
-                    sentence_summary,
-                    paragraph_summary,  
-                    key_implication
+                    sentence_summary or "",
+                    paragraph_summary or "",  
+                    key_implication or "",
+                    ", ".join(db_tags) if db_tags else ""  # Convert tags list to string like topic field
                 ]
-                full_text_input = safe_join("\n\n", full_text_parts) # Join with double newline
+                full_text_input = "\n".join(full_text_parts) # Join with single newline to match backfill pattern
 
                 # Call the embedding function (uses global openai_client)
                 embedding_short_vector, embedding_full_vector = generate_embeddings(

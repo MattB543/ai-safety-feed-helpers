@@ -1330,17 +1330,19 @@ def main():
                             # Optionally: current_post_analysis_failed = True
 
                     # OpenAI Embeddings
-                    # Prepare text for embeddings
+                    # Prepare text for embeddings (matching backfill script format)
                     text_for_short_embedding = title if title and title != 'N/A' else ""
                     
-                    full_embedding_components = [text_for_short_embedding]
-                    # Add summaries to embedding text only if they are valid strings
-                    if sentence_summary and not (sentence_summary.startswith("Error:") or sentence_summary.startswith("Content was empty.") or sentence_summary.startswith("Analysis skipped")):
-                        full_embedding_components.append(sentence_summary)
-                    if paragraph_summary and not (paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Content was empty.") or paragraph_summary.startswith("Analysis skipped")):
-                        full_embedding_components.append(paragraph_summary)
+                    # Prepare components for full embedding text, using empty string for None/failed values
+                    sentence_summary_text = sentence_summary if sentence_summary and not (sentence_summary.startswith("Error:") or sentence_summary.startswith("Content was empty.") or sentence_summary.startswith("Analysis skipped")) else ""
+                    paragraph_summary_text = paragraph_summary if paragraph_summary and not (paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Content was empty.") or paragraph_summary.startswith("Analysis skipped")) else ""
+                    key_implication_text = key_implication if key_implication and not (key_implication.startswith("Error:") or key_implication.startswith("Content was empty.") or key_implication.startswith("Analysis skipped")) else ""
                     
-                    text_for_full_embedding = "\\n\\n".join(c for c in full_embedding_components if c and c.strip()).strip()
+                    # Convert db_tags list to string representation (matching topics field in backfill script)
+                    topics_text = ", ".join(db_tags) if db_tags and isinstance(db_tags, list) else ""
+                    
+                    # Combine full embedding components with single newlines (matching backfill format)
+                    text_for_full_embedding = f"{sentence_summary_text}\n{paragraph_summary_text}\n{key_implication_text}\n{topics_text}"
 
                     # Check if openai_client is available and there's text to embed
                     if openai_client and (text_for_short_embedding.strip() or text_for_full_embedding.strip()):

@@ -113,11 +113,16 @@ def call_gpt_api(prompt: str,
                  temperature: float = 0.2) -> str:
     """
     Sends a single-prompt exchange to OpenAI ChatCompletions and
-    returns the content string (or an 'Error:' string on failure).
+    returns the content string. Raises exceptions on failure.
+    
+    Raises:
+        ValueError: If OpenAI client not initialized or API returns no content
+        OpenAI_APIError: For OpenAI API errors
+        OpenAI_RateLimitError: For OpenAI rate limit errors
+        Exception: For other unexpected errors
     """
     if not openai_client:
-        logging.warning("OpenAI client not initialised.")
-        return "Analysis skipped (client missing)."
+        raise ValueError("OpenAI client not initialized")
 
     try:
         response = openai_client.chat.completions.create(
@@ -128,18 +133,19 @@ def call_gpt_api(prompt: str,
                 {"role": "user", "content": prompt}
             ],
             temperature=temperature)
+        
         # Check if choices is not empty and message content exists
         if response.choices and response.choices[0].message and response.choices[0].message.content:
             return response.choices[0].message.content.strip()
         else:
-            logging.warning("OpenAI API call returned no content or unexpected response structure.")
-            return "Error: OpenAI API returned no content."
+            raise ValueError("OpenAI API returned no content or unexpected response structure")
+            
     except (OpenAI_APIError, OpenAI_RateLimitError) as e:
         logging.error(f"OpenAI API error: {e}")
-        return f"Error: {type(e).__name__}"
+        raise
     except Exception as e:
         logging.error(f"Unexpected error during OpenAI API call: {e}", exc_info=True)
-        return f"Error: {type(e).__name__}"
+        raise
 
 # ---------- Specific Analysis Functions ----------
 
@@ -148,14 +154,21 @@ def summarize_text(text_to_summarize: str) -> str:
     if not text_to_summarize or text_to_summarize.isspace():
         logging.info("Skipping sentence summary: Input content was empty.")
         return "Content was empty."
+    
     prompt = f"Summarize the following AI safety content in 2 concise sentences (maximum 50 words). Focus on the core argument, key insight, or main conclusion rather than methodology. Use clear, accessible language while preserving technical accuracy. The summary should be very readable and should help readers quickly understand what makes this content valuable or interesting and decide if they want to read more.\n\nContent to summarize:\n{text_to_summarize}"
-    return call_gpt_api(prompt)
+    
+    try:
+        return call_gpt_api(prompt)
+    except Exception as e:
+        logging.warning(f"Sentence summary failed: {type(e).__name__}: {e}")
+        return None
 
 def generate_paragraph_summary(text_to_summarize: str) -> str:
     """Generates a structured paragraph summary using the OpenAI GPT model."""
     if not text_to_summarize or text_to_summarize.isspace():
         logging.info("Skipping paragraph summary: Input content was empty.")
         return "Content was empty."
+    
     prompt = f"""
 Generate a structured summary of the following AI safety content so the reader can quickly understand the main points. The summary should consist of:
 
@@ -177,13 +190,19 @@ Rules:
 Content to summarize:
 {text_to_summarize}
 """
-    return call_gpt_api(prompt)
+    
+    try:
+        return call_gpt_api(prompt)
+    except Exception as e:
+        logging.warning(f"Paragraph summary failed: {type(e).__name__}: {e}")
+        return None
 
 def generate_key_implication(text_to_analyze: str) -> str:
     """Identifies the single most important logical consequence using the OpenAI GPT model."""
     if not text_to_analyze or text_to_analyze.isspace():
         logging.info("Skipping key implication: Input content was empty.")
         return "Content was empty."
+    
     prompt = f"""
 Based on the AI safety content below, identify the single most important logical consequence or implication in one concise sentence (25-35 words). Focus on:
 
@@ -197,7 +216,12 @@ The implication should represent a direct consequence of the content's argument,
 Content to analyze:
 {text_to_analyze}
 """
-    return call_gpt_api(prompt)
+    
+    try:
+        return call_gpt_api(prompt)
+    except Exception as e:
+        logging.warning(f"Key implication generation failed: {type(e).__name__}: {e}")
+        return None
 
 def generate_cluster_tag(title: str, tags_list: List[str], content_markdown: str) -> Dict[str, Any]:
     """
@@ -217,7 +241,7 @@ Given one blog-style post, do BOTH of the following:
 1. **Pick exactly one "Cluster"** that best captures the *main theme*
    (see the list of Clusters below).
 
-2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
+2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
    describe the post.
    • Tags *must* come from the taxonomy.
    • Prefer the most specific tags that materially help the reader; skip
@@ -324,11 +348,9 @@ The format is:
 
 Remember: return only JSON with "cluster" and "tags".
 """
-    raw_response = call_gpt_api(prompt)
-    if raw_response.startswith("Error:") or raw_response == "Content was empty.":
-        return {"error": raw_response}
-
+    
     try:
+        raw_response = call_gpt_api(prompt)
         # Try to parse the response as JSON
         json_response = json.loads(raw_response)
         # Basic validation
@@ -340,12 +362,15 @@ Remember: return only JSON with "cluster" and "tags".
             return {"error": "Tags field was not a list"}
         # Return the parsed response
         return json_response
+    except (ValueError, OpenAI_APIError, OpenAI_RateLimitError) as e:
+        logging.warning(f"Cluster/tag generation failed: {type(e).__name__}: {e}")
+        return {"error": f"API error: {type(e).__name__}"}
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse cluster/tag JSON response: {e}")
         return {"error": f"JSON parse error: {str(e)}"}
     except Exception as e:
         logging.error(f"Unexpected error processing cluster/tag response: {e}")
-        return {"error": f"Processing error: {str(e)}"}
+        return {"error": f"Processing error: {type(e).__name__}"}
 
 def is_ai_safety_post(title: str, html_body: str) -> bool:
     """
@@ -384,27 +409,28 @@ Rules for inclusion:
 Respond with ONLY "yes" or "no". Use "yes" if you are reasonably confident the content meets the criteria, otherwise use "no".
 """
     
-    response = call_gpt_api(
-        prompt=prompt,
-        model="gpt-4.1",  # Use the fast model for this guardrail
-        temperature=0.1   # Low temperature for more consistent yes/no
-    )
+    try:
+        response = call_gpt_api(
+            prompt=prompt,
+            model="gpt-4.1",  # Use the fast model for this guardrail
+            temperature=0.1   # Low temperature for more consistent yes/no
+        )
+        
+        # Clean and validate response
+        response = response.strip().lower()
+        is_relevant = response == "yes"
 
-    # Clean and validate response
-    if response.startswith("Error:"):
-        logging.warning(f"AI safety guard-rail check failed: {response}. Defaulting to True (fail-open).")
+        # Log the decision
+        if is_relevant:
+            logging.debug(f"Guard-rail: Content accepted as AI safety relevant.")
+        else:
+            logging.info(f"Guard-rail: Content rejected as not sufficiently AI safety focused.")
+
+        return is_relevant
+        
+    except Exception as e:
+        logging.warning(f"AI safety guard-rail check failed: {type(e).__name__}: {e}. Defaulting to True (fail-open).")
         return True
-
-    response = response.strip().lower()
-    is_relevant = response == "yes"
-
-    # Log the decision
-    if is_relevant:
-        logging.debug(f"Guard-rail: Content accepted as AI safety relevant.")
-    else:
-        logging.info(f"Guard-rail: Content rejected as not sufficiently AI safety focused.")
-
-    return is_relevant
 
 # ================================================================
 #                         Constants
@@ -670,6 +696,30 @@ def generate_embeddings(short_text: str, full_text: str, model="text-embedding-3
 #                      Feed Fetching Iterator
 # ================================================================
 
+def extract_audio_url(entry):
+    """Extract audio URL from RSS entry."""
+    # Check enclosures
+    for enc in entry.get("enclosures", []):
+        if isinstance(enc, dict) and enc.get("type", "").startswith("audio/") and enc.get("href"):
+            return enc["href"]
+    
+    # Check links
+    for link in entry.get("links", []):
+        if isinstance(link, dict) and link.get('rel') == 'enclosure' and link.get('type', '').startswith('audio/') and link.get('href'):
+            return link["href"]
+    
+    # Check media_content
+    for media in entry.get("media_content", []):
+        if isinstance(media, dict) and media.get("medium") == "audio" and media.get("url"):
+            return media["url"]
+    
+    # Check if main link is audio file
+    link_url = entry.get("link", "")
+    if link_url and link_url.endswith((".mp3", ".m4a", ".wav")):
+        return link_url
+    
+    return None
+
 def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
     """
     Simplified iterator: Fetches and yields basic info for each entry in an RSS feed.
@@ -759,26 +809,7 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         html_body = str(html_body) if html_body else ""
 
         # --- Extract Audio URL ---
-        audio_url = None
-        if entry.get("enclosures"):
-            for enc in entry.enclosures:
-                if isinstance(enc, dict) and enc.get("type", "").startswith("audio/") and enc.get("href"):
-                    audio_url = enc.get("href")
-                    break
-        if not audio_url and entry.get("links"):
-             for lnk in entry.links:
-                 if isinstance(lnk, dict) and lnk.get('rel') == 'enclosure' and lnk.get('type', '').startswith('audio/') and lnk.get('href'):
-                     audio_url = lnk.get('href')
-                     break
-        if not audio_url and entry.get("media_content"):
-             for media in entry.media_content:
-                 if isinstance(media, dict) and media.get("medium") == "audio" and media.get("url"):
-                     audio_url = media.get("url")
-                     break
-        if not audio_url and entry.get("link"):
-            link_url = entry.get("link")
-            if link_url.endswith((".mp3", ".m4a", ".wav")): # Check for common audio extensions
-                audio_url = link_url
+        audio_url = extract_audio_url(entry)
 
         # --- Extract Image URL ---
         image_url = None
@@ -1124,19 +1155,19 @@ def main():
                     logging.info("  -> Performing AI analyses on available content...")
                     # OpenAI GPT-4o Analyses
                     sentence_summary = summarize_text(analysis_content)
-                    if sentence_summary is None or sentence_summary.startswith("Error:") or sentence_summary == "Content was empty.":
+                    if sentence_summary is None or sentence_summary == "Content was empty.":
                         logging.warning(f"     Sentence summary failed/skipped: {sentence_summary}")
                         sentence_summary = None; analysis_step_failed = True
                     else: logging.debug("     Sentence summary generated.")
 
                     paragraph_summary = generate_paragraph_summary(analysis_content)
-                    if paragraph_summary is None or paragraph_summary.startswith("Error:") or paragraph_summary == "Content was empty.":
+                    if paragraph_summary is None or paragraph_summary == "Content was empty.":
                         logging.warning(f"     Paragraph summary failed/skipped: {paragraph_summary}")
                         paragraph_summary = None; analysis_step_failed = True
                     else: logging.debug("     Paragraph summary generated.")
 
                     key_implication = generate_key_implication(analysis_content)
-                    if key_implication is None or key_implication.startswith("Error:") or key_implication == "Content was empty.":
+                    if key_implication is None or key_implication == "Content was empty.":
                         logging.warning(f"     Key implication failed/skipped: {key_implication}")
                         key_implication = None; analysis_step_failed = True
                     else: logging.debug("     Key implication generated.")
@@ -1157,13 +1188,19 @@ def main():
 
                     # OpenAI Embeddings
                     logging.info("  -> Generating Embeddings...")
-                    # Use the analysis results and title for embeddings
-                    full_text_for_embedding = f"Title: {title}\nSummary: {sentence_summary or 'N/A'}\nKey Points: {paragraph_summary or 'N/A'}\nImplication: {key_implication or 'N/A'}".strip()
-                    short_text_for_embedding = f"{title}. {sentence_summary or ''}".strip() or title
+                    # Format embeddings to match the standard format
+                    short_text_for_embedding = title or ""
+                    
+                    # Convert topics list to string for embedding
+                    topics_str = ""
+                    if db_tags:
+                        topics_str = ", ".join(db_tags) if isinstance(db_tags, list) else str(db_tags)
+                    
+                    full_text_for_embedding = f"{sentence_summary or ''}\n{paragraph_summary or ''}\n{key_implication or ''}\n{topics_str}"
 
                     embedding_short_vector, embedding_full_vector = generate_embeddings(
                         short_text=short_text_for_embedding,
-                        full_text=full_text_for_embedding # Or use analysis_content here if preferred
+                        full_text=full_text_for_embedding
                     )
                     if embedding_short_vector is None and embedding_full_vector is None:
                         logging.warning(f"     Embedding Generation failed or skipped.")

@@ -1,46 +1,46 @@
 {
-  "post_id": "substack:post:162651762",
-  "title": "The Last Human CEO",
-  "link": "https://www.dwarkesh.com/p/ai-firms-narration",
-  "published_parsed": "2025-05-01T23:00:27+00:00",
-  "html_body": "<p>Based on my essay about <a href=\"https://www.dwarkesh.com/p/ai-firm\" target=\"_blank\">AI firms.</a></p><p>Huge thanks to <a href=\"https://www.petrsalaba.cz/\" target=\"_blank\">Petr</a> and his team for bringing this to life!</p><p>Watch on <a href=\"https://youtu.be/bJD1NpdMY5s\" target=\"_blank\">YouTube</a>.</p><p>Thanks to Google for sponsoring. We used their Veo 2 model to make this <em>entire</em> video—it generated everything from the photorealistic humans to the claymation octopuses. If you’re a Gemini Advanced user, you can try Veo 2 now in the Gemini app. Just select Veo 2 in the dropdown, and type your video idea in the prompt bar. Get started today by going to <a href=\"https://gemini.google.com/\" target=\"_blank\">gemini.google.com</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>",
-  "audio_url": "https://api.substack.com/feed/podcast/162651762/c485711d53ca0e0a1e4234e7860d865e.mp3",
-  "image_url": "https://substackcdn.com/feed/podcast/69345/post/162651762/0f71bb06bac00cc19f82413317935957.jpg",
+  "post_id": "substack:post:164189186",
+  "title": "How Does Claude 4 Think? — Sholto Douglas & Trenton Bricken",
+  "link": "https://www.dwarkesh.com/p/sholto-trenton-2",
+  "published_parsed": "2025-05-22T20:53:36+00:00",
+  "html_body": "<p>New episode with my good friends <a href=\"https://x.com/_sholtodouglas?lang=en\" target=\"_blank\">Sholto Douglas</a> & <a href=\"https://x.com/trentonbricken?lang=en\" target=\"_blank\">Trenton Bricken</a>. Sholto focuses on scaling RL and Trenton researches mechanistic interpretability, both at Anthropic.</p><p>We talk through what’s changed in the last year of AI research; the new RL regime and how far it can scale; how to trace a model’s thoughts; and how countries, workers, and students should prepare for AGI.</p><p>See you next year for v3. <a href=\"https://www.youtube.com/watch?v=UTuuTTnjxMQ\" target=\"_blank\">Here’s last year’s episode</a>, btw. Enjoy!</p><p>Watch on <a href=\"https://youtu.be/64lXQP6cs5M\" target=\"_blank\">YouTube</a>; listen on <a href=\"https://podcasts.apple.com/us/podcast/dwarkesh-podcast/id1516093381?i=1000709488338\" target=\"_blank\">Apple Podcasts</a> or <a href=\"https://open.spotify.com/episode/3H46XEWBlUeTY1c1mHolqh?si=b645971b1af546fa\" target=\"_blank\">Spotify</a>.</p><p>----------</p><p>SPONSORS</p><p>* <a href=\"https://workos.com/\" target=\"_blank\">WorkOS</a> ensures that AI companies like OpenAI and Anthropic don't have to spend engineering time building enterprise features like access controls or SSO. It’s not that they don't need these features; it's just that WorkOS gives them battle-tested APIs that they can use for auth, provisioning, and more. Start building today at <a href=\"https://workos.com/\" target=\"_blank\">workos.com</a>.</p><p>* <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">Scale</a> is building the infrastructure for safer, smarter AI. Scale’s Data Foundry gives major AI labs access to high-quality data to fuel post-training, while their public leaderboards help assess model capabilities. They also just released Scale Evaluation, a new tool that diagnoses model limitations. If you’re an AI researcher or engineer, learn how Scale can help you push the frontier at <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">scale.com/dwarkesh</a>.</p><p>* <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">Lighthouse</a> is THE fastest immigration solution for the technology industry. They specialize in expert visas like the O-1A and EB-1A, and they’ve already helped companies like Cursor, Notion, and Replit navigate U.S. immigration. Explore which visa is right for you at <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">lighthousehq.com/ref/Dwarkesh</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p><p>----------</p><p>TIMESTAMPS</p><p>(00:00:00) – How far can RL scale?</p><p>(00:16:27) – Is continual learning a key bottleneck?</p><p>(00:31:59) – Model self-awareness</p><p>(00:50:32) – Taste and slop</p><p>(01:00:51) – How soon to fully autonomous agents?</p><p>(01:15:17) – Neuralese</p><p>(01:18:55) – Inference compute will bottleneck AGI</p><p>(01:23:01) – DeepSeek algorithmic improvements</p><p>(01:37:42) – Why are LLMs ‘baby AGI’ but not AlphaZero?</p><p>(01:45:38) – Mech interp</p><p>(01:56:15) – How countries should prepare for AGI</p><p>(02:10:26) – Automating white collar work</p><p>(02:15:35) – Advice for students</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>",
+  "audio_url": "https://api.substack.com/feed/podcast/164189186/f8b9e3b318b615e15a807aae787fce46.mp3",
+  "image_url": "https://substackcdn.com/feed/podcast/69345/post/164189186/fa32dce8c7c701886362484b34845f6c.jpg",
   "authors_list": [
     "Dwarkesh Patel"
   ],
   "tags": [],
   "source_name": "Dwarkesh Podcast",
   "raw_entry": {
-    "title": "The Last Human CEO",
+    "title": "How Does Claude 4 Think? — Sholto Douglas & Trenton Bricken",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://api.substack.com/feed/podcast/69345.rss",
-      "value": "The Last Human CEO"
+      "value": "How Does Claude 4 Think? — Sholto Douglas & Trenton Bricken"
     },
-    "summary": "<p>Based on my essay about <a href=\"https://www.dwarkesh.com/p/ai-firm\" target=\"_blank\">AI firms.</a></p><p>Huge thanks to <a href=\"https://www.petrsalaba.cz/\" target=\"_blank\">Petr</a> and his team for bringing this to life!</p><p>Watch on <a href=\"https://youtu.be/bJD1NpdMY5s\" target=\"_blank\">YouTube</a>.</p><p>Thanks to Google for sponsoring. We used their Veo 2 model to make this <em>entire</em> video—it generated everything from the photorealistic humans to the claymation octopuses. If you’re a Gemini Advanced user, you can try Veo 2 now in the Gemini app. Just select Veo 2 in the dropdown, and type your video idea in the prompt bar. Get started today by going to <a href=\"https://gemini.google.com/\" target=\"_blank\">gemini.google.com</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>",
+    "summary": "<p>New episode with my good friends <a href=\"https://x.com/_sholtodouglas?lang=en\" target=\"_blank\">Sholto Douglas</a> & <a href=\"https://x.com/trentonbricken?lang=en\" target=\"_blank\">Trenton Bricken</a>. Sholto focuses on scaling RL and Trenton researches mechanistic interpretability, both at Anthropic.</p><p>We talk through what’s changed in the last year of AI research; the new RL regime and how far it can scale; how to trace a model’s thoughts; and how countries, workers, and students should prepare for AGI.</p><p>See you next year for v3. <a href=\"https://www.youtube.com/watch?v=UTuuTTnjxMQ\" target=\"_blank\">Here’s last year’s episode</a>, btw. Enjoy!</p><p>Watch on <a href=\"https://youtu.be/64lXQP6cs5M\" target=\"_blank\">YouTube</a>; listen on <a href=\"https://podcasts.apple.com/us/podcast/dwarkesh-podcast/id1516093381?i=1000709488338\" target=\"_blank\">Apple Podcasts</a> or <a href=\"https://open.spotify.com/episode/3H46XEWBlUeTY1c1mHolqh?si=b645971b1af546fa\" target=\"_blank\">Spotify</a>.</p><p>----------</p><p>SPONSORS</p><p>* <a href=\"https://workos.com/\" target=\"_blank\">WorkOS</a> ensures that AI companies like OpenAI and Anthropic don't have to spend engineering time building enterprise features like access controls or SSO. It’s not that they don't need these features; it's just that WorkOS gives them battle-tested APIs that they can use for auth, provisioning, and more. Start building today at <a href=\"https://workos.com/\" target=\"_blank\">workos.com</a>.</p><p>* <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">Scale</a> is building the infrastructure for safer, smarter AI. Scale’s Data Foundry gives major AI labs access to high-quality data to fuel post-training, while their public leaderboards help assess model capabilities. They also just released Scale Evaluation, a new tool that diagnoses model limitations. If you’re an AI researcher or engineer, learn how Scale can help you push the frontier at <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">scale.com/dwarkesh</a>.</p><p>* <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">Lighthouse</a> is THE fastest immigration solution for the technology industry. They specialize in expert visas like the O-1A and EB-1A, and they’ve already helped companies like Cursor, Notion, and Replit navigate U.S. immigration. Explore which visa is right for you at <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">lighthousehq.com/ref/Dwarkesh</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p><p>----------</p><p>TIMESTAMPS</p><p>(00:00:00) – How far can RL scale?</p><p>(00:16:27) – Is continual learning a key bottleneck?</p><p>(00:31:59) – Model self-awareness</p><p>(00:50:32) – Taste and slop</p><p>(01:00:51) – How soon to fully autonomous agents?</p><p>(01:15:17) – Neuralese</p><p>(01:18:55) – Inference compute will bottleneck AGI</p><p>(01:23:01) – DeepSeek algorithmic improvements</p><p>(01:37:42) – Why are LLMs ‘baby AGI’ but not AlphaZero?</p><p>(01:45:38) – Mech interp</p><p>(01:56:15) – How countries should prepare for AGI</p><p>(02:10:26) – Automating white collar work</p><p>(02:15:35) – Advice for students</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>",
     "summary_detail": {
       "type": "text/html",
       "language": null,
       "base": "https://api.substack.com/feed/podcast/69345.rss",
-      "value": "<p>Based on my essay about <a href=\"https://www.dwarkesh.com/p/ai-firm\" target=\"_blank\">AI firms.</a></p><p>Huge thanks to <a href=\"https://www.petrsalaba.cz/\" target=\"_blank\">Petr</a> and his team for bringing this to life!</p><p>Watch on <a href=\"https://youtu.be/bJD1NpdMY5s\" target=\"_blank\">YouTube</a>.</p><p>Thanks to Google for sponsoring. We used their Veo 2 model to make this <em>entire</em> video—it generated everything from the photorealistic humans to the claymation octopuses. If you’re a Gemini Advanced user, you can try Veo 2 now in the Gemini app. Just select Veo 2 in the dropdown, and type your video idea in the prompt bar. Get started today by going to <a href=\"https://gemini.google.com/\" target=\"_blank\">gemini.google.com</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>"
+      "value": "<p>New episode with my good friends <a href=\"https://x.com/_sholtodouglas?lang=en\" target=\"_blank\">Sholto Douglas</a> & <a href=\"https://x.com/trentonbricken?lang=en\" target=\"_blank\">Trenton Bricken</a>. Sholto focuses on scaling RL and Trenton researches mechanistic interpretability, both at Anthropic.</p><p>We talk through what’s changed in the last year of AI research; the new RL regime and how far it can scale; how to trace a model’s thoughts; and how countries, workers, and students should prepare for AGI.</p><p>See you next year for v3. <a href=\"https://www.youtube.com/watch?v=UTuuTTnjxMQ\" target=\"_blank\">Here’s last year’s episode</a>, btw. Enjoy!</p><p>Watch on <a href=\"https://youtu.be/64lXQP6cs5M\" target=\"_blank\">YouTube</a>; listen on <a href=\"https://podcasts.apple.com/us/podcast/dwarkesh-podcast/id1516093381?i=1000709488338\" target=\"_blank\">Apple Podcasts</a> or <a href=\"https://open.spotify.com/episode/3H46XEWBlUeTY1c1mHolqh?si=b645971b1af546fa\" target=\"_blank\">Spotify</a>.</p><p>----------</p><p>SPONSORS</p><p>* <a href=\"https://workos.com/\" target=\"_blank\">WorkOS</a> ensures that AI companies like OpenAI and Anthropic don't have to spend engineering time building enterprise features like access controls or SSO. It’s not that they don't need these features; it's just that WorkOS gives them battle-tested APIs that they can use for auth, provisioning, and more. Start building today at <a href=\"https://workos.com/\" target=\"_blank\">workos.com</a>.</p><p>* <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">Scale</a> is building the infrastructure for safer, smarter AI. Scale’s Data Foundry gives major AI labs access to high-quality data to fuel post-training, while their public leaderboards help assess model capabilities. They also just released Scale Evaluation, a new tool that diagnoses model limitations. If you’re an AI researcher or engineer, learn how Scale can help you push the frontier at <a href=\"https://scale.com/dwarkesh\" target=\"_blank\">scale.com/dwarkesh</a>.</p><p>* <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">Lighthouse</a> is THE fastest immigration solution for the technology industry. They specialize in expert visas like the O-1A and EB-1A, and they’ve already helped companies like Cursor, Notion, and Replit navigate U.S. immigration. Explore which visa is right for you at <a href=\"https://www.lighthousehq.com/ref/Dwarkesh\" target=\"_blank\">lighthousehq.com/ref/Dwarkesh</a>.</p><p>To sponsor a future episode, visit <a href=\"https://www.dwarkesh.com/advertise\" target=\"_blank\">dwarkesh.com/advertise</a>.</p><p>----------</p><p>TIMESTAMPS</p><p>(00:00:00) – How far can RL scale?</p><p>(00:16:27) – Is continual learning a key bottleneck?</p><p>(00:31:59) – Model self-awareness</p><p>(00:50:32) – Taste and slop</p><p>(01:00:51) – How soon to fully autonomous agents?</p><p>(01:15:17) – Neuralese</p><p>(01:18:55) – Inference compute will bottleneck AGI</p><p>(01:23:01) – DeepSeek algorithmic improvements</p><p>(01:37:42) – Why are LLMs ‘baby AGI’ but not AlphaZero?</p><p>(01:45:38) – Mech interp</p><p>(01:56:15) – How countries should prepare for AGI</p><p>(02:10:26) – Automating white collar work</p><p>(02:15:35) – Advice for students</p> <br /><br />Get full access to Dwarkesh Podcast at <a href=\"https://www.dwarkesh.com/subscribe?utm_medium=podcast&#38;utm_campaign=CTA_4\">www.dwarkesh.com/subscribe</a>"
     },
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://www.dwarkesh.com/p/ai-firms-narration"
+        "href": "https://www.dwarkesh.com/p/sholto-trenton-2"
       },
       {
-        "length": "9881110",
+        "length": "138258955",
         "type": "audio/mpeg",
-        "href": "https://api.substack.com/feed/podcast/162651762/c485711d53ca0e0a1e4234e7860d865e.mp3",
+        "href": "https://api.substack.com/feed/podcast/164189186/f8b9e3b318b615e15a807aae787fce46.mp3",
         "rel": "enclosure"
       }
     ],
-    "link": "https://www.dwarkesh.com/p/ai-firms-narration",
-    "id": "substack:post:162651762",
+    "link": "https://www.dwarkesh.com/p/sholto-trenton-2",
+    "id": "substack:post:164189186",
     "guidislink": false,
     "authors": [
       {
@@ -54,22 +54,22 @@
     "author_detail": {
       "name": "Dwarkesh Patel"
     },
-    "published": "Thu, 01 May 2025 23:00:27 GMT",
+    "published": "Thu, 22 May 2025 20:53:36 GMT",
     "published_parsed": [
       2025,
       5,
-      1,
-      23,
-      0,
-      27,
+      22,
+      20,
+      53,
+      36,
       3,
-      121,
+      142,
       0
     ],
     "itunes_explicit": null,
-    "itunes_duration": "618",
+    "itunes_duration": "8641",
     "image": {
-      "href": "https://substackcdn.com/feed/podcast/69345/post/162651762/0f71bb06bac00cc19f82413317935957.jpg"
+      "href": "https://substackcdn.com/feed/podcast/69345/post/164189186/fa32dce8c7c701886362484b34845f6c.jpg"
     }
   }
 }

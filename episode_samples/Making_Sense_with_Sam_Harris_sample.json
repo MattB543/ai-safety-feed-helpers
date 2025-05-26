@@ -1,10 +1,10 @@
 {
-  "post_id": "1580266",
-  "title": "#414 - Strange Truths",
-  "link": "https://samharris.org/podcasts/making-sense-episodes/strange-truths",
-  "published_parsed": "2025-05-12T19:30:00+00:00",
-  "html_body": "<p dir=\"ltr\">Sam Harris speaks with David Deutsch about quantum physics and current events. They discuss the &ldquo;many-worlds&rdquo; interpretation of QM, Schr&ouml;dinger&rsquo;s cat, constructor theory,&nbsp; quantum computing and whether it will ever be practically possible, recent developments in AI, the prospects of artificial super-intelligence, the alignment problem, antisemitism and the historical persecution of Jews, misconceptions about Israel, the future of the Jews in Israel and the West, and other topics.</p>\n<p dir=\"ltr\"><strong>David Deutsch</strong> is a visiting professor of physics at the Centre for Quantum Computation at Oxford University, and an honorary fellow of Wolfson College, Oxford. He works on fundamental issues in physics, particularly the quantum theory of computation and information, and constructor theory.</p>\n<p dir=\"ltr\">He has written two books, <em><a href=\"https://amzn.to/3YGKUUo\" rel=\"noopener\" target=\"_blank\">The Fabric of Reality</a></em> and <em><a href=\"https://amzn.to/3F5WnGr\" rel=\"noopener\" target=\"_blank\">The Beginning of Infinity</a></em>, aimed at the general reader.</p>\n<p dir=\"ltr\">Website: <a href=\"http://daviddeutsch.org.uk\" rel=\"noopener\" target=\"_blank\">daviddeutsch.org.uk</a></p>\n<p dir=\"ltr\">X: <a href=\"https://x.com/DavidDeutschOxf\" rel=\"noopener\" target=\"_blank\">@DavidDeutschOxf</a></p>\n<p>Share this episode: <a href=\"https://www.samharris.org/podcasts/making-sense-episodes/strange-truths\" rel=\"noopener\" target=\"_blank\">https://www.samharris.org/podcasts/making-sense-episodes/strange-truths</a></p>\n<p>&nbsp;</p>\n<p dir=\"ltr\">Learning how to train your mind is the single greatest investment you can make in life. That&rsquo;s why Sam Harris created the <a href=\"https://www.wakingup.com/makingsense\" rel=\"noopener\" target=\"_blank\">Waking Up</a> app. From rational mindfulness practice to lessons on some of life&rsquo;s most important topics, join Sam as he demystifies the practice of meditation and explores the theory behind it.</p>\n<p>&nbsp;</p>",
-  "audio_url": "https://assets.samharris.org/episodes/audios/50c43ffa-ed74-4f30-9bcc-425d373fcc8e/Making_Sense_414_David_Deutsch_subscriber.mp3",
+  "post_id": "1580268",
+  "title": "#416 - “More From Sam”: Biden's Big Lie, Review of Tapper Interview, Trump, & a Case Against Israel's Actions in Gaza",
+  "link": "https://samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza",
+  "published_parsed": "2025-05-23T07:00:00+00:00",
+  "html_body": "<p dir=\"ltr\">Sam hopped back on with his manager and business partner, Jaron Lowenstein, to talk about current events and answer some of the questions you all submitted on Substack. They discuss the Biden cover-up and how it compares to Trump&rsquo;s transgressions, Sam&rsquo;s latest episode with Jake Tapper, whether Tapper had a journalistic responsibility to share what he knew about the cover-up sooner, and criticism from the audience about Sam&rsquo;s views on Israel&rsquo;s actions in Gaza.</p>\n<p dir=\"ltr\">Produced by Griffin Katz</p>\n<p>Share this episode: <a href=\"https://rss.samharris.org/Share%20this%20episode:%20https:/www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza\">https://www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza</a></p>",
+  "audio_url": "https://assets.samharris.org/episodes/audios/3b2c3c98-8989-4336-bd60-270133c3d8b1/Making_Sense_416_More_From_Sam_4_subscriber.mp3",
   "image_url": "https://assets.samharris.org/images/rss/making-sense-logo.png",
   "authors_list": [
     "Making Sense with Sam Harris"
@@ -12,67 +12,67 @@
   "tags": [],
   "source_name": "Making Sense with Sam Harris",
   "raw_entry": {
-    "title": "#414 - Strange Truths",
+    "title": "#416 - “More From Sam”: Biden's Big Lie, Review of Tapper Interview, Trump, & a Case Against Israel's Actions in Gaza",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://rss.samharris.org/feed?uid=PNIypzHCbq78upz",
-      "value": "#414 - Strange Truths"
+      "value": "#416 - “More From Sam”: Biden's Big Lie, Review of Tapper Interview, Trump, & a Case Against Israel's Actions in Gaza"
     },
-    "published": "Mon, 12 May 2025 19:30:00 +0000",
+    "published": "Fri, 23 May 2025 07:00:00 +0000",
     "published_parsed": [
       2025,
       5,
-      12,
-      19,
-      30,
+      23,
+      7,
       0,
       0,
-      132,
+      4,
+      143,
       0
     ],
-    "id": "1580266",
+    "id": "1580268",
     "guidislink": false,
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://samharris.org/podcasts/making-sense-episodes/strange-truths"
+        "href": "https://samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza"
       },
       {
         "length": "0",
         "type": "audio/mpeg",
-        "href": "https://assets.samharris.org/episodes/audios/50c43ffa-ed74-4f30-9bcc-425d373fcc8e/Making_Sense_414_David_Deutsch_subscriber.mp3",
+        "href": "https://assets.samharris.org/episodes/audios/3b2c3c98-8989-4336-bd60-270133c3d8b1/Making_Sense_416_More_From_Sam_4_subscriber.mp3",
         "rel": "enclosure"
       }
     ],
-    "link": "https://samharris.org/podcasts/making-sense-episodes/strange-truths",
-    "subtitle": "A Conversation with David Deutsch",
+    "link": "https://samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza",
+    "subtitle": "",
     "subtitle_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://rss.samharris.org/feed?uid=PNIypzHCbq78upz",
-      "value": "A Conversation with David Deutsch"
+      "value": ""
     },
-    "summary": "<p dir=\"ltr\">Sam Harris speaks with David Deutsch about quantum physics and current events. They discuss the &ldquo;many-worlds&rdquo; interpretation of QM, Schr&ouml;dinger&rsquo;s cat, constructor theory,&nbsp; quantum computing and whether it will ever be practically possible, recent developments in AI, the prospects of artificial super-intelligence, the alignment problem, antisemitism and the historical persecution of Jews, misconceptions about Israel, the future of the Jews in Israel and the West, and other topics.</p>\n<p dir=\"ltr\"><strong>David Deutsch</strong> is a visiting professor of physics at the Centre for Quantum Computation at Oxford University, and an honorary fellow of Wolfson College, Oxford. He works on fundamental issues in physics, particularly the quantum theory of computation and information, and constructor theory.</p>\n<p dir=\"ltr\">He has written two books, <em><a href=\"https://amzn.to/3YGKUUo\" rel=\"noopener\" target=\"_blank\">The Fabric of Reality</a></em> and <em><a href=\"https://amzn.to/3F5WnGr\" rel=\"noopener\" target=\"_blank\">The Beginning of Infinity</a></em>, aimed at the general reader.</p>\n<p dir=\"ltr\">Website: <a href=\"http://daviddeutsch.org.uk\" rel=\"noopener\" target=\"_blank\">daviddeutsch.org.uk</a></p>\n<p dir=\"ltr\">X: <a href=\"https://x.com/DavidDeutschOxf\" rel=\"noopener\" target=\"_blank\">@DavidDeutschOxf</a></p>\n<p>Share this episode: <a href=\"https://www.samharris.org/podcasts/making-sense-episodes/strange-truths\" rel=\"noopener\" target=\"_blank\">https://www.samharris.org/podcasts/making-sense-episodes/strange-truths</a></p>\n<p>&nbsp;</p>\n<p dir=\"ltr\">Learning how to train your mind is the single greatest investment you can make in life. That&rsquo;s why Sam Harris created the <a href=\"https://www.wakingup.com/makingsense\" rel=\"noopener\" target=\"_blank\">Waking Up</a> app. From rational mindfulness practice to lessons on some of life&rsquo;s most important topics, join Sam as he demystifies the practice of meditation and explores the theory behind it.</p>\n<p>&nbsp;</p>",
+    "summary": "<p dir=\"ltr\">Sam hopped back on with his manager and business partner, Jaron Lowenstein, to talk about current events and answer some of the questions you all submitted on Substack. They discuss the Biden cover-up and how it compares to Trump&rsquo;s transgressions, Sam&rsquo;s latest episode with Jake Tapper, whether Tapper had a journalistic responsibility to share what he knew about the cover-up sooner, and criticism from the audience about Sam&rsquo;s views on Israel&rsquo;s actions in Gaza.</p>\n<p dir=\"ltr\">Produced by Griffin Katz</p>\n<p>Share this episode: <a href=\"https://rss.samharris.org/Share%20this%20episode:%20https:/www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza\">https://www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza</a></p>",
     "summary_detail": {
       "type": "text/html",
       "language": null,
       "base": "https://rss.samharris.org/feed?uid=PNIypzHCbq78upz",
-      "value": "<p dir=\"ltr\">Sam Harris speaks with David Deutsch about quantum physics and current events. They discuss the &ldquo;many-worlds&rdquo; interpretation of QM, Schr&ouml;dinger&rsquo;s cat, constructor theory,&nbsp; quantum computing and whether it will ever be practically possible, recent developments in AI, the prospects of artificial super-intelligence, the alignment problem, antisemitism and the historical persecution of Jews, misconceptions about Israel, the future of the Jews in Israel and the West, and other topics.</p>\n<p dir=\"ltr\"><strong>David Deutsch</strong> is a visiting professor of physics at the Centre for Quantum Computation at Oxford University, and an honorary fellow of Wolfson College, Oxford. He works on fundamental issues in physics, particularly the quantum theory of computation and information, and constructor theory.</p>\n<p dir=\"ltr\">He has written two books, <em><a href=\"https://amzn.to/3YGKUUo\" rel=\"noopener\" target=\"_blank\">The Fabric of Reality</a></em> and <em><a href=\"https://amzn.to/3F5WnGr\" rel=\"noopener\" target=\"_blank\">The Beginning of Infinity</a></em>, aimed at the general reader.</p>\n<p dir=\"ltr\">Website: <a href=\"http://daviddeutsch.org.uk\" rel=\"noopener\" target=\"_blank\">daviddeutsch.org.uk</a></p>\n<p dir=\"ltr\">X: <a href=\"https://x.com/DavidDeutschOxf\" rel=\"noopener\" target=\"_blank\">@DavidDeutschOxf</a></p>\n<p>Share this episode: <a href=\"https://www.samharris.org/podcasts/making-sense-episodes/strange-truths\" rel=\"noopener\" target=\"_blank\">https://www.samharris.org/podcasts/making-sense-episodes/strange-truths</a></p>\n<p>&nbsp;</p>\n<p dir=\"ltr\">Learning how to train your mind is the single greatest investment you can make in life. That&rsquo;s why Sam Harris created the <a href=\"https://www.wakingup.com/makingsense\" rel=\"noopener\" target=\"_blank\">Waking Up</a> app. From rational mindfulness practice to lessons on some of life&rsquo;s most important topics, join Sam as he demystifies the practice of meditation and explores the theory behind it.</p>\n<p>&nbsp;</p>"
+      "value": "<p dir=\"ltr\">Sam hopped back on with his manager and business partner, Jaron Lowenstein, to talk about current events and answer some of the questions you all submitted on Substack. They discuss the Biden cover-up and how it compares to Trump&rsquo;s transgressions, Sam&rsquo;s latest episode with Jake Tapper, whether Tapper had a journalistic responsibility to share what he knew about the cover-up sooner, and criticism from the audience about Sam&rsquo;s views on Israel&rsquo;s actions in Gaza.</p>\n<p dir=\"ltr\">Produced by Griffin Katz</p>\n<p>Share this episode: <a href=\"https://rss.samharris.org/Share%20this%20episode:%20https:/www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza\">https://www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza</a></p>"
     },
     "content": [
       {
         "type": "text/html",
         "language": null,
         "base": "https://rss.samharris.org/feed?uid=PNIypzHCbq78upz",
-        "value": "<p dir=\"ltr\">Sam Harris speaks with David Deutsch about quantum physics and current events. They discuss the &ldquo;many-worlds&rdquo; interpretation of QM, Schr&ouml;dinger&rsquo;s cat, constructor theory,&nbsp; quantum computing and whether it will ever be practically possible, recent developments in AI, the prospects of artificial super-intelligence, the alignment problem, antisemitism and the historical persecution of Jews, misconceptions about Israel, the future of the Jews in Israel and the West, and other topics.</p>\n<p dir=\"ltr\"><strong>David Deutsch</strong> is a visiting professor of physics at the Centre for Quantum Computation at Oxford University, and an honorary fellow of Wolfson College, Oxford. He works on fundamental issues in physics, particularly the quantum theory of computation and information, and constructor theory.</p>\n<p dir=\"ltr\">He has written two books, <em><a href=\"https://amzn.to/3YGKUUo\" rel=\"noopener\" target=\"_blank\">The Fabric of Reality</a></em> and <em><a href=\"https://amzn.to/3F5WnGr\" rel=\"noopener\" target=\"_blank\">The Beginning of Infinity</a></em>, aimed at the general reader.</p>\n<p dir=\"ltr\">Website: <a href=\"http://daviddeutsch.org.uk\" rel=\"noopener\" target=\"_blank\">daviddeutsch.org.uk</a></p>\n<p dir=\"ltr\">X: <a href=\"https://x.com/DavidDeutschOxf\" rel=\"noopener\" target=\"_blank\">@DavidDeutschOxf</a></p>\n<p>Share this episode: <a href=\"https://www.samharris.org/podcasts/making-sense-episodes/strange-truths\" rel=\"noopener\" target=\"_blank\">https://www.samharris.org/podcasts/making-sense-episodes/strange-truths</a></p>\n<p>&nbsp;</p>\n<p dir=\"ltr\">Learning how to train your mind is the single greatest investment you can make in life. That&rsquo;s why Sam Harris created the <a href=\"https://www.wakingup.com/makingsense\" rel=\"noopener\" target=\"_blank\">Waking Up</a> app. From rational mindfulness practice to lessons on some of life&rsquo;s most important topics, join Sam as he demystifies the practice of meditation and explores the theory behind it.</p>\n<p>&nbsp;</p>"
+        "value": "<p dir=\"ltr\">Sam hopped back on with his manager and business partner, Jaron Lowenstein, to talk about current events and answer some of the questions you all submitted on Substack. They discuss the Biden cover-up and how it compares to Trump&rsquo;s transgressions, Sam&rsquo;s latest episode with Jake Tapper, whether Tapper had a journalistic responsibility to share what he knew about the cover-up sooner, and criticism from the audience about Sam&rsquo;s views on Israel&rsquo;s actions in Gaza.</p>\n<p dir=\"ltr\">Produced by Griffin Katz</p>\n<p>Share this episode: <a href=\"https://rss.samharris.org/Share%20this%20episode:%20https:/www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza\">https://www.samharris.org/podcasts/making-sense-episodes/416-more-from-sam-bidens-big-lie-review-of-tapper-interview-trump-a-case-against-israels-actions-in-gaza</a></p>"
       }
     ],
     "image": {
       "href": "https://assets.samharris.org/images/rss/making-sense-logo.png"
     },
-    "itunes_duration": "8315",
+    "itunes_duration": "2828",
     "itunes_explicit": null,
     "itunes_episodetype": "Full"
   }
