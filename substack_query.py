@@ -120,17 +120,20 @@ SUBSTACK_SOURCE_NAMES = {
 
 # --- Initialize API Clients --- # <<< ADD THIS SECTION
 logging.info("Initializing API clients...")
+gemini_client = None # Initialize to None
 openai_client = None # Initialize to None
 try:
-    # Gemini Client is initialized implicitly within call_gemini_api
+    # Gemini Client
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    logging.info("Gemini client initialized.")
 
     # OpenAI Client
     openai_client = OpenAI(api_key=OPENAI_API_KEY)
     logging.info("OpenAI client initialized.")
 except Exception as e:
-    logging.critical(f"CRITICAL ERROR: Failed to initialize OpenAI client: {e}", exc_info=True)
-    # Decide if you want to exit if OpenAI client fails, or continue without embeddings
-    # sys.exit(1) # Uncomment to exit if OpenAI client fails
+    logging.critical(f"CRITICAL ERROR: Failed to initialize API clients: {e}", exc_info=True)
+    # Decide if you want to exit if API clients fail, or continue without analysis
+    # sys.exit(1) # Uncomment to exit if API clients fail
 logging.info("API clients initialized successfully.")
 
 # --- Database Columns and Pre-computed INSERT statement ---
@@ -175,18 +178,19 @@ def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
                  source_url))
 
 # --- Helper function for Gemini API calls ---
-def call_gemini_api(prompt, model_name="gemini-2.5-pro-preview-03-25"): # Removed client parameter
-    """Calls the Gemini API with the given prompt and model."""
+def call_gemini_api(prompt, model_name="gemini-2.5-pro-preview-03-25"):
+    """Calls the Gemini API with the given prompt and model using the global client."""
     if not GEMINI_API_KEY:
         logging.warning("Gemini API call skipped: GEMINI_API_KEY not set.")
         return "Analysis skipped (missing API key)."
+    
+    if not gemini_client:
+        logging.warning("Gemini API call skipped: Gemini client not initialized.")
+        return "Analysis skipped (client not initialized)."
 
     try:
-        # Instantiate the client inside the function (legacy way)
-        # Consider initializing the client once globally if performance is critical
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content( # Use client.models.generate_content
-            model=model_name, # Specify model name here
+        response = gemini_client.models.generate_content(
+            model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.2),
         )
@@ -276,6 +280,15 @@ Content to analyze:
 """
     return call_gemini_api(prompt) # Removed client argument
 
+# --- Helper function to remove parentheses ---
+def remove_parentheses(text: str) -> str:
+    """Remove everything in parentheses (including the parentheses themselves) from text."""
+    if not isinstance(text, str):
+        return text
+    # Use regex to remove parentheses and everything inside them
+    import re
+    return re.sub(r'\s*\([^)]*\)\s*', ' ', text).strip()
+
 def generate_cluster_tag(title, tags_list, content_markdown):
     """
     Generates a cluster and canonical tags using the Gemini API.
@@ -300,7 +313,7 @@ Given one blog-style post, do BOTH of the following:
 1. **Pick exactly one "Cluster"** that best captures the *main theme*
    (see the list of Clusters below).
 
-2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
+2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
    describe the post.
    • Tags *must* come from the taxonomy.
    • Prefer the most specific tags that materially help the reader; skip
@@ -366,7 +379,7 @@ The format is:
 - Scalable oversight (Debate; Tree-of-thought)
 - CoT alignment (CoT alignment)
 - Scaling laws
-- Benchmarks & evals (Safety benchmarks)
+- Benchmarks & evals
 - Mechanistic interpretability
 - Value decomposition (Shard theory)
 
@@ -425,6 +438,13 @@ Remember: return only JSON with "cluster" and "tags".
         parsed_json = json.loads(cleaned_response)
         # Basic validation of structure
         if isinstance(parsed_json, dict) and "cluster" in parsed_json and "tags" in parsed_json and isinstance(parsed_json["tags"], list):
+            # Clean parentheses from cluster and tags
+            if parsed_json["cluster"]:
+                parsed_json["cluster"] = remove_parentheses(parsed_json["cluster"])
+            
+            if parsed_json["tags"]:
+                parsed_json["tags"] = [remove_parentheses(tag) for tag in parsed_json["tags"] if tag]
+            
             return parsed_json
         else:
             logging.warning(f"Warning: Parsed JSON from cluster tag API has unexpected structure: {parsed_json}")
@@ -500,6 +520,10 @@ def is_ai_safety_post(title: str, html_body: str,
     if not GEMINI_API_KEY:
         logging.warning("Flash guard-rail check skipped: GEMINI_API_KEY not set. Defaulting to True (fail-open).")
         return True        # fail-open so you still ingest during local tests
+    
+    if not gemini_client:
+        logging.warning("Flash guard-rail check skipped: Gemini client not initialized. Defaulting to True (fail-open).")
+        return True        # fail-open if client not available
 
     # Very lightweight prompt; temp=0 for determinism
     # --- Start safe truncation ---
@@ -518,9 +542,7 @@ Content (markdown, truncated):
 {snippet}
 """
     try:
-        # Consider initializing the client once globally if performance is critical
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        rsp = client.models.generate_content(
+        rsp = gemini_client.models.generate_content(
             model=model,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0)
@@ -676,11 +698,11 @@ def json_to_post(full: dict, slug: str) -> dict | None:
 
 # ---------- Substack Iterators ----------
 
-def iter_substack_archive(slug: str, cutoff: datetime, batch: int = 35):
+def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
     """
-    Yields full post objects fetched from the Substack Archive API for a given slug,
+    Yields lightweight post stubs from the Substack Archive API for a given slug,
     stopping when posts are older than the cutoff date.
-    Raises exceptions on network/JSON errors.
+    This is the first phase - just get the basic info without full post content.
     """
     headers = {
         "User-Agent": (
@@ -690,107 +712,111 @@ def iter_substack_archive(slug: str, cutoff: datetime, batch: int = 35):
     }
     offset = 0
     while True:
-        # slug may already be 'domain.com' or 'xyz.substack.com'
         list_url = f"https://{slug}/api/v1/archive?sort=new&search=&offset={offset}&limit={batch}"
         logging.debug(f"  Fetching archive page: slug={slug}, offset={offset}, limit={batch}")
         try:
-            # Propagate errors up to the caller (fetch_substack)
             page_response = requests.get(list_url, timeout=45, headers=headers)
-            page_response.raise_for_status() # Raises HTTPError for bad status codes
-            # --- Handle potential list or dict response ---
-            json_response = page_response.json() # Raises JSONDecodeError on invalid JSON
+            page_response.raise_for_status()
+            json_response = page_response.json()
             if isinstance(json_response, list):
-                stubs = json_response # API returned a list directly
+                stubs = json_response
             elif isinstance(json_response, dict):
-                stubs = json_response.get("posts", []) # API returned a dict with 'posts' key
+                stubs = json_response.get("posts", [])
             else:
                 logging.warning(f"Unexpected JSON response type ({type(json_response).__name__}) for '{slug}' at offset {offset}. Assuming empty.")
                 stubs = []
-            # --- End handling ---
-            time.sleep(2) # Be polite
+            time.sleep(1)  # Shorter delay for list fetching
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            # Log the error origin and re-raise to signal failure
             logging.error(f"Failed fetching/decoding archive page for '{slug}' at offset {offset}: {e}")
-            raise # Propagate the error
+            raise
 
         if not stubs:
             logging.debug(f"  No more post stubs found for '{slug}' at offset {offset}.")
-            break # Finished the archive for this slug
+            break
 
         logging.debug(f"  Processing {len(stubs)} post stubs for '{slug}'.")
         reached_cutoff = False
         for stub in stubs:
-            # Check cutoff date *before* fetching full post
             posted_at_dt = iso_to_dt(stub.get("post_date"))
             if not posted_at_dt:
                 logging.warning(f"Skipping stub with missing/invalid 'post_date' in archive for '{slug}': ID {stub.get('id')}")
                 continue
             if posted_at_dt < cutoff:
                 logging.debug(f"  Reached cutoff date ({cutoff.date()}) for '{slug}'. Stopping.")
-                buffer_skip(stub.get('id'), stub.get('title'), stub.get('canonical_url'))
                 reached_cutoff = True
-                break # Stop processing stubs for this page
+                break
 
-            pid = stub.get("id")
-            post_title_stub = stub.get('title', 'Untitled') # Get title from stub for logging
-            if not pid:
-                logging.warning(f"Skipping stub with missing 'id' in archive for '{slug}'.")
-                continue
-
-            # --- Use new endpoints based on user feedback ---
-            post_slug = stub.get("slug")          # e.g. "math"
-            if post_slug:                         # preferred: slug endpoint
-                full_post_url = f"https://{slug}/api/v1/posts/{post_slug}"
-            else:                                 # fallback: new by-id endpoint
-                full_post_url = f"https://{slug}/api/v1/posts/by-id/{pid}"
-            # --- End endpoint update ---
-
-            logging.info(f"    Fetching full post details for '{post_title_stub[:50]}...' (ID: {pid}) from {slug}")
-            full_post_data = None # Initialize
-            try:
-                # Propagate errors up to the caller (fetch_substack)
-                full_response = requests.get(full_post_url, timeout=45, headers=headers)
-                full_response.raise_for_status()
-                full_post_data = full_response.json()
-                time.sleep(2) # Be polite
-            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-                # Log the specific error but continue to next stub; fetch_substack decides overall failure
-                logging.warning(f"Failed fetching/decoding full post ID {pid} for \'{slug}\': {e}. Skipping this post.")
-                continue # Skip to the next stub
-
-            # --- Check if the API returned a dict before proceeding ---
-            if not isinstance(full_post_data, dict):
-                logging.warning(f"Substack API for post ID {pid} ('{slug}') returned unexpected type ({type(full_post_data).__name__}) instead of dict. Skipping this post.")
-                logging.debug(f"    Unexpected data was: {full_post_data}") # Log the data for debugging
-                continue # Skip to the next stub
-            # --- End check ---
-
-            # Convert to standard post dict and yield if valid (handles paywall etc.)
-            post_dict = json_to_post(full_post_data, slug)
-            if post_dict:
-                # --- Guard-rail: Check if post is AI safety related ---
-                if not is_ai_safety_post(post_dict["title"], post_dict["htmlBody"]):
-                    logging.info(f"    Skipping post '{post_dict['title'][:50]}...' (ID: {pid}): Failed AI safety guard-rail.")
-                    buffer_skip(pid, post_dict["title"], post_dict.get("pageUrl"))
-                    continue                      # discard & do NOT yield
-                # Set friendly source name using the mapping
-                post_dict["source_type"] = SUBSTACK_SOURCE_NAMES.get(slug, slug) # Use friendly name
-                yield post_dict
-            # else: # Debugging for skipped posts (paywalled, invalid date etc.)
-            #     logging.debug(f"    Skipped post ID {pid} (paywalled or invalid) for '{slug}'.")
+            yield stub
 
         if reached_cutoff:
-            break # Stop pagination if cutoff reached
+            break
 
-        offset += len(stubs) # Advance pagination
+        offset += len(stubs)
 
+def fetch_single_post(slug: str, stub: dict, headers: dict):
+    """
+    Fetches a single full post from Substack API given a stub.
+    Returns the converted post_dict or None if failed.
+    """
+    pid = stub.get("id")
+    title = stub.get('title', 'Untitled')
+    
+    # Construct URL
+    post_slug = stub.get("slug")
+    if post_slug:
+        full_post_url = f"https://{slug}/api/v1/posts/{post_slug}"
+    else:
+        full_post_url = f"https://{slug}/api/v1/posts/by-id/{pid}"
+        
+    try:
+        full_response = requests.get(full_post_url, timeout=45, headers=headers)
+        full_response.raise_for_status()
+        full_post_data = full_response.json()
+        time.sleep(2)  # Politeness delay
+        
+    except Exception as e:
+        logging.warning(f"Failed fetching full post ID {pid} for '{slug}': {e}")
+        return None
+        
+    if not isinstance(full_post_data, dict):
+        logging.warning(f"Substack API for post ID {pid} ('{slug}') returned unexpected type ({type(full_post_data).__name__}) instead of dict.")
+        return None
+        
+    # Convert to standard post dict
+    post_dict = json_to_post(full_post_data, slug)
+    if not post_dict:
+        return None
+        
+    # AI safety check
+    if not is_ai_safety_post(post_dict["title"], post_dict["htmlBody"]):
+        logging.info(f"    Failed AI safety check: '{title[:50]}...'")
+        buffer_skip(pid, post_dict["title"], post_dict.get("pageUrl"))
+        return None
+        
+    post_dict["source_type"] = SUBSTACK_SOURCE_NAMES.get(slug, slug)
+    return post_dict
 
-def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25):
+def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None):
     """
     Yields post objects parsed from a Substack RSS feed for a given slug,
     up to a limit and respecting the cutoff date.
     Handles feedparser errors gracefully.
+    
+    Args:
+        slug: The Substack domain/slug
+        cutoff: Earliest date to include posts from
+        limit: Maximum number of posts to process
+        existing_titles: Set of normalized titles already in content table (for early filtering)
+        already_skipped: Set of normalized titles already in skipped_posts table (for early filtering)
     """
+    # Initialize sets if not provided (backward compatibility)
+    if existing_titles is None:
+        existing_titles = set()
+    if already_skipped is None:
+        already_skipped = set()
+    
+    known_titles = existing_titles | already_skipped
+    
     # slug may already be 'domain.com' or 'xyz.substack.com'
     feed_url = f"https://{slug}/feed"
     logging.info(f"Fetching RSS feed: {feed_url}") # Keep this INFO level
@@ -843,6 +869,13 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25):
             buffer_skip(entry.get("id", link), title, link)
             continue # Skip posts older than cutoff
 
+        # --- EARLY DATABASE CHECK (NEW) ---
+        title_norm = normalise_title(title)
+        if title_norm in known_titles:
+            logging.debug(f"  RSS: Skipping '{title[:50]}...' - already in database/skipped")
+            continue # Skip if already known, avoiding expensive AI safety check
+        # --- END EARLY DATABASE CHECK ---
+
         # Extract content (prefer full content over summary)
         html_body = ""
         if entry.get("content") and isinstance(entry.get("content"), list) and len(entry.get("content")) > 0:
@@ -872,7 +905,7 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25):
             "source_type": SUBSTACK_SOURCE_NAMES.get(slug, slug) # Use friendly name from mapping
         }
 
-        # --- Guard-rail: Check if post is AI safety related ---
+        # --- Guard-rail: Check if post is AI safety related (MOVED AFTER DB CHECK) ---
         if not is_ai_safety_post(post_dict["title"], post_dict["htmlBody"]):
             logging.info(f"    Skipping RSS entry '{title[:50]}...' (URL: {link}): Failed AI safety guard-rail.")
             buffer_skip(post_id, title, link)
@@ -882,81 +915,132 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25):
         count += 1
 
 # --- Substack Orchestration Function ---
-def fetch_substack(source_input: str, cutoff: datetime, rss_limit: int = 25, archive_batch: int = 100, always_add_rss: bool = False):
+def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_titles: set, 
+                           already_skipped: set, rss_limit: int = 25, 
+                           archive_batch: int = 100, always_add_rss: bool = False):
     """
-    Fetches posts for a Substack publication (given slug or URL).
-    Tries the Archive API first, falls back to RSS if archive fails or returns no posts.
-    Deduplicates posts by ID.
-
+    Optimized version that checks database before fetching full posts.
+    
     Args:
         source_input: Substack slug or full feed/publication URL.
         cutoff: The earliest date (inclusive) for posts.
+        existing_titles: Set of normalized titles already in content table
+        already_skipped: Set of normalized titles already in skipped_posts table
         rss_limit: Max posts to fetch via RSS fallback.
         archive_batch: Batch size for archive pagination.
         always_add_rss: If True, always fetches RSS (after archive) to catch newest posts.
-
-    Returns:
-        List of unique post dictionaries, sorted by date descending.
     """
     slug = slug_from_thing(source_input)
     if not slug:
         logging.error(f"Cannot fetch Substack: Invalid source input '{source_input}'")
-        return [] # Return empty list if slug extraction fails
-
+        return []
+    
+    # Combined set for faster lookups
+    known_titles = existing_titles | already_skipped
+    
+    posts_to_fetch = []  # List of stubs that need full fetching
     posts_by_id = {}
     archive_failed = False
-    archive_yielded_posts = False # Track if archive actually returned anything
-
-    # 1. Attempt Archive Crawl
-    logging.info(f"Starting Substack fetch for '{slug}' (cutoff: {cutoff.date()})")
-    logging.info(f" -> Attempting Archive API crawl...")
+    
+    logging.info(f"Starting optimized Substack fetch for '{slug}' (cutoff: {cutoff.date()})")
+    
+    # STEP 1: Get all post stubs first (lightweight)
+    logging.info(f" -> Fetching post list from archive...")
     try:
-        for post in iter_substack_archive(slug, cutoff=cutoff, batch=archive_batch):
-            # iter_substack_archive already checks cutoff and AI safety guard-rail
-            if post and post.get('_id'): # Ensure post and ID are valid
-                posts_by_id[post['_id']] = post
-                archive_yielded_posts = True # Mark that we got at least one post
-        logging.info(f" -> Archive API crawl finished for '{slug}'. Found {len(posts_by_id)} posts so far.")
+        for stub in iter_substack_archive_stubs(slug, cutoff=cutoff, batch=archive_batch):
+            # Check title against database
+            title = stub.get('title', '')
+            if not title:
+                continue
+                
+            title_norm = normalise_title(title)
+            
+            # Skip if already in database or previously skipped
+            if title_norm in known_titles:
+                logging.debug(f"  Skipping '{title[:50]}...' - already in database/skipped")
+                continue
+                
+            # This post needs to be fetched
+            posts_to_fetch.append(stub)
+            
+        logging.info(f" -> Found {len(posts_to_fetch)} new posts to fetch (after DB check)")
+        
     except Exception as e:
-        # Errors during archive crawl (network, JSON, etc.) trigger fallback
-        logging.warning(f" -> Archive API crawl FAILED for '{slug}': {e}. Will attempt RSS fallback.")
+        logging.warning(f" -> Archive API stub fetch FAILED for '{slug}': {e}. Will attempt RSS fallback.")
         archive_failed = True
-
-    # Check if archive finished but yielded nothing (could be new pub, 403, etc.)
-    if not archive_failed and not archive_yielded_posts:
-        logging.warning(f" -> Archive API crawl for '{slug}' completed but yielded no posts (older than cutoff, failed guard-rail, or other issue).")
-        # Treat as failure for fallback purposes, unless always_add_rss is True
-        archive_failed = True
-
-    # 2. Decide whether to fetch RSS
+    
+    # STEP 2: Only fetch full details for posts not in database
+    if not archive_failed and posts_to_fetch:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
+            )
+        }
+        
+        for i, stub in enumerate(posts_to_fetch):
+            title = stub.get('title', 'Untitled')
+            logging.info(f"  [{i+1}/{len(posts_to_fetch)}] Fetching new post: '{title[:50]}...'")
+            
+            post_dict = fetch_single_post(slug, stub, headers)
+            if post_dict and post_dict.get('_id'):
+                posts_by_id[post_dict['_id']] = post_dict
+                
+        logging.info(f" -> Archive API optimized fetch finished for '{slug}'. Found {len(posts_by_id)} posts.")
+        
+    elif archive_failed:
+        logging.info(f" -> Archive failed, will fall back to RSS.")
+    else:
+        logging.info(f" -> No new posts found in archive for '{slug}'.")
+    
+    # STEP 3: Handle RSS if needed (with similar pre-filtering)
     need_rss = archive_failed or always_add_rss
     if need_rss:
         reason = "fallback" if archive_failed else "always_add_rss"
         logging.info(f" -> Fetching RSS feed for '{slug}' (Reason: {reason}, Limit: {rss_limit})...")
         try:
             rss_count = 0
-            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit):
-                # iter_substack_rss already checks cutoff and AI safety guard-rail
-                 if post and post.get('_id'): # Ensure post and ID are valid
-                    # Use setdefault: only add if ID wasn't already seen from archive
-                    posts_by_id.setdefault(post['_id'], post)
-                    rss_count +=1
-            logging.info(f" -> RSS fetch finished for '{slug}'. Added/kept {rss_count} posts via RSS.")
+            # Use existing RSS iterator but with pre-filtering
+            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit, existing_titles=existing_titles, already_skipped=already_skipped):
+                if post and post.get('_id'):
+                    # Check if this title is already known before adding
+                    title_norm = normalise_title(post.get('title', ''))
+                    if title_norm not in known_titles:
+                        posts_by_id.setdefault(post['_id'], post)
+                        rss_count += 1
+                    else:
+                        logging.debug(f"  RSS: Skipping '{post.get('title', '')[:50]}...' - already known")
+            logging.info(f" -> RSS fetch finished for '{slug}'. Added {rss_count} new posts via RSS.")
         except Exception as e:
-            # Log error but don't fail the whole process if RSS fetch fails
             logging.error(f" -> RSS fetch FAILED for '{slug}': {e}")
     else:
         logging.info(f" -> Skipping RSS fetch for '{slug}' (Archive successful and always_add_rss=False).")
 
-
-    # 3. Return sorted results
+    # STEP 4: Return sorted results
     final_posts = list(posts_by_id.values())
-    # Sort by 'postedAt' descending (newest first)
     final_posts.sort(key=lambda p: p.get('postedAt', ''), reverse=True)
 
-    logging.info(f" -> Completed fetch for '{slug}'. Total unique posts: {len(final_posts)}")
+    logging.info(f" -> Completed optimized fetch for '{slug}'. Total unique posts: {len(final_posts)}")
     return final_posts
 
+def fetch_substack(source_input: str, cutoff: datetime, rss_limit: int = 25, archive_batch: int = 100, always_add_rss: bool = False):
+    """
+    DEPRECATED: Use fetch_substack_optimized() instead.
+    
+    Backward compatibility wrapper that fetches posts for a Substack publication.
+    This version is less efficient as it doesn't check the database before fetching full posts.
+    """
+    logging.warning("fetch_substack() is deprecated. Consider using fetch_substack_optimized() for better performance.")
+    # Use optimized version with empty sets (no pre-filtering)
+    return fetch_substack_optimized(
+        source_input=source_input,
+        cutoff=cutoff,
+        existing_titles=set(),
+        already_skipped=set(),
+        rss_limit=rss_limit,
+        archive_batch=archive_batch,
+        always_add_rss=always_add_rss
+    )
 
 # --- Filtering Logic (Removed EA/LW/AF specific filters) ---
 # No specific filtering logic needed here anymore, as Substack fetching
@@ -1024,27 +1108,69 @@ def main():
         logging.error("Error: DATABASE_URL environment variable not set. Cannot connect to database.")
         sys.exit(1) # Exit with error code
 
-    # --- Fetch Substack Data ---
-    logging.info("--- Starting Substack Feed Fetch ---")
+    # --- Connect to DB and fetch existing titles FIRST ---
+    conn = None
+    existing_titles = set()
+    already_skipped = set()
+    
+    try:
+        logging.info("\n--- Database Connection & Title Fetch ---")
+        logging.info("Connecting to the database...")
+        conn = psycopg2.connect(DATABASE_URL)
+        logging.info("Database connection successful.")
+        register_vector(conn) # Register pgvector type with the connection
+        logging.info("pgvector type registered with psycopg2 connection.")
+
+        with conn.cursor() as cur:
+            # Fetch existing titles BEFORE processing any feeds
+            logging.info("Fetching existing titles from database...")
+            cur.execute("SELECT title_norm FROM content")
+            existing_titles = {row[0] for row in cur.fetchall()}
+            logging.info(f"→ {len(existing_titles):,} titles already in content table")
+
+            # Fetch already skipped titles
+            logging.info("Fetching already skipped titles from database...")
+            cur.execute("SELECT title_norm FROM skipped_posts")
+            already_skipped = {row[0] for row in cur.fetchall()}
+            logging.info(f"→ {len(already_skipped):,} titles already in skipped_posts table")
+
+    except psycopg2.OperationalError as e:
+        logging.critical(f"FATAL: Database connection failed: {e}")
+        sys.exit(1) # Exit with error code
+    except psycopg2.DatabaseError as e:
+        logging.error(f"Database error occurred while fetching existing titles: {e}")
+        sys.exit(1) # Exit with error code
+    except Exception as e:
+        logging.error(f"An unexpected error occurred while connecting to database: {e}", exc_info=True)
+        sys.exit(1) # Exit with error code
+    finally:
+        if conn:
+            conn.close()
+            logging.info("Initial database connection closed.")
+
+    # --- Fetch Substack Data with Database Info ---
+    logging.info("--- Starting Optimized Substack Feed Fetch ---")
     substack_posts_all = []
     # Option to always fetch RSS as a safety net for very new posts
     # Set this via env var or keep False
     ALWAYS_FETCH_RSS_NET = os.getenv("SUBSTACK_ALWAYS_FETCH_RSS", "False").lower() == "true"
 
     for feed_url_or_slug in SUBSTACK_FEEDS:
-        # Use the fetch_substack function which handles archive/RSS fallback and guard-rail
-        posts_for_feed = fetch_substack(
+        # Use the optimized fetch_substack function with database info
+        posts_for_feed = fetch_substack_optimized(
             source_input=feed_url_or_slug,
             cutoff=CUTOFF_DATE,
+            existing_titles=existing_titles,
+            already_skipped=already_skipped,
             rss_limit=40, # Max RSS posts per feed if needed
             archive_batch=20, # Archive API page size
             always_add_rss=ALWAYS_FETCH_RSS_NET
         )
         substack_posts_all.extend(posts_for_feed)
-        # Detailed logging is now handled inside fetch_substack
+        # Detailed logging is now handled inside fetch_substack_optimized
 
     initial_fetched_count = len(substack_posts_all)
-    logging.info(f"--- Finished Substack Fetch: {initial_fetched_count} posts fetched (before deduplication) ---")
+    logging.info(f"--- Finished Optimized Substack Fetch: {initial_fetched_count} posts fetched (before deduplication) ---")
 
     # --- Deduplicate in memory before processing ---
     unique_posts = choose_highest_score(substack_posts_all)
@@ -1068,29 +1194,15 @@ def main():
     conn = None # Initialize conn outside the try block
 
     try:
-        # Establish a single connection
+        # Establish a new connection for processing
         logging.info("\n--- Database Operations ---")
-        logging.info("Connecting to the database...")
+        logging.info("Connecting to the database for processing...")
         conn = psycopg2.connect(DATABASE_URL)
         logging.info("Database connection successful.")
         register_vector(conn) # Register pgvector type with the connection
         logging.info("pgvector type registered with psycopg2 connection.")
 
         with conn.cursor() as cur:
-            # --- Fetch existing titles early ---
-            logging.info("Fetching existing titles from database...")
-            cur.execute("SELECT title_norm FROM content")
-            existing_titles = {row[0] for row in cur.fetchall()}
-            logging.info(f"→ {len(existing_titles):,} titles already in DB")
-            # --- End fetching existing titles ---
-
-            # --- Fetch already skipped titles ---
-            logging.info("Fetching already skipped titles from database...")
-            cur.execute("SELECT title_norm FROM skipped_posts")
-            already_skipped = {r[0] for r in cur.fetchall()}
-            logging.info(f"→ {len(already_skipped):,} titles already in skipped_posts")
-            # --- End fetching already skipped titles ---
-
             # --- Process skipped buffer ---
             if SKIPPED_BUFFER:
                 extras.execute_values(cur,
@@ -1128,6 +1240,7 @@ def main():
                      continue # Skip to the next post
 
                 # --- Normalize title and check against existing DB titles (EARLY OUT) ---
+                # Note: This check should be much faster now since most titles were already filtered out
                 if title_norm in existing_titles:
                     logging.info(f"  -> Skipping post (already in DB): '{title[:60]}...'")
                     skipped_in_db_count += 1

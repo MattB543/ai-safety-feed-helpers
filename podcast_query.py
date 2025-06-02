@@ -232,6 +232,15 @@ def generate_cluster_tag(title: str, tags_list: List[str], content_markdown: str
         logging.info("Skipping cluster tag generation: Input content was empty.")
         return {"error": "Input content was empty."}
 
+    def remove_parentheses(text: str) -> str:
+        """Remove everything in parentheses and the parentheses themselves."""
+        if not text:
+            return text
+        # Use regex to remove parentheses and their contents
+        cleaned = re.sub(r'\s*\([^)]*\)\s*', '', text)
+        # Clean up any extra whitespace
+        return cleaned.strip()
+
     prompt = f"""
 You are the "AI-Safety-Tagger"—an expert taxonomist for an AI-safety news feed.
 
@@ -307,7 +316,7 @@ The format is:
 - Scalable oversight (Debate; Tree-of-thought)
 - CoT alignment (CoT alignment)
 - Scaling laws
-- Benchmarks & evals (Safety benchmarks)
+- Benchmarks & evals
 - Mechanistic interpretability
 - Value decomposition (Shard theory)
 
@@ -360,7 +369,15 @@ Remember: return only JSON with "cluster" and "tags".
             return {"error": "Response missing required fields"}
         if not isinstance(json_response["tags"], list):
             return {"error": "Tags field was not a list"}
-        # Return the parsed response
+        
+        # Clean parentheses from cluster and tags
+        if json_response.get("cluster"):
+            json_response["cluster"] = remove_parentheses(json_response["cluster"])
+        
+        if json_response.get("tags") and isinstance(json_response["tags"], list):
+            json_response["tags"] = [remove_parentheses(tag) for tag in json_response["tags"] if tag]
+        
+        # Return the cleaned response
         return json_response
     except (ValueError, OpenAI_APIError, OpenAI_RateLimitError) as e:
         logging.warning(f"Cluster/tag generation failed: {type(e).__name__}: {e}")
