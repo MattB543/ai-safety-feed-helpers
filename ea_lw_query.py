@@ -384,7 +384,7 @@ The format is:
 - Scalable oversight (Debate; Tree-of-thought)
 - CoT alignment (CoT alignment)
 - Scaling laws
-- Benchmarks & evals (Safety benchmarks)
+- Benchmarks & evals
 - Mechanistic interpretability
 - Value decomposition (Shard theory)
 
@@ -448,8 +448,18 @@ Remember: return only JSON with "cluster" and "tags".
            "tags" in parsed_json and isinstance(parsed_json["tags"], list):
             # Further validation: ensure tags are strings
             if all(isinstance(tag, str) for tag in parsed_json["tags"]):
-                logging.debug(f"Successfully parsed cluster/tag JSON: {parsed_json}")
-                return parsed_json
+                # Clean parentheses and their contents from cluster and tags
+                cleaned_cluster = remove_parentheses_content(parsed_json["cluster"])
+                cleaned_tags = [remove_parentheses_content(tag) for tag in parsed_json["tags"]]
+                
+                # Create cleaned response
+                cleaned_response_dict = {
+                    "cluster": cleaned_cluster,
+                    "tags": cleaned_tags
+                }
+                
+                logging.debug(f"Successfully parsed and cleaned cluster/tag JSON: {cleaned_response_dict}")
+                return cleaned_response_dict
             else:
                 logging.warning(f"Parsed JSON from cluster tag API has non-string items in tags list: {parsed_json['tags']}")
                 return {"error": "Parsed JSON tags list contains non-string items"}
@@ -524,6 +534,30 @@ def generate_embeddings(openai_client, short_text: str, full_text: str, model="t
 # ================================================================
 #                         Utility Helpers
 # ================================================================
+
+def remove_parentheses_content(text: str) -> str:
+    """
+    Removes parentheses and everything inside them from a string.
+    
+    Args:
+        text: The input string that may contain parentheses.
+        
+    Returns:
+        The string with all parentheses and their contents removed, 
+        with extra whitespace cleaned up.
+    """
+    if not text:
+        return text
+    
+    # Remove parentheses and their contents using regex
+    # This handles nested parentheses by matching the outermost ones
+    import re
+    cleaned = re.sub(r'\([^)]*\)', '', text)
+    
+    # Clean up any extra whitespace that might be left
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
 
 def normalise_title(title: str) -> str:
     """

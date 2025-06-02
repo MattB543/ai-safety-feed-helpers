@@ -135,3 +135,5 @@ temp_audio/*
 
 twitter_state.json
 twitter.cookies
+
+data/*
