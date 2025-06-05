@@ -17,7 +17,7 @@ from datetime import datetime
 DB_URL              = os.getenv("AI_SAFETY_FEED_DB_URL")
 OPENAI_API_KEY      = os.getenv("OPEN_AI_FREE_CREDITS_KEY")
 MODEL               = "gpt-4.1"   # pick the tier that matches your quota
-BATCH               = 5              # rows to back‑fill each run
+BATCH               = 7              # rows to back‑fill each run
 K_NEIGHBOURS        = 20              # vector recall set size
 
 if not (DB_URL and OPENAI_API_KEY):

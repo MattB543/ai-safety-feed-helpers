@@ -1,63 +1,105 @@
 #!/usr/bin/env python3
 """
-Ingest the 25 most-recent “AI Safety” papers from ArXiv, enrich with
+Ingest "AI Safety" papers from ArXiv, enrich with
 Semantic Scholar, summarise with Gemini, embed with OpenAI & Gemini,
 and insert into the `posts` table of the AI-Safety-Feed DB.
 
 Environment variables required
 ------------------------------
 ARXIV_QUERY_TERM="ai safety"
-SEMANTIC_SCHOLAR_API_KEY=...
+ARXIV_MIN_AGE_DAYS=30 (optional - minimum age in days for papers, default 30)
+SEMANTIC_SCHOLAR_API_KEY=... (optional - improves rate limits)
 OPENAI_API_KEY=...
 GEMINI_API_KEY=...
 AI_SAFETY_FEED_DB_URL=postgres://...
-
-Dependencies
-------------
-pip install feedparser requests psycopg2-binary google-generativeai openai
 """
+
+# Add immediate debug output
+print("Script starting - imports beginning...")
 
 # ================================================================
 # Imports
 # ================================================================
 import os, re, json, time, uuid, logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
+from urllib.parse import urlencode, quote, quote_plus
+
+print("Basic imports completed...")
 
 import feedparser              # ArXiv Atom -> dicts
 import requests
 import psycopg2
 from psycopg2 import extras
 from pgvector.psycopg2 import register_vector   # same as EA/LW script
-
-from google import genai as genai               # Gemini
-from google.genai import types as gtypes
+from bs4 import BeautifulSoup
+from google import genai as genai
+from google.genai import types
 from openai import OpenAI, APIError, RateLimitError
+
+print("All imports completed successfully...")
 
 # ================================================================
 # Environment
 # ================================================================
-load_dotenv = __import__("dotenv").load_dotenv
-load_dotenv()
+print("Starting environment setup...")
 
-ARXIV_QUERY_TERM         = os.getenv("ARXIV_QUERY_TERM", "ai safety")
-ARXIV_MAX_RESULTS        = 10            # per user request
-ARXIV_API_URL            = "https://export.arxiv.org/api/query"
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # Load .env BEFORE using env vars
+    print("dotenv loaded successfully")
+except ImportError:
+    print("dotenv not available (optional)")
+    pass  # dotenv is optional
 
+print("Checking environment variables...")
+
+ARXIV_QUERY_TERM         = os.environ.get("ARXIV_QUERY_TERM", "ai safety")
+ARXIV_MAX_RESULTS        = 4            # per user request
+ARXIV_MIN_AGE_DAYS       = int(os.environ.get("ARXIV_MIN_AGE_DAYS", "30"))  # Default: 30 days
+ARXIV_API_URL           = "http://export.arxiv.org/api/query"
 S2_API_URL               = "https://api.semanticscholar.org/graph/v1"
-S2_API_KEY               = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+S2_API_KEY               = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
 
-OPENAI_API_KEY           = os.getenv("OPEN_AI_FREE_CREDITS_KEY")
-GEMINI_API_KEY           = os.getenv("GEMINI_API_KEY")
-DATABASE_URL             = os.getenv("AI_SAFETY_FEED_DB_URL")
+OPENAI_API_KEY           = os.environ.get("OPEN_AI_FREE_CREDITS_KEY")
+GEMINI_API_KEY           = os.environ.get("GEMINI_API_KEY")
+DATABASE_URL             = os.environ.get("AI_SAFETY_FEED_DB_URL")
 
-if not all([DATABASE_URL, OPENAI_API_KEY, GEMINI_API_KEY, S2_API_KEY]):
+print(f"Environment variables status:")
+print(f"  DATABASE_URL: {'SET' if DATABASE_URL else 'MISSING'}")
+print(f"  OPENAI_API_KEY: {'SET' if OPENAI_API_KEY else 'MISSING'}")
+print(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
+print(f"  S2_API_KEY: {'SET' if S2_API_KEY else 'MISSING'}")
+
+if not all([DATABASE_URL, OPENAI_API_KEY, GEMINI_API_KEY]):
+    print("ERROR: Missing required environment variables!")
+    print("Required variables:")
+    print(f"  AI_SAFETY_FEED_DB_URL: {DATABASE_URL}")
+    print(f"  OPEN_AI_FREE_CREDITS_KEY: {OPENAI_API_KEY}")
+    print(f"  GEMINI_API_KEY: {GEMINI_API_KEY}")
     raise SystemExit("Missing one or more required API / DB keys")
 
-# Logging
+print("Environment setup completed successfully...")
+
+# ================================================================
+# Logging setup
+# ================================================================
+print("Setting up logging...")
+
+# More focused logging - reduce noise
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-for noisy in ("urllib3","openai","httpx","google.generativeai"):
+
+# Silence noisy libraries
+for noisy in ("urllib3", "openai", "httpx", "google.generativeai", "httpcore", "google", "genai"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
+# Log S2 API key status
+if S2_API_KEY:
+    logging.info("Semantic Scholar API key found - using authenticated requests")
+else:
+    logging.info("No Semantic Scholar API key - using rate-limited public access")
+
+print("Logging setup completed...")
 
 # ================================================================
 #                      Database Configuration
@@ -66,11 +108,15 @@ DB_COLS = (
     "uuid", "published_date", "source_updated_at", "title", "title_norm",
     "generated_title", "source_url", "source_type", "authors_display", "authors_ids",
     "content_snippet", "full_content", "short_summary", "long_summary", "key_implication",
-    "why_valuable", "image_url", "score", "comment_count", "views",
+    "why_valuable", "image_url", "score", "comment_count",
+    "citation_count", "reference_count", "influential_citation_count",
+    "doi", "journal_ref", "arxiv_comment",
+    "fields_of_study", "venue",
     "first_comment_at", "last_activity_at", "score_timeseries", "comment_timeseries",
     "source_tag_ids", "source_tag_names", "feed_cluster", "feed_tags",
     "reading_time_minutes", "word_count", "external_links", "novelty_score",
     "novelty_note", "embedding_short", "embedding_full", "analysis_version",
+    "source_id", "semantic_scholar_id"
     # "author_credentials", "audio_url", "generated_image", "image_prompt" are excluded as they are not populated by this script
 )
 NUM_DB_COLS = len(DB_COLS)
@@ -97,92 +143,219 @@ def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
 # ================================================================
 # Helpers – ArXiv
 # ================================================================
-def fetch_arxiv_entries(query_term: str, max_results: int = 25) -> List[Dict[str, Any]]:
+def fetch_arxiv_entries(query_term: str, max_results: int = 25, min_age_days: int = 30) -> List[Dict[str, Any]]:
     """
-    Query ArXiv API for the most recent papers containing `query_term`
-    in title OR abstract. Returns parsed feedparser dict entries.
+    Query ArXiv API for papers containing `query_term` in title OR abstract,
+    excluding papers newer than min_age_days (to ensure citation data has had time to accumulate).
+    Returns parsed feedparser dict entries.
     Rate-limited to 1 call every 3 s (ArXiv policy).
+    
+    Args:
+        query_term: Search term to look for in papers
+        max_results: Maximum number of results to return
+        min_age_days: Minimum age in days for papers (default 30 days)
     """
-    query = (
-        f'search_query=all:"{query_term}"'
-        f"&sortBy=submittedDate&sortOrder=descending&max_results={max_results}"
-    )
-    url = f"{ARXIV_API_URL}?{query}"
-    logging.info(f"→ ArXiv query: {url}")
-    time.sleep(3)  # honor ArXiv rate-limit
-    feed = feedparser.parse(url)
-    if feed.bozo:
-        raise RuntimeError(f"ArXiv feed parse error: {feed.bozo_exception}")
-    return feed.entries
+    # Calculate the cutoff date (papers must be older than this)
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=min_age_days)
+    # ArXiv date format: YYYYMMDDTTTT where TTTT is HHMM in 24-hour format GMT
+    cutoff_str = cutoff_date.strftime("%Y%m%d%H%M")
+    
+    # Build query with date range - papers submitted before the cutoff date
+    # ArXiv date format: [* TO YYYYMMDDTTTT] for papers from beginning of time to cutoff
+    search_query = f'all:"{query_term}" AND submittedDate:[* TO {cutoff_str}]'
+    logging.info(f"→ ArXiv search: '{query_term}' (excluding papers newer than {min_age_days} days)")
+    
+    url = f"{ARXIV_API_URL}?search_query={quote_plus(search_query)}&sortBy=submittedDate&sortOrder=descending&max_results={max_results}"
+    
+    # Add retry logic for connection errors
+    max_retries = 3
+    retry_delay = 5  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            # Fetch with requests first (supports timeout and proper error handling)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:139.0) Gecko/20100101 Firefox/139.0'
+            }
+            
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            
+            # Parse the response content with feedparser
+            feed = feedparser.parse(response.content)
+            
+            if feed.bozo:
+                logging.error(f"→ Feed parse error: {feed.bozo_exception}")
+                if hasattr(feed, 'entries') and len(feed.entries) == 0:
+                    logging.error("→ Zero entries returned due to parse error")
+                raise RuntimeError(f"ArXiv feed parse error: {feed.bozo_exception}")
+            
+            logging.info(f"→ Retrieved {len(feed.entries)} entries from ArXiv")
+            
+            # Honor ArXiv rate-limit: sleep after each call
+            time.sleep(3)
+            
+            return feed.entries
+            
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+            if attempt < max_retries - 1:
+                logging.warning(f"→ Attempt {attempt + 1} failed: {e}. Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                logging.error(f"→ All {max_retries} attempts failed. Last error: {e}")
+                raise
 
 def arxiv_to_dict(entry) -> Dict[str, Any]:
     """
     Map feedparser entry to a flat dict containing the fields we need
     before enrichment.
     """
-    arxiv_id = entry.id.split("/abs/")[-1]
-    authors  = [a.name.strip() for a in entry.authors]
-    cats     = [t["term"] for t in entry.tags] if "tags" in entry else []
-    links = { l.rel: l.href for l in entry.links }
-    return {
+    # Strip version suffix (v1, v2, etc.) from ArXiv ID
+    raw_id = entry.id if hasattr(entry, 'id') else None
+    if not raw_id:
+        logging.warning(f"→ Entry has no 'id' attribute: {entry}")
+        arxiv_id = None
+    else:
+        if "/abs/" in raw_id:
+            extracted_id = raw_id.split("/abs/")[-1]
+        else:
+            logging.warning(f"→ Entry ID doesn't contain '/abs/': {raw_id}")
+            extracted_id = raw_id
+        
+        arxiv_id = re.sub(r'v\d+$', '', extracted_id)
+    
+    authors = []
+    if hasattr(entry, 'authors'):
+        authors = [a.name.strip() for a in entry.authors]
+    else:
+        logging.warning(f"→ Entry has no 'authors' attribute")
+    
+    cats = []
+    if hasattr(entry, 'tags'):
+        cats = [t["term"] for t in entry.tags] if "tags" in entry else []
+    else:
+        logging.warning(f"→ Entry has no 'tags' attribute")
+    
+    links = {}
+    if hasattr(entry, 'links'):
+        links = { l.rel: l.href for l in entry.links }
+    else:
+        logging.warning(f"→ Entry has no 'links' attribute")
+    
+    result = {
         "arxiv_id": arxiv_id,
-        "title": entry.title.strip().replace("\n"," "),
-        "summary": entry.summary.strip(),
+        "title": entry.title.strip().replace("\n"," ") if hasattr(entry, 'title') else None,
+        "summary": entry.summary.strip() if hasattr(entry, 'summary') else None,
         "authors": authors,
         "categories": cats,
-        "published": datetime.fromisoformat(entry.published).astimezone(timezone.utc),
-        "updated":   datetime.fromisoformat(entry.updated).astimezone(timezone.utc),
-        "pdf_url":   links.get("related") or links.get("alternate")+"?format=pdf",
+        "published": iso_to_dt(entry.published) if hasattr(entry, 'published') else None,
+        "updated":   iso_to_dt(entry.updated) if hasattr(entry, 'updated') else None,
+        "pdf_url":   links.get("related") or links.get("alternate")+"?format=pdf" if links.get("alternate") else None,
         "arxiv_url": links.get("alternate"),
         "doi": getattr(entry, "arxiv_doi", None),
         "comment": getattr(entry, "arxiv_comment", None),
         "journal_ref": getattr(entry, "arxiv_journal_ref", None),
     }
+    
+    return result
 
 # ================================================================
 # Helpers – Semantic Scholar
 # ================================================================
-S2_PAPER_FIELDS = ",".join([
-    "title,abstract,year,venue,publicationTypes,publicationDate,url",
-    "citationCount,influentialCitationCount,referenceCount",
-    "isOpenAccess,openAccessPdf,fieldsOfStudy",
-    "authors.name,authors.authorId",
-    "externalIds"
-])
+S2_PAPER_FIELDS = "paperId,title,abstract,year,venue,publicationTypes,publicationDate,url,citationCount,influentialCitationCount,referenceCount,isOpenAccess,openAccessPdf,fieldsOfStudy,authors.name,authors.authorId,externalIds"
+
 
 def enrich_with_semanticscholar(batch: List[str]) -> Dict[str, Any]:
     """
     Call /paper/batch endpoint once for up to 100 ArXiv IDs.
     Returns dict keyed by arxiv_id.
     """
-    headers = {"x-api-key": S2_API_KEY}
-    payload = {"ids": [f"ARXIV:{pid}" for pid in batch], "fields": S2_PAPER_FIELDS}
-    r = requests.post(f"{S2_API_URL}/paper/batch", json=payload, headers=headers, timeout=30)
-    r.raise_for_status()
-    out = {}
-    for paper in r.json()["data"]:
-        aid = paper.get("externalIds", {}).get("ArXiv")
-        if aid:
-            out[aid] = paper
-    return out
+    if not batch:
+        logging.warning("Empty batch provided to enrich_with_semanticscholar")
+        return {}
+    
+    headers = {"x-api-key": S2_API_KEY} if S2_API_KEY else {}
+    formatted_ids = [f"ARXIV:{pid}" for pid in batch]
+    
+    # Put fields in query parameters, not JSON body
+    params = {'fields': S2_PAPER_FIELDS}
+    payload = {"ids": formatted_ids}
+    
+    logging.info(f"→ Calling Semantic Scholar API for {len(batch)} papers...")
+    
+    try:
+        r = requests.post(f"{S2_API_URL}/paper/batch", 
+                          params=params, json=payload, headers=headers, timeout=30)
+        
+        if r.status_code != 200:
+            logging.error(f"Semantic Scholar API error {r.status_code}: {r.text}")
+            r.raise_for_status()
+            
+        response_data = r.json()
+        
+        # Handle both possible response structures from Semantic Scholar API
+        if isinstance(response_data, list):
+            # API returned list directly
+            papers_list = response_data
+        elif isinstance(response_data, dict) and "data" in response_data:
+            # API returned dict with "data" key
+            papers_list = response_data["data"]
+        else:
+            logging.warning(f"Unexpected response structure from Semantic Scholar API. Type: {type(response_data)}, Keys: {list(response_data.keys()) if isinstance(response_data, dict) else 'N/A'}")
+            return {}
+            
+        out = {}
+        for paper in papers_list:
+            if paper is None:  # API returns null for papers not found
+                continue
+            aid = paper.get("externalIds", {}).get("ArXiv") if paper.get("externalIds") else None
+            if aid:
+                out[aid] = paper
+        
+        logging.info(f"→ Successfully enriched {len(out)} papers from Semantic Scholar")
+        return out
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Network error calling Semantic Scholar API: {e}")
+        return {}
+    except json.JSONDecodeError as e:
+        logging.error(f"Failed to parse JSON response from Semantic Scholar API: {e}")
+        return {}
+    except Exception as e:
+        logging.error(f"Unexpected error calling Semantic Scholar API: {e}", exc_info=True)
+        return {}
 
 # ================================================================
 #                          Gemini Helpers
 # ================================================================
 
-def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-17") -> str: # Updated model
+def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-17") -> str: # Updated to match example model
+    """
+    Utility wrapper around the Gemini API.
+
+    Calls the specified Gemini model with the given prompt.
+    Handles common API errors and returns the generated text content
+    or a string indicating the error type.
+
+    Args:
+        prompt: The text prompt to send to the Gemini API.
+        model_name: The specific Gemini model to use.
+
+    Returns:
+        The generated text content as a string, or an error message
+        string starting with "Error:" or "Analysis skipped".
+    """
     if not GEMINI_API_KEY:
         logging.warning("call_gemini_api called without GEMINI_API_KEY.")
         return "Analysis skipped (missing API key)."
 
-    logging.debug(f"Calling Gemini API (model: {model_name}) with prompt (first 100 chars): {prompt[:100]}...")
     try:
-        # Use the working client-based approach from the old script
+        # Use the working client-based approach from the example script
         client = genai.Client(api_key=GEMINI_API_KEY)
         response = client.models.generate_content(
             model=model_name,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2)
+            config=types.GenerateContentConfig(temperature=0.2) # Fixed: use types instead of gtypes
         )
 
         if hasattr(response, 'text'):
@@ -199,13 +372,12 @@ def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-
         elif result.startswith("Error:"):
              logging.warning(f"Gemini API returned an error message: '{result}'")
 
-        logging.debug(f"Gemini API call successful. Result (first 100 chars): {result[:100]}...")
         return result
 
-    except types.generation_types.BlockedPromptException as e:
+    except types.generation_types.BlockedPromptException as e: # Fixed: use types instead of gtypes
         logging.error(f"Gemini API call failed due to blocked prompt: {e}")
         return "Error: Analysis blocked due to prompt content."
-    except types.generation_types.StopCandidateException as e:
+    except types.generation_types.StopCandidateException as e: # Fixed: use types instead of gtypes
         logging.error(f"Gemini API call failed due to stop candidate: {e}")
         return "Error: Analysis stopped unexpectedly by the model."
     except Exception as e:
@@ -423,7 +595,6 @@ def generate_embeddings(openai_client, short_text: str, full_text: str, model="t
     full_text = full_text or ""
 
     if not short_text.strip() and not full_text.strip():
-        logging.debug("Skipping embedding generation: Both short and full texts are empty.")
         return None, None
     
     inputs_to_embed = []
@@ -438,7 +609,6 @@ def generate_embeddings(openai_client, short_text: str, full_text: str, model="t
         inputs_to_embed.append("placeholder_for_empty_full_text")
 
     try:
-        logging.debug(f"  -> Generating OpenAI embeddings for {len(inputs_to_embed)} input(s) using model '{model}'...")
         response = openai_client.embeddings.create(
             model=model,
             input=inputs_to_embed
@@ -453,7 +623,6 @@ def generate_embeddings(openai_client, short_text: str, full_text: str, model="t
             if full_text.strip(): # Only assign if original text was not empty
                 embedding_full = response.data[1].embedding
             
-            logging.debug(f"  -> OpenAI embeddings generated. Short: {'Yes' if embedding_short else 'No'}, Full: {'Yes' if embedding_full else 'No'}")
             return embedding_short, embedding_full
         else:
             logging.warning(f"Unexpected number of embeddings received: {len(response.data)}")
@@ -528,25 +697,34 @@ def calculate_word_count_and_reading_time(markdown_text: str | None) -> tuple[in
 
     return word_count, reading_time_minutes
 
-def extract_external_links(html_content: str | None) -> list[str] | None:
-    """Extracts all unique external links (href) from HTML content."""
-    if not html_content:
+def extract_external_links(content: str | None) -> list[str] | None:
+    """Extracts all unique external links from HTML content or plain text."""
+    if not content:
         return None
     
     links = set()
+    
+    # First try to parse as HTML
     try:
-        soup = BeautifulSoup(html_content, 'html.parser')
+        soup = BeautifulSoup(content, 'html.parser')
         for a_tag in soup.find_all('a', href=True):
             href = a_tag['href']
             # Basic check for external links (starts with http/https)
             if href and (href.startswith('http://') or href.startswith('https://')):
                 links.add(href)
     except Exception as e:
-        logging.warning(f"Failed to parse HTML for link extraction: {e}")
-        return None # Or empty list: []
+        logging.debug(f"HTML parsing failed, will try text extraction: {e}")
+    
+    # Also extract URLs from plain text using regex
+    try:
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+[^\s<>"{}|\\^`\[\].,;:!?)]'
+        text_urls = re.findall(url_pattern, content)
+        for url in text_urls:
+            links.add(url)
+    except Exception as e:
+        logging.warning(f"Failed to extract URLs from text: {e}")
         
     return sorted(list(links)) if links else None
-
 
 # ================================================================
 # Main
@@ -555,39 +733,117 @@ def main():
     logging.info("=== ArXiv AI-Safety ingestion start ===")
 
     # 1) Fetch & flatten
-    raw_entries = fetch_arxiv_entries(ARXIV_QUERY_TERM, ARXIV_MAX_RESULTS)
-    arxiv_posts = [arxiv_to_dict(e) for e in raw_entries]
-    logging.info(f"Fetched {len(arxiv_posts)} ArXiv entries")
+    logging.info(f"→ Fetching ArXiv papers for '{ARXIV_QUERY_TERM}' (max {ARXIV_MAX_RESULTS}, min age {ARXIV_MIN_AGE_DAYS} days)")
+    raw_entries = fetch_arxiv_entries(ARXIV_QUERY_TERM, ARXIV_MAX_RESULTS, ARXIV_MIN_AGE_DAYS)
+    
+    if not raw_entries:
+        logging.warning("→ No raw entries returned from ArXiv API")
+        return
+    
+    arxiv_posts = []
+    for i, entry in enumerate(raw_entries):
+        try:
+            post_dict = arxiv_to_dict(entry)
+            if post_dict.get("arxiv_id"):
+                arxiv_posts.append(post_dict)
+            else:
+                logging.warning(f"→ Entry {i+1} produced no ArXiv ID, skipping")
+        except Exception as e:
+            logging.error(f"→ Error processing entry {i+1}: {e}", exc_info=True)
+    
+    arxiv_ids = [p["arxiv_id"] for p in arxiv_posts if p.get("arxiv_id")]
+    logging.info(f"→ Processed {len(arxiv_posts)} ArXiv papers: {arxiv_ids}")
+    
+    if not arxiv_ids:
+        logging.error("→ No valid ArXiv IDs extracted from any entries!")
+        return
 
-    # 2) Semantic Scholar enrichment
-    enrichment = enrich_with_semanticscholar([p["arxiv_id"] for p in arxiv_posts])
-    logging.info(f"Enriched {len(enrichment)} entries via Semantic Scholar")
-
-    # 3) Open DB
+    # 2) Open DB and check for existing papers BEFORE any expensive processing
+    logging.info("→ Connecting to database...")
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = False
     register_vector(conn)
     cur = conn.cursor()
 
-    # 4) Pre-load existing title_norms
+    # Pre-load existing title_norms to avoid processing duplicates
     cur.execute("SELECT title_norm FROM posts")
     existing_titles = {row[0] for row in cur.fetchall()}
+    logging.info(f"→ Found {len(existing_titles)} existing papers in database")
 
-    batch = []
+    # Filter out papers we already have BEFORE expensive processing
+    new_papers = []
+    skipped_duplicates = 0
+    
     for post in arxiv_posts:
-        title_norm = re.sub(r'[^a-z0-9\s]+','',post["title"].lower()).strip()
+        title_norm = normalise_title(post["title"])
         if title_norm in existing_titles:
-            logging.info(f"Skip duplicate: {post['title'][:60]}")
+            logging.info(f"→ Skipping duplicate: {post['title'][:60]}...")
+            skipped_duplicates += 1
             continue
+        new_papers.append(post)
+    
+    logging.info(f"→ Processing {len(new_papers)} new papers ({skipped_duplicates} duplicates skipped)")
+    
+    if not new_papers:
+        logging.info("→ No new papers to process")
+        conn.close()
+        return
 
+    # Extract ArXiv IDs for new papers only
+    new_arxiv_ids = [p["arxiv_id"] for p in new_papers if p.get("arxiv_id")]
+    
+    # 3) Semantic Scholar enrichment (only for new papers)
+    enrichment = enrich_with_semanticscholar(new_arxiv_ids)
+
+    # 4) Initialize OpenAI client once for all papers
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # 5) Process only new papers
+    logging.info(f"→ Generating summaries and embeddings for {len(new_papers)} papers...")
+    batch = []
+    for i, post in enumerate(new_papers):
+        logging.info(f"→ Processing paper {i+1}/{len(new_papers)}: {post['title'][:50]}...")
+        
         s2 = enrichment.get(post["arxiv_id"], {})
         citation_count = s2.get("citationCount")
         influential_count = s2.get("influentialCitationCount")
-        open_pdf = s2.get("openAccessPdf", {}).get("url") if s2 else post["pdf_url"]
+        reference_count = s2.get("referenceCount")
+        
+        # Extract new metadata fields
+        fields_of_study = s2.get("fieldsOfStudy")  # list[str] or None
+        venue = s2.get("venue")
+        
+        # Prefer S2's DOI if present, else ArXiv's
+        doi = (s2.get("externalIds", {}).get("DOI") 
+               if s2 else None) or post.get("doi")
+        
+        journal_ref = post.get("journal_ref")     # arXiv <arxiv:journal_ref>
+        arxiv_comment = post.get("comment")       # arXiv <arxiv:comment>
+        
+        open_pdf = (s2.get("openAccessPdf", {}).get("url") if s2 else None) or post["pdf_url"]
 
         # Build textual content for analysis
         abstract_md = post["summary"].replace("\n\n", "\n")
         full_md = f"**Abstract:**\n{abstract_md}"
+
+        # Extract external links from content
+        content_for_links = f"{post['title']} {abstract_md}"
+        extracted_links = extract_external_links(content_for_links)
+        
+        # Combine extracted links with PDF URL
+        external_links = []
+        if open_pdf:
+            external_links.append(open_pdf)
+        if extracted_links:
+            external_links.extend(extracted_links)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_external_links = []
+        for link in external_links:
+            if link not in seen:
+                seen.add(link)
+                unique_external_links.append(link)
 
         # Gemini analyses
         short_sum = generate_short_summary(full_md)
@@ -597,14 +853,23 @@ def main():
         cluster     = tags_json.get("cluster") if isinstance(tags_json, dict) else None
         tag_list    = tags_json.get("tags")    if isinstance(tags_json, dict) else None
 
-        # Embeddings
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        # Embeddings (using the shared client)
         emb_short, emb_full = generate_embeddings(openai_client, post["title"], " ".join([short_sum,long_sum,implication]))
 
         # Assemble DB tuple (fill unused fields with None)
         uuid_str = str(uuid.uuid4())
-        word_count = len(abstract_md.split())
-        reading_minutes = max(1, round(word_count/200))
+        title_norm = normalise_title(post["title"])
+        word_count, reading_minutes = calculate_word_count_and_reading_time(abstract_md)
+        
+        # Ensure proper defaults if word_count is None or 0
+        if word_count is None or word_count == 0:
+            word_count = 0
+            reading_minutes = 0
+        elif reading_minutes == 0 and word_count > 0:
+            reading_minutes = 1
+
+        # Get Semantic Scholar paper ID
+        semantic_scholar_paper_id = s2.get("paperId") if s2 else None
 
         data = (
             uuid_str,
@@ -614,8 +879,7 @@ def main():
             post["title"],                # generated_title (use original)
             post["arxiv_url"], "ArXiv",   # url, source_type
             post["authors"],              # authors_display
-            [None]*len(post["authors"]),  # authors_ids (S2 IDs later)
-            None,                         # author_credentials
+            [a.get("authorId") for a in s2.get("authors",[])],  # authors_ids (S2 IDs)
             None,                         # content_snippet
             full_md,                      # full_content
             short_sum, long_sum, implication,
@@ -623,24 +887,86 @@ def main():
             None,                         # image_url
             influential_count,            # score (proxy: influential citations)
             None,                         # comment_count
-            citation_count,               # views (proxy)
+            citation_count,               # citation_count (dedicated column)
+            reference_count,              # reference_count
+            influential_count,            # influential_citation_count
+            doi,                          # doi
+            journal_ref,                  # journal_ref
+            arxiv_comment,                # arxiv_comment
+            fields_of_study,              # fields_of_study
+            venue,                        # venue
             None, None,                   # first_comment_at, last_activity_at
             None, None,                   # score_timeseries, comment_timeseries
             None, post["categories"],     # source_tag_ids, source_tag_names
             cluster, tag_list,            # feed_cluster, feed_tags
             reading_minutes, word_count,
-            [open_pdf],                   # external_links
+            unique_external_links,        # external_links
             None, None,                   # novelty_score, novelty_note
             emb_short, emb_full,
-            "1.0-arxiv"                   # analysis_version
+            "1.0",                        # analysis_version
+            post["arxiv_id"],             # source_id (ArXiv ID)
+            semantic_scholar_paper_id     # semantic_scholar_id (Semantic Scholar paper ID)
         )
         batch.append(data)
 
-    # 5) Insert
+    # 6) Insert
     if batch:
-        extras.execute_batch(cur, INSERT_SQL, batch)
-        conn.commit()
-        logging.info(f"Inserted {len(batch)} new ArXiv posts")
+        try:
+            logging.info(f"→ Attempting to insert {len(batch)} records into database...")
+            
+            # Log the first record's key details for debugging
+            if batch:
+                sample_record = batch[0]
+                logging.info(f"→ Sample record: UUID={sample_record[0]}, Title='{sample_record[3][:50]}...', Title_norm='{sample_record[4]}'")
+            
+            # Execute the batch insert
+            extras.execute_batch(cur, INSERT_SQL, batch)
+            
+            # Check how many rows were actually affected
+            if hasattr(cur, 'rowcount'):
+                logging.info(f"→ Rows affected by INSERT: {cur.rowcount}")
+            
+            # Commit the transaction
+            logging.info("→ Committing transaction...")
+            conn.commit()
+            logging.info("→ Transaction committed successfully")
+            
+            # Verify the insert by checking if the record exists
+            sample_title_norm = batch[0][4]  # title_norm is at index 4
+            cur.execute("SELECT uuid, title FROM posts WHERE title_norm = %s", (sample_title_norm,))
+            verification_result = cur.fetchone()
+            
+            if verification_result:
+                logging.info(f"→ Verification successful: Record found in DB with UUID {verification_result[0]}")
+            else:
+                logging.error(f"→ Verification failed: Record with title_norm '{sample_title_norm}' not found in DB after insert!")
+                
+                # Additional debugging - check if there are any constraint violations
+                cur.execute("SELECT COUNT(*) FROM posts WHERE title_norm = %s", (sample_title_norm,))
+                count_result = cur.fetchone()
+                logging.info(f"→ Count check: {count_result[0] if count_result else 'None'} records with this title_norm")
+                
+                # Check if the INSERT was skipped due to ON CONFLICT
+                logging.info("→ Checking if INSERT was skipped due to duplicate title_norm...")
+                cur.execute("SELECT uuid, title, published_date FROM posts WHERE title_norm = %s", (sample_title_norm,))
+                existing_record = cur.fetchone()
+                if existing_record:
+                    logging.info(f"→ Found existing record: UUID={existing_record[0]}, Published={existing_record[2]}")
+                else:
+                    logging.error("→ No existing record found either - this suggests a different issue")
+            
+            logging.info(f"Successfully processed {len(batch)} new ArXiv posts")
+            
+        except psycopg2.Error as e:
+            logging.error(f"→ Database error during insert: {e}")
+            logging.error(f"→ Error code: {e.pgcode}")
+            logging.error(f"→ Error details: {e.pgerror}")
+            conn.rollback()
+            raise
+        except Exception as e:
+            logging.error(f"→ Unexpected error during insert: {e}", exc_info=True)
+            conn.rollback()
+            raise
     else:
         logging.info("Nothing new to insert")
 
