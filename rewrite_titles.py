@@ -65,7 +65,7 @@ if OPENAI_WRENLY_KEY: OPENAI_WRENLY_KEY = OPENAI_WRENLY_KEY.strip()
 if CLOUDINARY_URL: CLOUDINARY_URL = CLOUDINARY_URL.strip()
 
 MODEL          = "gpt-4.1"   
-BATCH          = 2         # rows per execution
+BATCH          = 1         # rows per execution
 # Default mode can be changed here if needed
 DEFAULT_MODE   = "titles"
 

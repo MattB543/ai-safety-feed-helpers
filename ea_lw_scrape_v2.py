@@ -83,7 +83,7 @@ AF_API_URL = "https://www.alignmentforum.org/graphql"
 DEFAULT_LIMIT = 3000
 BATCH_SIZE    = 1
 
-CUTOFF_DATE = datetime(2025, 5, 10, tzinfo=timezone.utc) # Example: only posts from May 2025 onwards
+CUTOFF_DATE = datetime(2025, 5, 1, tzinfo=timezone.utc) # Example: only posts past this date
 
 # ================================================================
 #                 Filtering Thresholds & Tag Sets
@@ -111,7 +111,7 @@ AI_TAGS_LW       = {"AI"}
 # ================================================================
 DB_COLS = (
     "uuid", "published_date", "source_updated_at", "title", "title_norm",
-    "generated_title", "source_url", "source_type", "authors_display", "authors_ids",
+    "generated_title", "source_url", "source_type", "source_id", "authors_display", "authors_ids",
     "content_snippet", "full_content", "short_summary", "long_summary", "key_implication",
     "why_valuable", "image_url", "score", "comment_count", "views",
     "first_comment_at", "last_activity_at", "score_timeseries", "comment_timeseries",
@@ -943,7 +943,7 @@ def main():
                 # --- Prepare Data Tuple for Insertion (Matches DB_COLS) ---
                 data_tuple = (
                     post_uuid, published_date_dt, source_updated_at_dt, title, norm_title,
-                    generated_title, source_url, source_type, authors_display_list, authors_ids_list,
+                    generated_title, source_url, source_type, post_data_raw.get('_id', 'N/A'), authors_display_list, authors_ids_list,
                     content_snippet_text, full_content_md, short_summary_text, long_summary_text, key_implication_text,
                     None, # why_valuable (NULL for now)
                     image_url_val, score_val, comment_count_val, views_val,
@@ -953,7 +953,7 @@ def main():
                     reading_time_minutes, word_count, external_links,
                     None, None, # novelty_score, novelty_note (NUMERIC, TEXT, NULL for now)
                     embedding_short_vec, embedding_full_vec,
-                    "1.1" # analysis_version (updated from 1.0)
+                    "1.0" # analysis_version 
                 )
                 
                 if len(data_tuple) != NUM_DB_COLS:
