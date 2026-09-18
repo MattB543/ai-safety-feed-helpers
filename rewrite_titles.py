@@ -19,24 +19,26 @@ Run *once* beforehand:
 
 Workflow (mirrors backfill_novelty_openai.py):
  1. Pull a batch of recent rows whose `cleaned_title` is NULL.
- 2. Ask GPT-4.1 to propose a short, readable title that follows strict
+ 2. Ask the Azure deployment to propose a short, readable title that follows strict
     formatting rules.
  3. Validate the returned JSON and update each row individually so a
     single failure doesn't halt the whole batch.
 
 Environment variables (same as the other backfills):
   • AI_SAFETY_FEED_DB_URL       – PostgreSQL connection string
-  • OPEN_AI_FREE_CREDITS_KEY    – OpenAI key for text generation
-  • OPEN_AI_WRENLY_KEY         – OpenAI key for image generation
+  • AZURE_OPENAI_API_KEY        – Azure OpenAI API key for text generation
+  • AZURE_OPENAI_ENDPOINT       – Azure OpenAI endpoint
+  • AZURE_OPENAI_DEPLOYMENT     – Azure OpenAI deployment name (e.g. gpt-5.6-terra)
+  • AZURE_OPENAI_API_VERSION    – Azure OpenAI API version (defaults to 2024-12-01-preview)
+  • GEMINI_API_KEY              – Gemini API key for image generation
   • CLOUDINARY_URL              – Cloudinary connection string (e.g., cloudinary://key:secret@cloud_name)
 """
 
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, re, psycopg2
 from psycopg2 import extras
-from openai import OpenAI  # OpenAI Python v1.x client
+from openai import AzureOpenAI
 from dotenv import load_dotenv
-import base64 # Added import
 import argparse # Added import
 from PIL import Image
 import tempfile
@@ -46,26 +48,55 @@ import subprocess
 import platform
 import csv
 from datetime import datetime
+from google import genai
+from google.genai import types
 
 # ───── Load environment variables ──────────────────────────────
-load_dotenv()  # Load environment variables from .env file
+load_dotenv(override=True)  # Load environment variables from .env file
 
 import cloudinary, cloudinary.uploader, requests
 
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL         = os.getenv("AI_SAFETY_FEED_DB_URL")
-OPENAI_API_KEY = os.getenv("OPEN_AI_FREE_CREDITS_KEY")
-OPENAI_WRENLY_KEY = os.getenv("OPEN_AI_WRENLY_KEY")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
 # Strip potential whitespace from keys
 if DB_URL: DB_URL = DB_URL.strip()
-if OPENAI_API_KEY: OPENAI_API_KEY = OPENAI_API_KEY.strip()
-if OPENAI_WRENLY_KEY: OPENAI_WRENLY_KEY = OPENAI_WRENLY_KEY.strip()
+if AZURE_OPENAI_API_KEY: AZURE_OPENAI_API_KEY = AZURE_OPENAI_API_KEY.strip()
+if AZURE_OPENAI_ENDPOINT: AZURE_OPENAI_ENDPOINT = AZURE_OPENAI_ENDPOINT.strip()
+if AZURE_OPENAI_DEPLOYMENT: AZURE_OPENAI_DEPLOYMENT = AZURE_OPENAI_DEPLOYMENT.strip()
+if AZURE_OPENAI_API_VERSION: AZURE_OPENAI_API_VERSION = AZURE_OPENAI_API_VERSION.strip()
+if GEMINI_API_KEY: GEMINI_API_KEY = GEMINI_API_KEY.strip()
 if CLOUDINARY_URL: CLOUDINARY_URL = CLOUDINARY_URL.strip()
 
-MODEL          = "gpt-4.1"   
-BATCH          = 1         # rows per execution
+MODEL          = AZURE_OPENAI_DEPLOYMENT
+IMAGE_MODEL    = os.getenv("GEMINI_IMAGE_MODEL") or "gemini-3.1-flash-lite-image"
+
+# ───── Cost tracking (estimates; check the Azure / Google billing pages for exact figures) ─────
+AZURE_USD_PER_M_INPUT  = float(os.getenv("AZURE_USD_PER_M_INPUT", "2.0"))    # gpt-5.6-terra list price
+AZURE_USD_PER_M_OUTPUT = float(os.getenv("AZURE_USD_PER_M_OUTPUT", "12.0"))
+GEMINI_IMAGE_USD_EACH  = float(os.getenv("GEMINI_IMAGE_USD_EACH", "0.0336"))  # gemini-3.1-flash-lite-image: $30/M image tokens, 1120 tokens per 1K image
+AZURE_USAGE = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0}
+GEMINI_USAGE = {"calls": 0, "images": 0, "prompt_tokens": 0, "output_tokens": 0}
+
+def _track_azure_usage(rsp) -> None:
+    usage = getattr(rsp, "usage", None)
+    AZURE_USAGE["calls"] += 1
+    if usage:
+        AZURE_USAGE["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+        AZURE_USAGE["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+
+def azure_cost_usd() -> float:
+    return (AZURE_USAGE["prompt_tokens"] * AZURE_USD_PER_M_INPUT + AZURE_USAGE["completion_tokens"] * AZURE_USD_PER_M_OUTPUT) / 1e6
+
+def gemini_image_cost_usd() -> float:
+    return GEMINI_USAGE["images"] * GEMINI_IMAGE_USD_EACH
+BATCH          = 2       # rows per execution
 # Default mode can be changed here if needed
 DEFAULT_MODE   = "titles"
 
@@ -75,10 +106,19 @@ cloudinary.config(
     secure=True
 )
 
-if not (DB_URL and OPENAI_API_KEY and OPENAI_WRENLY_KEY and CLOUDINARY_URL):
+if not (
+    DB_URL
+    and AZURE_OPENAI_API_KEY
+    and AZURE_OPENAI_ENDPOINT
+    and AZURE_OPENAI_DEPLOYMENT
+    and CLOUDINARY_URL
+    and GEMINI_API_KEY
+):
     sys.exit(
         "Ensure the following environment variables are set: "
-        "AI_SAFETY_FEED_DB_URL, OPEN_AI_FREE_CREDITS_KEY, OPEN_AI_WRENLY_KEY, and CLOUDINARY_URL"
+        "AI_SAFETY_FEED_DB_URL, AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, "
+        "AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION (optional), "
+        "GEMINI_API_KEY, and CLOUDINARY_URL"
     )
 
 logging.basicConfig(
@@ -86,16 +126,23 @@ logging.basicConfig(
     format = "%(asctime)s  %(levelname)-8s  %(message)s"
 )
 
-# ───── OpenAI helper ──────────────────────────────────────────
-text_client = OpenAI(api_key=OPENAI_API_KEY)
-image_client = OpenAI(api_key=OPENAI_WRENLY_KEY)
+# ───── LLM/Image clients ───────────────────────────────────────
+try:
+    text_client = AzureOpenAI(
+        api_key=AZURE_OPENAI_API_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_deployment=MODEL,
+    )
+    image_client = genai.Client(api_key=GEMINI_API_KEY)
+except Exception as e:
+    sys.exit(f"Failed to initialize Azure/Gemini clients: {e}")
 
 def openai_json(prompt: str,
                 *,
-                model: str | None = None,
-                temperature: float = 0.5,
-                max_tokens: int = 500):
-    """Call GPT-4.1 in strict-JSON mode and return the parsed dict (or None)."""
+                model: str | None = None
+                ):
+    """Call the Azure deployment in strict-JSON mode and return the parsed dict (or None)."""
     sys_prompt = (
         "You MUST return only minified JSON. Do not wrap it in markdown or add commentary."
     )
@@ -107,11 +154,16 @@ def openai_json(prompt: str,
                 {"role": "system", "content": sys_prompt},
                 {"role": "user",   "content": prompt}
             ],
-            temperature     = temperature,
-            max_tokens      = max_tokens,
-            response_format = {"type": "json_object"}
+            response_format = {"type": "json_object"},
+            max_completion_tokens = 1200,
         )
+        _track_azure_usage(rsp)
         raw = rsp.choices[0].message.content
+        if isinstance(raw, list):
+            raw = "".join(
+                part.get("text", "") if isinstance(part, dict) else (getattr(part, "text", "") or "")
+                for part in raw
+            )
         logging.debug("Raw GPT response: %s", raw)
         return json.loads(raw)
 
@@ -119,8 +171,62 @@ def openai_json(prompt: str,
         logging.warning("JSON decode error: %s — text: %.120s…", e, raw)
         return None
     except Exception as e:
-        logging.warning("OpenAI call failed: %s", e)
+        logging.warning("Azure OpenAI call failed: %s", e)
         return None
+
+
+def azure_text(prompt: str, *, model: str | None = None) -> str:
+    """Call Azure OpenAI chat completions and return plain text."""
+    target_model = model or MODEL
+    request_kwargs = {
+        "model": target_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_completion_tokens": 1200,
+    }
+    rsp = text_client.chat.completions.create(**request_kwargs)
+    _track_azure_usage(rsp)
+    content = rsp.choices[0].message.content if rsp.choices else None
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else (getattr(part, "text", "") or "")
+            for part in content
+        ).strip()
+    raise ValueError("Azure OpenAI returned empty or unsupported content")
+
+
+def generate_gemini_image_bytes(prompt: str) -> bytes | None:
+    """Generate one image with Gemini and return raw bytes."""
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=prompt)],
+        ),
+    ]
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+    )
+    for chunk in image_client.models.generate_content_stream(
+        model=IMAGE_MODEL,
+        contents=contents,
+        config=config,
+    ):
+        candidates = getattr(chunk, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
+                inline_data = getattr(part, "inline_data", None)
+                if inline_data and getattr(inline_data, "data", None):
+                    return bytes(inline_data.data)
+        # Backward-compat fallback for SDKs that expose top-level parts
+        parts = getattr(chunk, "parts", None) or []
+        for part in parts:
+            inline_data = getattr(part, "inline_data", None)
+            if inline_data and getattr(inline_data, "data", None):
+                return bytes(inline_data.data)
+    return None
 
 
 def save_image_to_file(image_bytes: bytes, content_id: int, variant_num: int, images_dir: str = "generated_images") -> str:
@@ -131,11 +237,181 @@ def save_image_to_file(image_bytes: bytes, content_id: int, variant_num: int, im
     
     with open(filepath, 'wb') as f:
         f.write(image_bytes)
-    
+
     return filepath
 
 
 # ───── Main routine ───────────────────────────────────────────
+def generate_gemini_image(prompt: str) -> tuple[bytes | None, object]:
+    """Generate ONE image (non-streaming) and return (bytes, usage_metadata)."""
+    response = image_client.models.generate_content(
+        model=IMAGE_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"]),
+    )
+    usage = getattr(response, "usage_metadata", None)
+    GEMINI_USAGE["calls"] += 1
+    if usage:
+        GEMINI_USAGE["prompt_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
+        GEMINI_USAGE["output_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+    for cand in getattr(response, "candidates", None) or []:
+        content = getattr(cand, "content", None)
+        for part in (getattr(content, "parts", None) or []):
+            inline = getattr(part, "inline_data", None)
+            if inline and getattr(inline, "data", None):
+                GEMINI_USAGE["images"] += 1
+                return bytes(inline.data), usage
+    return None, usage
+
+
+# ───── Image prompt templates ─────────────────────────────────
+# The generated images are shown on the site as small square thumbnails, so the
+# prompts below push hard for one simple subject and zero text.
+
+CONCEPT_EXTRACTION_TEMPLATE = """
+Read the article below and pick the single most important idea in it.
+
+Then invent ONE visual metaphor for that idea that could be drawn as a simple icon.
+
+Rules for the metaphor:
+- It must be ONE concrete object, or one object doing one thing. No scenes, no
+  crowds, no rooms, no collections of objects, no multi-part diagrams.
+- Name at most two physical things in total.
+- It must be something a person can recognise instantly from its silhouette alone.
+- It must contain nothing that would need a word, label, sign, screen or symbol
+  to be understood.
+- Do not use abstract nouns in the metaphor; describe only what is physically drawn.
+
+Reply with the metaphor only, in 12 words or fewer. No explanation, no title,
+no concept summary, no quotation marks.
+
+---
+
+Article:
+
+Title: {title}
+
+Full Content:
+{full_content}
+"""
+
+# Shared composition rules for every image request.
+IMAGE_STYLE_RULES = """
+Composition rules, follow all of them exactly:
+- ONE subject only, centred, filling most of the frame. At most two objects in
+  the entire image. Nothing else.
+- Absolutely NO text anywhere: no words, letters, numbers, labels, signs,
+  captions, tags, titles, logos, handwriting, or marks that look like writing.
+  Any surface that would normally carry text must be left completely blank.
+- Plain, empty background in one or two flat colours. No scenery, no machinery,
+  no wires, no scattered paper, no clutter, no props, no background characters.
+- Bold silhouette, strong contrast, limited palette of three or four colours.
+- Big chunky shapes only. No fine detail, no thin lines, no small parts, no
+  intricate texture, no tiny faces.
+- The image is displayed as a 200 x 200 pixel thumbnail on a website and must be
+  fully understandable at a glance at that size, with no zooming. If an element
+  would be unreadable when shrunk to 200 x 200 pixels, leave it out entirely.
+
+Style: raw, fun, grungy paper cut-out collage - flat torn-paper shapes, bold and
+simple.
+"""
+
+IMAGE_PROMPT_TEMPLATE = """Create one simple illustration of this visual metaphor:
+{metaphor}
+{style_rules}"""
+
+IMAGE_PROMPT_FALLBACK_TEMPLATE = """Create one simple illustration that represents this article.
+Choose a single everyday object as the metaphor and draw only that.
+
+Title: {title}
+Summary: {summary}
+{style_rules}"""
+
+
+def build_image_prompt(cleaned_title: str, full_content: str, paragraph_summary: str) -> str:
+    """Concept extraction (Azure) -> image prompt; falls back to a title/summary prompt."""
+    concept_extraction_prompt = CONCEPT_EXTRACTION_TEMPLATE.format(
+        title=cleaned_title,
+        full_content=(full_content or "")[:20000],
+    )
+    try:
+        concept_result = azure_text(concept_extraction_prompt)
+    except Exception as e:
+        logging.warning("   → Concept extraction failed: %s", e)
+        concept_result = ""
+    if concept_result:
+        logging.info("   → Visual metaphor: %s", concept_result.strip())
+        return IMAGE_PROMPT_TEMPLATE.format(
+            metaphor=concept_result.strip(),
+            style_rules=IMAGE_STYLE_RULES,
+        )
+    return IMAGE_PROMPT_FALLBACK_TEMPLATE.format(
+        title=cleaned_title,
+        summary=paragraph_summary,
+        style_rules=IMAGE_STYLE_RULES,
+    )
+
+
+def handle_auto_image_generation(rows):
+    """Unattended: one image per row, uploaded straight to Cloudinary, with cost tracking."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    images_dir = f"generated_images_{timestamp}"
+    os.makedirs(images_dir, exist_ok=True)
+    cost_rows = []
+    updated = 0
+    conn = cur = None
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cur = conn.cursor(cursor_factory=extras.RealDictCursor)
+        for row in rows:
+            cid = row["id"]
+            cleaned_title = row["cleaned_title"] or row["title"] or "Untitled"
+            az_before = (AZURE_USAGE["prompt_tokens"], AZURE_USAGE["completion_tokens"])
+            gm_before = (GEMINI_USAGE["prompt_tokens"], GEMINI_USAGE["output_tokens"])
+            logging.info("[%s] Generating image for: '%s'", cid, cleaned_title[:80])
+            img_prompt = build_image_prompt(cleaned_title, row["full_content_markdown"] or "", row["paragraph_summary"] or "")
+            cdn_url = None
+            try:
+                image_bytes, usage = generate_gemini_image(img_prompt)
+                if not image_bytes:
+                    raise RuntimeError("Gemini returned no image (usage=%s)" % usage)
+                local_path = save_image_to_file(image_bytes, cid, 1, images_dir)
+                up_rsp = cloudinary.uploader.upload(io.BytesIO(image_bytes), folder="ai-safety-feed", public_id=f"{cid}_auto")
+                cdn_url = up_rsp["secure_url"]
+                cur.execute("UPDATE content SET cleaned_image = %s, image_prompt = %s WHERE id = %s", (cdn_url, img_prompt.strip(), cid))
+                conn.commit()
+                updated += 1
+                logging.info("   → Uploaded %s (local copy %s)", cdn_url, local_path)
+            except Exception as e:
+                conn.rollback()
+                logging.warning("   → Image generation/upload failed for %s: %s", cid, e)
+            az_p = AZURE_USAGE["prompt_tokens"] - az_before[0]
+            az_c = AZURE_USAGE["completion_tokens"] - az_before[1]
+            gm_p = GEMINI_USAGE["prompt_tokens"] - gm_before[0]
+            gm_o = GEMINI_USAGE["output_tokens"] - gm_before[1]
+            est = (az_p * AZURE_USD_PER_M_INPUT + az_c * AZURE_USD_PER_M_OUTPUT) / 1e6 + (GEMINI_IMAGE_USD_EACH if cdn_url else 0.0)
+            cost_rows.append({"id": cid, "title": cleaned_title[:80], "azure_prompt_tokens": az_p, "azure_completion_tokens": az_c,
+                              "gemini_prompt_tokens": gm_p, "gemini_output_tokens": gm_o, "image_uploaded": bool(cdn_url),
+                              "cleaned_image": cdn_url or "", "est_cost_usd": round(est, 4)})
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+    csv_filename = f"image_cost_{timestamp}.csv"
+    with open(csv_filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(cost_rows[0].keys()) if cost_rows else ["id"])
+        writer.writeheader()
+        writer.writerows(cost_rows)
+    total = sum(r["est_cost_usd"] for r in cost_rows)
+    logging.info("Auto image generation complete: %d/%d images uploaded", updated, len(rows))
+    logging.info("Azure: %d calls, %d prompt + %d completion tokens ≈ $%.3f", AZURE_USAGE["calls"], AZURE_USAGE["prompt_tokens"], AZURE_USAGE["completion_tokens"], azure_cost_usd())
+    logging.info("Gemini: %d calls, %d images, %d prompt + %d output tokens ≈ $%.3f at $%.3f/image",
+                 GEMINI_USAGE["calls"], GEMINI_USAGE["images"], GEMINI_USAGE["prompt_tokens"], GEMINI_USAGE["output_tokens"], gemini_image_cost_usd(), GEMINI_IMAGE_USD_EACH)
+    logging.info("ESTIMATED TOTAL ≈ $%.3f (%s per image incl. concept extraction). Per-item breakdown: %s; local copies: %s/",
+                 total, f"${total / max(updated, 1):.3f}", csv_filename, images_dir)
+
+
 def main():
     t0 = time.time()
     conn = cur = None
@@ -145,7 +421,7 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["titles", "images", "images-batch", "upload", "both"],
+        choices=["titles", "images", "images-batch", "images-auto", "upload", "both"],
         default=DEFAULT_MODE,
         help="Operation mode: 'titles' to only generate titles, 'images' to only generate images interactively, 'images-batch' to generate images in batch mode, 'upload' to interactively upload generated images, 'both' to generate both. Default is 'both'."
     )
@@ -153,7 +429,7 @@ def main():
         "--batch-size",
         type=int,
         default=20,
-        help="Number of articles to process in batch mode (only applies to images-batch mode). Default is 20."
+        help="Number of articles to process per run (all modes). Default is 20."
     )
     parser.add_argument(
         "--images-dir",
@@ -162,7 +438,7 @@ def main():
     )
     args = parser.parse_args()
     mode = args.mode
-    batch_size = args.batch_size if mode == "images-batch" else BATCH
+    batch_size = args.batch_size
     images_dir = args.images_dir
     
     logging.info(f"Running in mode: {mode}")
@@ -199,7 +475,7 @@ def main():
                 ORDER  BY published_date DESC NULLS LAST
                 LIMIT  %s
             """
-        elif mode in ["images", "images-batch"]:
+        elif mode in ["images", "images-batch", "images-auto"]:
             logging.info("Selecting rows where cleaned_image IS NULL and cleaned_title IS NOT NULL …")
             select_query = """
                 SELECT id, title, sentence_summary, paragraph_summary, full_content_markdown, cleaned_title, cleaned_image, image_prompt
@@ -229,6 +505,8 @@ def main():
         # Handle batch image generation mode
         if mode == "images-batch":
             return handle_batch_image_generation(rows)
+        if mode == "images-auto":
+            return handle_auto_image_generation(rows)
 
         # 2️⃣  Process individually so errors don't block others (original logic for non-batch modes)
         for row in rows:
@@ -282,8 +560,8 @@ def main():
 
                 Paragraph Summary: "{paragraph_summary}"
 
-                Full Content:
-                {full_content}
+                Full Content (truncated):
+                {full_content[:10000]}
                 """
                 result = openai_json(prompt)
                 if result and isinstance(result, dict) and result.get("cleaned_title"):
@@ -331,52 +609,8 @@ def main():
                 logging.info("[%s] Generating image for title: '%s' …", cid, final_title_to_write)
                 
                 # --- Sub-Stage: Concept Extraction for Image Prompt ---
-                concept_extraction_prompt = f"""
-                Analyze the following article content and identify the top most important distinct concept presented.
-                Then think of a visual metaphor that is radical and can be used to represent the concept.
-                Output the concise most important distinct concept (max length of 20 words) and the visual metaphor (max length of 12 words).
-                
-                ---
-
-                Article:
-                
-                Title: {final_title_to_write}
-
-                Full Content:
-                {full_content}
-                """
                 logging.info("[%s] Attempting to extract concepts for image generation...", cid)
-                
-                try:
-                    rsp = text_client.chat.completions.create(
-                        model = "gpt-4.1",
-                        messages = [
-                            {"role": "user", "content": concept_extraction_prompt}
-                        ],
-                        temperature = 0.5,
-                        max_tokens = 300
-                    )
-
-                    concept_result = rsp.choices[0].message.content.strip()
-
-                    logging.info("   → Concepts extracted for image: %s", concept_result)
-                    
-                    if concept_result:
-                        img_prompt = f""" 
-                        Create a raw image of the visual metaphor below:
-                        {concept_result}
-
-                        Required Style: Raw, fun, & grungy paper cut-out animation
-                        """
-                    else:
-                        logging.warning("   → LLM failed to generate concepts.")
-                except Exception as e:
-                    logging.warning("   → LLM concept extraction failed: %s", e)
-                    img_prompt = f""" 
-                    Create a raw image for this article:
-                    Title: {final_title_to_write}
-                    Summary: {paragraph_summary}
-                    """
+                img_prompt = build_image_prompt(final_title_to_write, full_content, paragraph_summary)
 
                 try:
                     # Generate 3 images but DON'T upload yet - keep them local for user selection
@@ -384,14 +618,9 @@ def main():
                     logging.info("   → Generating 3 image variants...")
                     
                     for i in range(3):
-                        img_rsp = image_client.images.generate(
-                            model="gpt-image-1",
-                            prompt=img_prompt,
-                            size="1024x1024",
-                            quality="medium",
-                        )
-                        img_b64_data = img_rsp.data[0].b64_json 
-                        image_bytes = base64.b64decode(img_b64_data) 
+                        image_bytes = generate_gemini_image_bytes(img_prompt)
+                        if not image_bytes:
+                            raise RuntimeError("Gemini image generation returned no image bytes")
                         
                         # Show the image and store its path and bytes
                         path = _show_temp_image(image_bytes, i+1)
@@ -399,7 +628,7 @@ def main():
                         logging.info(f"   → Generated and opened image variant {i+1}")
                         
                         # Small delay to prevent overwhelming the system
-                        time.sleep(0.5)
+                        time.sleep(0.1)
 
                     # Give user time to see all images before prompting
                     logging.info("   → All 3 variants should now be open in your image viewer.")
@@ -512,55 +741,8 @@ def handle_batch_image_generation(rows):
             
             logging.info(f"[{cid}] Generating images for: '{cleaned_title}' ...")
             
-            # Extract concepts for image prompt
-            concept_extraction_prompt = f"""
-            Analyze the following article content and identify the top most important distinct concept presented.
-            Then think of a visual metaphor that is radical and can be used to represent the concept.
-            Output the concise most important distinct concept (max length of 20 words) and the visual metaphor (max length of 12 words).
-            
-            ---
-
-            Article:
-            
-            Title: {cleaned_title}
-
-            Full Content:
-            {full_content}
-            """
-            
-            try:
-                rsp = text_client.chat.completions.create(
-                    model = "gpt-4.1",
-                    messages = [
-                        {"role": "user", "content": concept_extraction_prompt}
-                    ],
-                    temperature = 0.5,
-                    max_tokens = 300
-                )
-
-                concept_result = rsp.choices[0].message.content.strip()
-                logging.info(f"   → Concepts extracted: {concept_result}")
-                
-                if concept_result:
-                    img_prompt = f""" 
-                    Create a raw image incorporating the visual metaphor below:
-                    {concept_result}
-
-                    Required Style: Raw, fun, & grungy paper cut-out animation
-                    """
-                else:
-                    img_prompt = f""" 
-                    Create a raw image for this article:
-                    Title: {cleaned_title}
-                    Summary: {paragraph_summary}
-                    """
-            except Exception as e:
-                logging.warning(f"   → Concept extraction failed: {e}")
-                img_prompt = f""" 
-                Create a raw image for this article:
-                Title: {cleaned_title}
-                Summary: {paragraph_summary}
-                """
+            # Extract concepts and build the image prompt
+            img_prompt = build_image_prompt(cleaned_title, full_content, paragraph_summary)
 
             # Save the image prompt to the database immediately
             try:
@@ -578,14 +760,9 @@ def handle_batch_image_generation(rows):
             for i in range(3):
                 try:
                     logging.info(f"   → Generating image variant {i+1}/3...")
-                    img_rsp = image_client.images.generate(
-                        model="gpt-image-1",
-                        prompt=img_prompt,
-                        size="1024x1024",
-                        quality="medium",
-                    )
-                    img_b64_data = img_rsp.data[0].b64_json 
-                    image_bytes = base64.b64decode(img_b64_data)
+                    image_bytes = generate_gemini_image_bytes(img_prompt)
+                    if not image_bytes:
+                        raise RuntimeError("Gemini image generation returned no image bytes")
                     
                     # Save to file with proper naming
                     filepath = save_image_to_file(image_bytes, cid, i+1, images_dir)
@@ -593,7 +770,7 @@ def handle_batch_image_generation(rows):
                     images_generated += 1
                     
                     # Small delay to prevent rate limiting
-                    time.sleep(1)
+                    time.sleep(0.1)
                     
                 except Exception as e:
                     logging.warning(f"   → Failed to generate image variant {i+1}: {e}")

@@ -24,6 +24,7 @@ import logging
 from datetime import datetime, timezone, date # Explicit imports for clarity
 import sys # For exiting early
 import uuid # For generating UUIDs
+from collections import defaultdict # For time-series processing
 
 import requests
 from markdownify import markdownify
@@ -88,20 +89,11 @@ CUTOFF_DATE = datetime(2025, 5, 1, tzinfo=timezone.utc) # Example: only posts pa
 # ================================================================
 #                 Filtering Thresholds & Tag Sets
 # ================================================================
-EA_SCORE_THRESHOLD_HIGH         = 85
-EA_COMMENT_THRESHOLD_HIGH_SCORE = 0
-EA_SCORE_THRESHOLD_MID          = 65
-EA_COMMENT_THRESHOLD_MID_SCORE  = 12
-
-LW_SCORE_THRESHOLD_HIGH         = 85
-LW_COMMENT_THRESHOLD_HIGH_SCORE = 0
-LW_SCORE_THRESHOLD_MID          = 65
-LW_COMMENT_THRESHOLD_MID_SCORE  = 20
-
-AF_SCORE_THRESHOLD_HIGH         = 140
-AF_COMMENT_THRESHOLD_HIGH_SCORE = -1
-AF_SCORE_THRESHOLD_MID          = 100
-AF_COMMENT_THRESHOLD_MID_SCORE  = 20
+# Unified filtering criteria for all forums:
+# Include posts with score 10+ OR (score 5+ AND 10+ comments)
+SCORE_THRESHOLD_HIGH = 10  # Posts with this score or higher are included regardless of comments
+SCORE_THRESHOLD_MID = 5    # Posts with this score need COMMENT_THRESHOLD_MID comments to be included
+COMMENT_THRESHOLD_MID = 10 # Minimum comments needed for mid-score posts
 
 APRIL_FOOLS_TAGS = {"April Fool's", "April Fools' Day"}
 AI_TAGS_LW       = {"AI"}
@@ -114,7 +106,7 @@ DB_COLS = (
     "generated_title", "source_url", "source_type", "source_id", "authors_display", "authors_ids",
     "content_snippet", "full_content", "short_summary", "long_summary", "key_implication",
     "why_valuable", "image_url", "score", "comment_count", "views",
-    "first_comment_at", "last_activity_at", "score_timeseries", "comment_timeseries",
+    "first_comment_at", "last_activity_at", "score_timeseries", "comments",
     "source_tag_ids", "source_tag_names", "feed_cluster", "feed_tags",
     "reading_time_minutes", "word_count", "external_links", "novelty_score",
     "novelty_note", "embedding_short", "embedding_full", "analysis_version",
@@ -145,7 +137,7 @@ def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
 #                          Gemini Helpers
 # ================================================================
 
-def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-17") -> str: # Updated model
+def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash") -> str: # Use stable model
     if not GEMINI_API_KEY:
         logging.warning("call_gemini_api called without GEMINI_API_KEY.")
         return "Analysis skipped (missing API key)."
@@ -177,12 +169,9 @@ def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-
         logging.debug(f"Gemini API call successful. Result (first 100 chars): {result[:100]}...")
         return result
 
-    except types.generation_types.BlockedPromptException as e:
-        logging.error(f"Gemini API call failed due to blocked prompt: {e}")
-        return "Error: Analysis blocked due to prompt content."
-    except types.generation_types.StopCandidateException as e:
-        logging.error(f"Gemini API call failed due to stop candidate: {e}")
-        return "Error: Analysis stopped unexpectedly by the model."
+    except Exception as e:
+        logging.error(f"Unexpected error during Gemini API call: {e}", exc_info=True)
+        return f"Error: {e}"
     except Exception as e:
         logging.error(f"Unexpected error during Gemini API call: {e}", exc_info=True)
         return f"Error during analysis: {e}"
@@ -635,6 +624,129 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
         return []
 
 # ================================================================
+#                  Comment Processing Logic
+# ================================================================
+
+def get_all_comments_for_post(api_url: str, post_id: str) -> list[dict]:
+    """
+    Fetches all comments for a given post ID.
+    Note: API has a hard-coded 5000 comment limit and ignores pagination.
+    """
+    print(f"    - Fetching comments for post {post_id}...")
+    
+    # Simple query without pagination since API ignores offset
+    query = """
+    query GetPostComments($postId: String!, $limit: Int) {
+      comments(input: {
+        terms: {
+          view: "postCommentsOld",
+          postId: $postId,
+          limit: $limit
+        }
+      }) {
+        results {
+          _id
+          baseScore
+          user {
+            displayName
+            slug
+          }
+          htmlBody
+          postedAt
+          parentCommentId
+        }
+      }
+    }
+    """
+    
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "AI-Safety-Feed-Ingestion-Script/1.4"
+    }
+
+    try:
+        variables = {"postId": post_id, "limit": 5000}
+        response = requests.post(api_url, json={"query": query, "variables": variables}, headers=headers, timeout=60)
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            logging.warning(f"GraphQL error fetching comments for post {post_id}: {data['errors']}")
+            print(f"    - GraphQL error: {data['errors']}")
+            return []
+
+        results = data.get("data", {}).get("comments", {}).get("results", [])
+        print(f"    - Retrieved {len(results)} comments")
+        return results
+
+    except requests.exceptions.Timeout as e:
+        print(f"    - Request timed out after 60s: {e}")
+        logging.error(f"Timeout fetching comments for post {post_id}: {e}")
+        return []
+    except requests.exceptions.RequestException as e:
+        print(f"    - HTTP error: {e}")
+        logging.error(f"HTTP error fetching comments for post {post_id}: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"    - JSON decode error: {e}")
+        logging.error(f"JSON decode error fetching comments for post {post_id}: {e}")
+        return []
+    except Exception as e:
+        print(f"    - Unexpected error: {e}")
+        logging.error(f"Unexpected error fetching comments for post {post_id}: {e}")
+        return []
+
+def process_comment_data(comments: list[dict]) -> tuple[datetime | None, datetime | None, str | None]:
+    """
+    Processes a list of comments to extract timestamps and prepare comments for JSON storage.
+    
+    Returns: (first_comment_at, last_activity_at, comments_json)
+    """
+    if not comments:
+        return None, None, None
+
+    first_comment_at = None
+    last_activity_at = None
+    processed_comments = []
+
+    for comment in comments:
+        posted_at_str = comment.get("postedAt")
+        comment_dt = None
+        if posted_at_str:
+            comment_dt = iso_to_dt(posted_at_str)
+
+        # Update first and last timestamps
+        if comment_dt:
+            if first_comment_at is None or comment_dt < first_comment_at:
+                first_comment_at = comment_dt
+            if last_activity_at is None or comment_dt > last_activity_at:
+                last_activity_at = comment_dt
+
+        # Process comment for storage
+        processed_comment = {
+            "id": comment.get("_id"),
+            "score": comment.get("baseScore"),
+            "posted_at": posted_at_str,
+            "parent_id": comment.get("parentCommentId"),
+            "author": None,
+            "content": comment.get("htmlBody", "")
+        }
+        
+        # Extract author information
+        if comment.get("user"):
+            processed_comment["author"] = {
+                "display_name": comment["user"].get("displayName"),
+                "slug": comment["user"].get("slug")
+            }
+        
+        processed_comments.append(processed_comment)
+
+    # Convert to JSON for database storage
+    comments_json = json.dumps(processed_comments) if processed_comments else None
+    
+    return first_comment_at, last_activity_at, comments_json
+
+# ================================================================
 #                     Source‑Specific Filtering
 # ================================================================
 # (Filtering logic remains largely the same, as it's pre-DB schema changes)
@@ -654,8 +766,8 @@ def filter_ea_posts(posts: list[dict], tag_id: str) -> list[dict]:
         score = safe_int_or_none(p.get("baseScore")) or 0 # Default to 0 if None for comparison
         comments = safe_int_or_none(p.get("commentCount")) or 0
         passes_threshold = (
-            (score >= EA_SCORE_THRESHOLD_HIGH and comments >= EA_COMMENT_THRESHOLD_HIGH_SCORE) or
-            (score >= EA_SCORE_THRESHOLD_MID and comments >= EA_COMMENT_THRESHOLD_MID_SCORE) # Changed to >=
+            (score >= SCORE_THRESHOLD_HIGH) or
+            (score >= SCORE_THRESHOLD_MID and comments >= COMMENT_THRESHOLD_MID)
         )
         if passes_threshold:
             p["source_type"] = "EA Forum"
@@ -678,8 +790,8 @@ def filter_lw_posts(posts: list[dict]) -> list[dict]:
         score = safe_int_or_none(p.get("baseScore")) or 0
         comments = safe_int_or_none(p.get("commentCount")) or 0
         passes_threshold = (
-            (score >= LW_SCORE_THRESHOLD_HIGH and comments >= LW_COMMENT_THRESHOLD_HIGH_SCORE) or
-            (score >= LW_SCORE_THRESHOLD_MID and comments >= LW_COMMENT_THRESHOLD_MID_SCORE) # Changed to >=
+            (score >= SCORE_THRESHOLD_HIGH) or
+            (score >= SCORE_THRESHOLD_MID and comments >= COMMENT_THRESHOLD_MID)
         )
         if passes_threshold:
             p["source_type"] = "Less Wrong"
@@ -701,8 +813,8 @@ def filter_af_posts(posts: list[dict]) -> list[dict]:
         score = safe_int_or_none(p.get("baseScore")) or 0
         comments = safe_int_or_none(p.get("commentCount")) or 0
         passes_threshold = (
-            (score >= AF_SCORE_THRESHOLD_HIGH and comments >= AF_COMMENT_THRESHOLD_HIGH_SCORE) or # Changed to >=
-            (score >= AF_SCORE_THRESHOLD_MID and comments >= AF_COMMENT_THRESHOLD_MID_SCORE) # Changed to >=
+            (score >= SCORE_THRESHOLD_HIGH) or
+            (score >= SCORE_THRESHOLD_MID and comments >= COMMENT_THRESHOLD_MID)
         )
         if passes_threshold:
             p["source_type"] = "Alignment Forum"
@@ -880,6 +992,23 @@ def main():
                 else:
                     print("  -> Gemini analyses completed.")
 
+                # --- Fetch and Process Comments Data ---
+                print("  -> Fetching all comments for this post...")
+                source_api_url = {
+                    "EA Forum": EA_API_URL,
+                    "Less Wrong": LW_API_URL,
+                    "Alignment Forum": AF_API_URL
+                }.get(post_data_raw.get('source_type'), LW_API_URL) # Default to LW just in case
+
+                all_comments = get_all_comments_for_post(source_api_url, post_id_source)
+                
+                first_comment_at_dt, last_activity_at_dt, comments_json = process_comment_data(all_comments)
+                
+                if all_comments:
+                    print(f"  -> Processed {len(all_comments)} comments. First at: {first_comment_at_dt}, Last at: {last_activity_at_dt}")
+                else:
+                    print("  -> No comments found for this post.")
+
                 # --- Extract Other Metadata from Raw Post ---
                 source_type = post_data_raw.get('source_type', 'Unknown')
                 score_val = safe_int_or_none(post_data_raw.get('baseScore'))
@@ -888,8 +1017,8 @@ def main():
                 
                 published_date_dt = iso_to_dt(post_data_raw.get('postedAt'))
                 source_updated_at_dt = iso_to_dt(post_data_raw.get('createdAt')) # New
-                first_comment_at_dt = iso_to_dt(post_data_raw.get('firstCommentedAt')) # New
-                last_activity_at_dt = iso_to_dt(post_data_raw.get('lastActivityAt')) # New
+                # first_comment_at_dt = iso_to_dt(post_data_raw.get('firstCommentedAt')) # No longer needed
+                # last_activity_at_dt = iso_to_dt(post_data_raw.get('lastActivityAt')) # No longer needed
 
                 content_snippet_text = None  # excerpt field doesn't exist, so set to None
 
@@ -947,8 +1076,8 @@ def main():
                     content_snippet_text, full_content_md, short_summary_text, long_summary_text, key_implication_text,
                     None, # why_valuable (NULL for now)
                     image_url_val, score_val, comment_count_val, views_val,
-                    first_comment_at_dt, last_activity_at_dt, 
-                    None, None, # score_timeseries, comment_timeseries (JSONB, NULL for now)
+                    first_comment_at_dt, last_activity_at_dt, # <-- NOW POPULATED FROM OUR NEW FUNCTIONS
+                    None, comments_json, # score_timeseries, comment_timeseries
                     source_tag_ids_list, source_tag_names_list, feed_cluster_text, feed_tags_list,
                     reading_time_minutes, word_count, external_links,
                     None, None, # novelty_score, novelty_note (NUMERIC, TEXT, NULL for now)

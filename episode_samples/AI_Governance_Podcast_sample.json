@@ -1,82 +1,78 @@
 {
-  "post_id": "3a16ddd8-be28-4f86-b33b-3c9438c37e67",
-  "title": "GPAI Code of Practice with Boniface de Champris",
-  "link": "http://sites.libsyn.com/539322/gpai-code-of-practice-with-boniface-de-champris",
-  "published_parsed": "2025-04-01T13:46:00+00:00",
-  "html_body": "<p>This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice.</p> <p>Boniface joined Enzai’s Var Shankar to discuss:</p> <ul> <li>Why the forthcoming GPAI Code of Practice is so important</li> <li>How the EU AI Office interacts with Working Groups to draft the Code</li> <li>Major changes between the second and third drafts of the Code</li> <li>Expectations for the final draft of the Code</li> <li>How work by researchers, including at the OECD and G7, informs AI laws</li> </ul>",
-  "audio_url": "https://traffic.libsyn.com/secure/5b772469-bab9-4ffc-8ed3-0fa19134520a/Boniface_de_Champris.mp3?dest-id=4645992",
-  "image_url": "https://static.libsyn.com/p/assets/1/a/6/6/1a66eadfc68e135c16c3140a3186d450/Boniface_square.png",
+  "post_id": "61a66500-dd88-45e8-8ef5-98e1021b09cb",
+  "title": "AI Governance Podcast - California's ADMT Regulations with Phil Laird",
+  "link": "https://www.enz.ai/ai-governance-podcast-california-admt-regulations-with-phil-laird",
+  "published_parsed": "2026-06-11T13:08:00+00:00",
+  "html_body": "<p dir=\"ltr\">This episode of the AI Governance Podcast features <a href=\"https://www.linkedin.com/in/philip-laird-416b403a/\">Phil Laird</a>, General Counsel of the <a href=\"https://cppa.ca.gov/\">California Privacy Protection Agency (CPPA)</a>.</p> <p> </p> <p dir=\"ltr\">Phil leads the CPPA's legal function through the agency's work on automated decision-making technology - the ADMT regulations, the Risk Assessment requirements, and the Delete Request and Opt-out Platform (DROP) build that's now well underway. The CPPA has become arguably the most consequential US-side voice on AI governance, and Phil's role sits at the centre of how California is operationalising oversight in 2026 and 2027.</p> <p> </p> <p dir=\"ltr\">Phil joined <a href=\"https://www.enz.ai/\">Enzai</a>'s Matt McCallum to discuss:</p> <ul> <li dir=\"ltr\">Meaningful human involvement and automation bias: What California's definition of human review explicitly closes the door on, and the most common implementation failure mode in early ADMT programmes - organisations believing they have addressed automation bias when they have not.</li> <li dir=\"ltr\">The 2026/2027 implementation roadmap: The Risk Assessment timeline, what's in scope and when, and how California's regime overlaps with - and where it diverges from - EU AI Act and GDPR risk assessment work that businesses may already be doing.</li> <li dir=\"ltr\">The DROP platform: Where California is in the build of its centralised Delete Request and Opt-out Platform, the architectural ambition behind it, and what operational readiness in 2026/2027 looks like for in-scope businesses.</li> <li dir=\"ltr\">Frictionless as operating doctrine: Why the CPPA's \"frictionless\" framing is not consumer rhetoric but the operating principle shaping how the agency sequences regulatory work and what it expects from business.</li> <li>Where the field is going: Phil's read on enforcement priorities, the practitioner gaps the CPPA is watching, and the next twelve months of agency agenda from inside the team.</li> </ul>",
+  "audio_url": "https://traffic.libsyn.com/secure/5b772469-bab9-4ffc-8ed3-0fa19134520a/AI_Governance_Podcast_EP18_Phil_Laird.mp3?dest-id=4645992",
+  "image_url": "https://static.libsyn.com/p/assets/0/b/4/9/0b49621878d6e00516c3140a3186d450/Podcast_Cover_4.png",
   "authors_list": [
     "Enzai"
   ],
   "tags": [],
   "source_name": "AI Governance Podcast",
   "raw_entry": {
-    "title": "GPAI Code of Practice with Boniface de Champris",
+    "title": "AI Governance Podcast - California's ADMT Regulations with Phil Laird",
     "title_detail": {
       "type": "text/plain",
       "language": null,
-      "base": "https://feeds.libsyn.com/539322/rss",
-      "value": "GPAI Code of Practice with Boniface de Champris"
+      "base": "https://rss.libsyn.com/shows/539322/destinations/4645992.xml",
+      "value": "AI Governance Podcast - California's ADMT Regulations with Phil Laird"
     },
-    "itunes_title": "GPAI Code of Practice with Boniface de Champris",
-    "published": "Tue, 01 Apr 2025 13:46:00 +0000",
+    "itunes_title": "AI Governance Podcast - California's ADMT Regulations with Phil Laird",
+    "published": "Thu, 11 Jun 2026 13:08:00 +0000",
     "published_parsed": [
-      2025,
-      4,
-      1,
+      2026,
+      6,
+      11,
       13,
-      46,
+      8,
       0,
-      1,
-      91,
+      3,
+      162,
       0
     ],
-    "id": "3a16ddd8-be28-4f86-b33b-3c9438c37e67",
+    "id": "61a66500-dd88-45e8-8ef5-98e1021b09cb",
     "guidislink": false,
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "http://sites.libsyn.com/539322/gpai-code-of-practice-with-boniface-de-champris"
+        "href": "https://www.enz.ai/ai-governance-podcast-california-admt-regulations-with-phil-laird"
       },
       {
-        "length": "81567524",
+        "length": "61095124",
         "type": "audio/mpeg",
-        "href": "https://traffic.libsyn.com/secure/5b772469-bab9-4ffc-8ed3-0fa19134520a/Boniface_de_Champris.mp3?dest-id=4645992",
+        "href": "https://traffic.libsyn.com/secure/5b772469-bab9-4ffc-8ed3-0fa19134520a/AI_Governance_Podcast_EP18_Phil_Laird.mp3?dest-id=4645992",
         "rel": "enclosure"
       }
     ],
-    "link": "http://sites.libsyn.com/539322/gpai-code-of-practice-with-boniface-de-champris",
-    "image": {
-      "href": "https://static.libsyn.com/p/assets/1/a/6/6/1a66eadfc68e135c16c3140a3186d450/Boniface_square.png"
-    },
-    "summary": "<p>This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice.</p> <p>Boniface joined Enzai’s Var Shankar to discuss:</p> <ul> <li>Why the forthcoming GPAI Code of Practice is so important</li> <li>How the EU AI Office interacts with Working Groups to draft the Code</li> <li>Major changes between the second and third drafts of the Code</li> <li>Expectations for the final draft of the Code</li> <li>How work by researchers, including at the OECD and G7, informs AI laws</li> </ul>",
+    "link": "https://www.enz.ai/ai-governance-podcast-california-admt-regulations-with-phil-laird",
+    "summary": "<p dir=\"ltr\">This episode of the AI Governance Podcast features <a href=\"https://www.linkedin.com/in/philip-laird-416b403a/\">Phil Laird</a>, General Counsel of the <a href=\"https://cppa.ca.gov/\">California Privacy Protection Agency (CPPA)</a>.</p> <p><strong> </strong></p> <p dir=\"ltr\">Phil leads the CPPA's legal function through the agency's work on automated decision-making technology - the ADMT regulations, the Risk Assessment requirements, and the Delete Request and Opt-out Platform (DROP) build that's now well underway. The CPPA has become arguably the most consequential US-side voice on AI governance, and Phil's role sits at the centre of how California is operationalising oversight in 2026 and 2027.</p> <p><strong> </strong></p> <p dir=\"ltr\">Phil joined <a href=\"https://www.enz.ai/\">Enzai</a>'s Matt McCallum to discuss:</p> <ul> <li dir=\"ltr\"><strong>Meaningful human involvement and automation bias:</strong> What California's definition of human review explicitly closes the door on, and the most common implementation failure mode in early ADMT programmes - organisations believing they have addressed automation bias when they have not.</li> <li dir=\"ltr\"><strong>The 2026/2027 implementation roadmap:</strong> The Risk Assessment timeline, what's in scope and when, and how California's regime overlaps with - and where it diverges from - EU AI Act and GDPR risk assessment work that businesses may already be doing.</li> <li dir=\"ltr\"><strong>The DROP platform:</strong> Where California is in the build of its centralised Delete Request and Opt-out Platform, the architectural ambition behind it, and what operational readiness in 2026/2027 looks like for in-scope businesses.</li> <li dir=\"ltr\"><strong>Frictionless as operating doctrine:</strong> Why the CPPA's \"frictionless\" framing is not consumer rhetoric but the operating principle shaping how the agency sequences regulatory work and what it expects from business.</li> <li><strong id=\"docs-internal-guid-d04f4a85-7fff-52c5-0cda-2e062afba43a\">Where the field is going: </strong>Phil's read on enforcement priorities, the practitioner gaps the CPPA is watching, and the next twelve months of agency agenda from inside the team.</li> </ul>",
     "summary_detail": {
       "type": "text/html",
       "language": null,
-      "base": "https://feeds.libsyn.com/539322/rss",
-      "value": "<p>This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice.</p> <p>Boniface joined Enzai’s Var Shankar to discuss:</p> <ul> <li>Why the forthcoming GPAI Code of Practice is so important</li> <li>How the EU AI Office interacts with Working Groups to draft the Code</li> <li>Major changes between the second and third drafts of the Code</li> <li>Expectations for the final draft of the Code</li> <li>How work by researchers, including at the OECD and G7, informs AI laws</li> </ul>"
+      "base": "https://rss.libsyn.com/shows/539322/destinations/4645992.xml",
+      "value": "<p dir=\"ltr\">This episode of the AI Governance Podcast features <a href=\"https://www.linkedin.com/in/philip-laird-416b403a/\">Phil Laird</a>, General Counsel of the <a href=\"https://cppa.ca.gov/\">California Privacy Protection Agency (CPPA)</a>.</p> <p><strong> </strong></p> <p dir=\"ltr\">Phil leads the CPPA's legal function through the agency's work on automated decision-making technology - the ADMT regulations, the Risk Assessment requirements, and the Delete Request and Opt-out Platform (DROP) build that's now well underway. The CPPA has become arguably the most consequential US-side voice on AI governance, and Phil's role sits at the centre of how California is operationalising oversight in 2026 and 2027.</p> <p><strong> </strong></p> <p dir=\"ltr\">Phil joined <a href=\"https://www.enz.ai/\">Enzai</a>'s Matt McCallum to discuss:</p> <ul> <li dir=\"ltr\"><strong>Meaningful human involvement and automation bias:</strong> What California's definition of human review explicitly closes the door on, and the most common implementation failure mode in early ADMT programmes - organisations believing they have addressed automation bias when they have not.</li> <li dir=\"ltr\"><strong>The 2026/2027 implementation roadmap:</strong> The Risk Assessment timeline, what's in scope and when, and how California's regime overlaps with - and where it diverges from - EU AI Act and GDPR risk assessment work that businesses may already be doing.</li> <li dir=\"ltr\"><strong>The DROP platform:</strong> Where California is in the build of its centralised Delete Request and Opt-out Platform, the architectural ambition behind it, and what operational readiness in 2026/2027 looks like for in-scope businesses.</li> <li dir=\"ltr\"><strong>Frictionless as operating doctrine:</strong> Why the CPPA's \"frictionless\" framing is not consumer rhetoric but the operating principle shaping how the agency sequences regulatory work and what it expects from business.</li> <li><strong id=\"docs-internal-guid-d04f4a85-7fff-52c5-0cda-2e062afba43a\">Where the field is going: </strong>Phil's read on enforcement priorities, the practitioner gaps the CPPA is watching, and the next twelve months of agency agenda from inside the team.</li> </ul>"
     },
     "content": [
       {
         "type": "text/html",
         "language": null,
-        "base": "https://feeds.libsyn.com/539322/rss",
-        "value": "<p>This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice.</p> <p>Boniface joined Enzai’s Var Shankar to discuss:</p> <ul> <li>Why the forthcoming GPAI Code of Practice is so important</li> <li>How the EU AI Office interacts with Working Groups to draft the Code</li> <li>Major changes between the second and third drafts of the Code</li> <li>Expectations for the final draft of the Code</li> <li>How work by researchers, including at the OECD and G7, informs AI laws</li> </ul>"
+        "base": "https://rss.libsyn.com/shows/539322/destinations/4645992.xml",
+        "value": "<p dir=\"ltr\">This episode of the AI Governance Podcast features <a href=\"https://www.linkedin.com/in/philip-laird-416b403a/\">Phil Laird</a>, General Counsel of the <a href=\"https://cppa.ca.gov/\">California Privacy Protection Agency (CPPA)</a>.</p> <p> </p> <p dir=\"ltr\">Phil leads the CPPA's legal function through the agency's work on automated decision-making technology - the ADMT regulations, the Risk Assessment requirements, and the Delete Request and Opt-out Platform (DROP) build that's now well underway. The CPPA has become arguably the most consequential US-side voice on AI governance, and Phil's role sits at the centre of how California is operationalising oversight in 2026 and 2027.</p> <p> </p> <p dir=\"ltr\">Phil joined <a href=\"https://www.enz.ai/\">Enzai</a>'s Matt McCallum to discuss:</p> <ul> <li dir=\"ltr\">Meaningful human involvement and automation bias: What California's definition of human review explicitly closes the door on, and the most common implementation failure mode in early ADMT programmes - organisations believing they have addressed automation bias when they have not.</li> <li dir=\"ltr\">The 2026/2027 implementation roadmap: The Risk Assessment timeline, what's in scope and when, and how California's regime overlaps with - and where it diverges from - EU AI Act and GDPR risk assessment work that businesses may already be doing.</li> <li dir=\"ltr\">The DROP platform: Where California is in the build of its centralised Delete Request and Opt-out Platform, the architectural ambition behind it, and what operational readiness in 2026/2027 looks like for in-scope businesses.</li> <li dir=\"ltr\">Frictionless as operating doctrine: Why the CPPA's \"frictionless\" framing is not consumer rhetoric but the operating principle shaping how the agency sequences regulatory work and what it expects from business.</li> <li>Where the field is going: Phil's read on enforcement priorities, the practitioner gaps the CPPA is watching, and the next twelve months of agency agenda from inside the team.</li> </ul>"
       }
     ],
-    "itunes_duration": "33:58",
+    "itunes_duration": "46:18",
     "itunes_explicit": null,
-    "subtitle": "This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice. Boniface joined Enzai’s Var Shankar to...",
-    "subtitle_detail": {
-      "type": "text/plain",
-      "language": null,
-      "base": "https://feeds.libsyn.com/539322/rss",
-      "value": "This episode of the AI Governance Podcast features Boniface de Champris. Boniface is an expert on the EU AI Act, Senior Manager at CCIA Europe and a keen watcher of the debate around the GPAI Code of Practice. Boniface joined Enzai’s Var Shankar to..."
-    },
     "itunes_season": "1",
-    "itunes_episode": "13",
+    "itunes_episode": "18",
+    "image": {
+      "href": "https://static.libsyn.com/p/assets/0/b/4/9/0b49621878d6e00516c3140a3186d450/Podcast_Cover_4.png"
+    },
+    "libsyn_widescreen-image": {
+      "href": "https://static.libsyn.com/p/assets/7/e/0/e/7e0e529e8fb0a734d959afa2a1bf1c87/Widescreen_Podcast_Cover_5.png"
+    },
     "itunes_episodetype": "full",
     "authors": [
       {
@@ -86,6 +82,8 @@
     "author": "Enzai",
     "author_detail": {
       "name": "Enzai"
-    }
+    },
+    "libsyn_item-id": "41583685",
+    "libsyn_last-updated": "2026-06-11T13:08:43Z"
   }
 }

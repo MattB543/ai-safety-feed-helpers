@@ -1,35 +1,78 @@
 #!/usr/bin/env python3
 """
-backfill_novelty_openai.py
+novelty_analysis.py
 ──────────────────────────
 Compute a "uniqueness / novelty" score plus a short
 'what-this-adds' note for the newest posts that still lack them,
-using **OpenAI GPT‑4o** instead of Google Gemini.
+using **Azure OpenAI**.
 """
 
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, psycopg2
 from psycopg2 import extras
-from openai import OpenAI  # OpenAI Python v1.x client
-from datetime import datetime
+from openai import AzureOpenAI
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv(override=True)
 
 # ───── Runtime settings ───────────────────────────────────────
-DB_URL              = os.getenv("AI_SAFETY_FEED_DB_URL")
-OPENAI_API_KEY      = os.getenv("OPEN_AI_FREE_CREDITS_KEY")
-MODEL               = "gpt-4.1"   # pick the tier that matches your quota
-BATCH               = 7              # rows to back‑fill each run
-K_NEIGHBOURS        = 20              # vector recall set size
+DB_URL = os.getenv("AI_SAFETY_FEED_DB_URL")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
+MODEL = AZURE_OPENAI_DEPLOYMENT
+BATCH = 21
+K_NEIGHBOURS = 20
+MAX_SUMMARY_CHARS = int(os.getenv("NOVELTY_MAX_SUMMARY_CHARS", "1200"))
+MAX_REF_CONTENT_CHARS = int(os.getenv("NOVELTY_MAX_REF_CONTENT_CHARS", "12000"))
+MAX_OVERLAP_CONTENT_CHARS = int(os.getenv("NOVELTY_MAX_OVERLAP_CONTENT_CHARS", "3000"))
+MAX_OVERLAPS_FOR_NOVELTY_PROMPT = int(os.getenv("NOVELTY_MAX_OVERLAPS_FOR_PROMPT", "8"))
 
-if not (DB_URL and OPENAI_API_KEY):
-    sys.exit("Set AI_SAFETY_FEED_DB_URL and OPEN_AI_FREE_CREDITS_KEY")
+if not DB_URL:
+    sys.exit("Set AI_SAFETY_FEED_DB_URL")
+if not AZURE_OPENAI_API_KEY:
+    sys.exit("Set AZURE_OPENAI_API_KEY (or AZURE_API_KEY)")
+if not AZURE_OPENAI_ENDPOINT:
+    sys.exit("Set AZURE_OPENAI_ENDPOINT")
+if not AZURE_OPENAI_DEPLOYMENT:
+    sys.exit("Set AZURE_OPENAI_DEPLOYMENT (e.g. gpt-5.6-terra)")
 
 logging.basicConfig(
-    level  = logging.INFO,
-    format = "%(asctime)s  %(levelname)-8s  %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s"
 )
 
-# ───── OpenAI client ─────────────────────────────────────────
-client = OpenAI(api_key=OPENAI_API_KEY)
+# ───── Azure OpenAI client ────────────────────────────────────
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
+    timeout=180,
+)
+
+
+def extract_response_text(response) -> str:
+    """Normalize Azure chat response content into plain text."""
+    try:
+        if not response or not response.choices:
+            return ""
+        content = response.choices[0].message.content
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    parts.append(part.get("text", "") or "")
+                else:
+                    parts.append(getattr(part, "text", "") or "")
+            return "".join(parts).strip()
+    except Exception:
+        return ""
+    return ""
 
 
 def openai_json(prompt: str,
@@ -37,35 +80,38 @@ def openai_json(prompt: str,
                 model: str | None = None,
                 temperature: float = 0.15,
                 max_tokens: int = 2048):
-    """Return parsed JSON (or None) using GPT‑4o in strict‑JSON mode."""
+    """Return parsed JSON (or None) from Azure OpenAI in strict-JSON mode."""
     sys_prompt = (
         "You are a service that MUST return **only** valid minified JSON. "
         "Do not wrap the JSON in markdown or add any commentary."
     )
+    raw_text = ""
     try:
         target_model = model or MODEL
         logging.info("Using model: %s", target_model)
 
-        rsp = client.chat.completions.create(
-            model           = target_model,
-            messages        = [
+        request_kwargs = {
+            "model": target_model,
+            "messages": [
                 {"role": "system", "content": sys_prompt},
-                {"role": "user",   "content": prompt}
+                {"role": "user", "content": prompt}
             ],
-            temperature     = temperature,
-            max_tokens      = max_tokens,
-            response_format = {"type": "json_object"}
-        )
-        raw_text = rsp.choices[0].message.content
-        logging.info("Raw GPT response text: %s", raw_text)
+            "max_completion_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        # gpt-5 deployments do not support temperature.
+        if temperature is not None and not str(target_model).lower().startswith("gpt-5"):
+            request_kwargs["temperature"] = temperature
 
+        rsp = client.chat.completions.create(**request_kwargs)
+        raw_text = extract_response_text(rsp)
         return json.loads(raw_text)
 
     except json.JSONDecodeError as json_err:
-        logging.warning(f"OpenAI JSON failure – Parsing error: {json_err}. Text was: {raw_text[:200]}…")
+        logging.warning("Azure JSON failure - Parsing error: %s. Text was: %s", json_err, raw_text[:200])
         return None
     except Exception as e:
-        logging.warning("OpenAI JSON failure – %s", e)
+        logging.warning("Azure JSON failure - %s", e)
         return None
 
 # ───── Prompt templates (unchanged from original) ────────────
@@ -82,8 +128,14 @@ CANDIDATE POSTS - MAIN POINTS
 ---
 
 TASK
-Return a JSON array of candidate IDs that cover **similar ideas**
-as the reference (≥15%+ content overlap).  Only output the JSON array.
+Return a JSON object with an array of candidate IDs that cover **similar ideas**
+as the reference (≥15%+ content overlap).
+
+Output format (minified JSON only – no commentary):
+{{"ids":[<integer candidate ids>]}}
+
+If there are no overlapping candidates, return:
+{{"ids":[]}}
 """
 
 NOVELTY_PROMPT = """
@@ -172,18 +224,30 @@ NOTE: Our database found no overlapping content with this piece.
 
 # ───── Small helpers ──────────────────────────────────────────
 def build_overlap_prompt(ref, cands):
-    ref_pts = ref["paragraph_summary"] or ref["sentence_summary"] or ""
-    blocks  = [f"- id:{c['id']}\n  {c['paragraph_summary'] or c['sentence_summary'] or ''}"
-               for c in cands]
+    ref_pts = (ref["paragraph_summary"] or ref["sentence_summary"] or "")[:MAX_SUMMARY_CHARS]
+    blocks = []
+    for c in cands:
+        cand_text = (c["paragraph_summary"] or c["sentence_summary"] or "")[:MAX_SUMMARY_CHARS]
+        blocks.append(f"- id:{c['id']}\n  {cand_text}")
     return OVERLAP_PROMPT.format(ref_pts=ref_pts,
                                  cand_blocks="\n".join(blocks))
 
-def build_novelty_prompt(ref, overlaps):
+def build_novelty_prompt(
+    ref,
+    overlaps,
+    *,
+    max_overlaps: int = MAX_OVERLAPS_FOR_NOVELTY_PROMPT,
+    max_ref_chars: int = MAX_REF_CONTENT_CHARS,
+    max_overlap_chars: int = MAX_OVERLAP_CONTENT_CHARS,
+):
     ref_content = (ref["full_content_markdown"] or
                    ref["paragraph_summary"]      or
-                   ref["sentence_summary"]       or "")
-    blocks  = [f"- id:{o['id']}\n  {o['full_content_markdown'] or o['paragraph_summary'] or o['sentence_summary'] or ''}"
-               for o in overlaps]
+                   ref["sentence_summary"]       or "")[:max_ref_chars]
+    selected_overlaps = overlaps[:max_overlaps]
+    blocks = []
+    for o in selected_overlaps:
+        overlap_text = (o["full_content_markdown"] or o["paragraph_summary"] or o["sentence_summary"] or "")[:max_overlap_chars]
+        blocks.append(f"- id:{o['id']}\n  {overlap_text}")
     return NOVELTY_PROMPT.format(ref_id       = ref["id"],
                                  ref_title    = ref["title"],
                                  ref_content  = ref_content,
@@ -203,7 +267,7 @@ def main():
         logging.info("Fetching refs needing novelty scores…")
         cur.execute("""
             SELECT id, title, sentence_summary, paragraph_summary,
-                   embedding_full, full_content_markdown
+                   embedding_full, full_content_markdown, published_date
             FROM   content
             WHERE  novelty_score IS NULL
                    AND embedding_full IS NOT NULL
@@ -224,14 +288,28 @@ def main():
                 logging.info("[%s] analysing…", rid)
 
                 # 2️⃣  nearest neighbours
-                cur.execute("""
-                    SELECT id, title, sentence_summary, paragraph_summary,
-                           full_content_markdown
-                    FROM   content
-                    WHERE  id <> %s
-                    ORDER  BY embedding_full <=> %s
-                    LIMIT  %s
-                """, (rid, ref["embedding_full"], K_NEIGHBOURS))
+                # Only compare against work published BEFORE the reference post;
+                # otherwise back-filled rows get penalised for later articles.
+                if ref.get("published_date"):
+                    cur.execute("""
+                        SELECT id, title, sentence_summary, paragraph_summary,
+                               full_content_markdown
+                        FROM   content
+                        WHERE  id <> %s
+                               AND embedding_full IS NOT NULL
+                               AND published_date < %s
+                        ORDER  BY embedding_full <=> %s
+                        LIMIT  %s
+                    """, (rid, ref["published_date"], ref["embedding_full"], K_NEIGHBOURS))
+                else:
+                    cur.execute("""
+                        SELECT id, title, sentence_summary, paragraph_summary,
+                               full_content_markdown
+                        FROM   content
+                        WHERE  id <> %s AND embedding_full IS NOT NULL
+                        ORDER  BY embedding_full <=> %s
+                        LIMIT  %s
+                    """, (rid, ref["embedding_full"], K_NEIGHBOURS))
                 cands = cur.fetchall()
 
                 neighbour_ids = [c['id'] for c in cands]
@@ -241,26 +319,30 @@ def main():
                 overlap_ids = openai_json(build_overlap_prompt(ref, cands),
                                            temperature=0.0)
                 
-                overlap_int_ids = set()
-                
-                # Handle both {"ids": [...]} and plain [...] formats
-                ids_to_process = None
-                if isinstance(overlap_ids, dict) and "ids" in overlap_ids:
-                    ids_to_process = overlap_ids["ids"]
-                elif isinstance(overlap_ids, dict) and "result" in overlap_ids:
-                    ids_to_process = overlap_ids["result"]
-                elif isinstance(overlap_ids, list):
-                    ids_to_process = overlap_ids
+                # Validate the overlap response strictly: anything malformed leaves the row
+                # for a later run instead of falling through to the "no overlaps" prompt.
+                if overlap_ids is None or (isinstance(overlap_ids, dict) and "error" in overlap_ids):
+                    logging.warning("   → Overlap call failed or reported an error for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    continue
+                if isinstance(overlap_ids, dict):
+                    ids_raw = overlap_ids.get("ids", overlap_ids.get("result"))
                 else:
-                    logging.warning("   → Unexpected overlap response format: %s", overlap_ids)
-                    ids_to_process = []
-                
-                if isinstance(ids_to_process, list):
-                    for item_id in ids_to_process:
-                        try:
-                            overlap_int_ids.add(int(item_id))
-                        except (ValueError, TypeError):
-                            logging.warning("   → Could not convert overlap ID '%s' to int. Skipping.", item_id)
+                    ids_raw = overlap_ids
+                if not isinstance(ids_raw, list):
+                    logging.warning("   → Unexpected overlap response format for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    continue
+                candidate_ids = {c["id"] for c in cands}
+                overlap_int_ids = set()
+                for item_id in ids_raw:
+                    try:
+                        value = int(item_id)
+                    except (ValueError, TypeError):
+                        continue
+                    if value in candidate_ids:
+                        overlap_int_ids.add(value)
+                if ids_raw and not overlap_int_ids:
+                    logging.warning("   → Overlap response for [%s] contained no valid candidate IDs: %s. Leaving row for a later run.", rid, ids_raw)
+                    continue
 
                 overlaps = [c for c in cands if c["id"] in overlap_int_ids]
                 logging.info("   → %d overlaps found", len(overlaps))
@@ -270,7 +352,7 @@ def main():
                     logging.info("   → No overlaps found, using specialized prompt")
                     ref_content = (ref["full_content_markdown"] or
                                    ref["paragraph_summary"]      or
-                                   ref["sentence_summary"]       or "")
+                                   ref["sentence_summary"]       or "")[:MAX_REF_CONTENT_CHARS]
                     nov_prompt = NOVELTY_NO_OVERLAPS_PROMPT.format(
                         ref_id     = rid,
                         ref_title  = ref["title"],
@@ -282,6 +364,18 @@ def main():
                     nov_prompt = build_novelty_prompt(ref, overlaps)
                     nov = openai_json(nov_prompt,
                                       temperature=0.1)
+
+                    # Retry once with a tighter prompt if context is still too large.
+                    if nov is None:
+                        logging.info("   → Retrying novelty call with tighter context window")
+                        nov_prompt_retry = build_novelty_prompt(
+                            ref,
+                            overlaps,
+                            max_overlaps=3,
+                            max_ref_chars=6000,
+                            max_overlap_chars=1500,
+                        )
+                        nov = openai_json(nov_prompt_retry, temperature=0.1)
 
                 logging.info("   → Raw LLM JSON output: %s", nov)
 
@@ -296,8 +390,14 @@ def main():
                 else:
                     nov_data = None
 
-                score = int(nov_data.get("uniqueness_score", 0)) if nov_data else 0
-                note  = nov_data.get("what_is_new", "LLM analysis failed.") if nov_data else "LLM analysis failed."
+                raw_score = nov_data.get("uniqueness_score") if nov_data else None
+                note = nov_data.get("what_is_new") if nov_data else None
+                if (isinstance(raw_score, bool) or not isinstance(raw_score, (int, float))
+                        or not isinstance(note, str) or not note.strip()):
+                    logging.warning("   → Novelty response malformed for [%s]: %s. Leaving row for a later run.", rid, nov)
+                    continue
+                score = max(0, min(100, int(round(raw_score))))
+                note = note.strip()
 
                 logging.info("   → score=%3d", score)
 

@@ -1,63 +1,49 @@
 {
-  "post_id": "https://futureoflife.org/?post_type=podcast&p=134827",
-  "title": "Facing Superintelligence (with Ben Goertzel)",
-  "link": "https://futureoflife.org/podcast/facing-superintelligence-with-ben-goertzel/",
-  "published_parsed": "2025-05-23T10:51:41+00:00",
+  "post_id": "https://futureoflife.org/podcast/first-24-hours-of-a-bioweapon-attack-annie-jacobsen-2/",
+  "title": "First 24 Hours of a Bioweapon Attack – Annie Jacobsen",
+  "link": "https://futureoflife.org/podcast/first-24-hours-of-a-bioweapon-attack-annie-jacobsen-2/",
+  "published_parsed": "2026-08-21T15:03:49+00:00",
   "html_body": "",
   "audio_url": null,
   "image_url": null,
   "authors_list": [
-    "Support"
+    "FLI Podcast"
   ],
-  "tags": [
-    "AI"
-  ],
+  "tags": [],
   "source_name": "FLI Podcast",
   "raw_entry": {
-    "title": "Facing Superintelligence (with Ben Goertzel)",
+    "title": "First 24 Hours of a Bioweapon Attack – Annie Jacobsen",
     "title_detail": {
       "type": "text/plain",
       "language": null,
       "base": "https://futureoflife.org/podcast/feed/",
-      "value": "Facing Superintelligence (with Ben Goertzel)"
+      "value": "First 24 Hours of a Bioweapon Attack – Annie Jacobsen"
     },
     "links": [
       {
         "rel": "alternate",
         "type": "text/html",
-        "href": "https://futureoflife.org/podcast/facing-superintelligence-with-ben-goertzel/"
+        "href": "https://futureoflife.org/podcast/first-24-hours-of-a-bioweapon-attack-annie-jacobsen-2/"
       }
     ],
-    "link": "https://futureoflife.org/podcast/facing-superintelligence-with-ben-goertzel/",
+    "link": "https://futureoflife.org/podcast/first-24-hours-of-a-bioweapon-attack-annie-jacobsen-2/",
     "authors": [
-      {
-        "name": "Support"
-      }
+      {}
     ],
-    "author": "Support",
-    "author_detail": {
-      "name": "Support"
-    },
-    "published": "Fri, 23 May 2025 10:51:41 +0000",
+    "author": "",
+    "published": "Fri, 21 Aug 2026 15:03:49 +0000",
     "published_parsed": [
-      2025,
-      5,
-      23,
-      10,
-      51,
-      41,
+      2026,
+      8,
+      21,
+      15,
+      3,
+      49,
       4,
-      143,
+      233,
       0
     ],
-    "tags": [
-      {
-        "term": "AI",
-        "scheme": null,
-        "label": null
-      }
-    ],
-    "id": "https://futureoflife.org/?post_type=podcast&p=134827",
+    "id": "https://futureoflife.org/podcast/first-24-hours-of-a-bioweapon-attack-annie-jacobsen-2/",
     "guidislink": false,
     "summary": "",
     "summary_detail": {

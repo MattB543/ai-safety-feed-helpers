@@ -8,6 +8,11 @@ import psycopg2
 from collections import Counter
 from ast import literal_eval
 import warnings
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv(override=True)
+
 warnings.filterwarnings('ignore')
 
 # Core ML libraries
@@ -544,7 +549,7 @@ class EmbeddingAnalyzer:
         return fig
     
     def label_clusters_with_gpt4(self,
-                                model: str = "gpt-4.1-mini",
+                                model: str = "gpt-5-mini",
                                 max_titles_per_cluster: int = 5,
                                 custom_prompt: Optional[str] = None) -> Dict[int, str]:
         """
@@ -615,7 +620,7 @@ Respond with only the label, nothing else."""
         return cluster_names
     
     def setup_bertopic_with_openai(self,
-                                  model: str = "gpt-4.1-mini",
+                                  model: str = "gpt-5-mini",
                                   embedding_model_name: str = "text-embedding-3-small",
                                   embedding_dims: int = 1536,
                                   use_multiple_representations: bool = True) -> BERTopic:
@@ -823,7 +828,7 @@ def main():
         # 7. Optional: Run BERTopic analysis
         print("\n7. Setting up BERTopic analysis...")
         analyzer.setup_bertopic_with_openai(
-            model="gpt-4.1-mini",  
+            model="gpt-5-mini",  
             embedding_model_name="text-embedding-3-small",
             embedding_dims=1536
         )

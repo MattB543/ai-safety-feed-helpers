@@ -138,3 +138,27 @@ twitter.cookies
 
 data/*
 
+
+# Twitter account credentials and twscrape's account store
+accounts.txt
+accounts.db
+
+# Generated image runs and their cost reports
+generated_images_*/
+image_cost_*.csv
+
+# Scratch analysis output
+conversation_samples/
+aborted_runs/
+domain_counts_*.csv
+follow_users_id_cache.json
+
+# Local scrape databases and captured traffic (contain session data)
+twitter.db
+twitter.har
+
+# One-off exports and test output
+test_*.txt
+tweets_export.md
+url_counts_*.csv
+*_leaderboard_*_x_links.txt

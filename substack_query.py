@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
+import os # Add os import for API key and DB URL
+import sys # Add sys import for exiting on critical errors
+import argparse # Add argparse for command-line arguments
+
+# Fix Windows console encoding issues with Unicode characters - must be done early
+if sys.platform == "win32":
+    # Set UTF-8 encoding for the environment
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    # Reconfigure stdout/stderr with UTF-8
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 import requests
 import json
 from datetime import datetime, timedelta, timezone, date
 import re
 from markdownify import markdownify # Add markdownify import
-import os # Add os import for API key and DB URL
-import sys # Add sys import for exiting on critical errors
-from google import genai as genai # Use alias to avoid potential conflicts
-from google.genai import types
 import psycopg2 # Add psycopg2 import
 from psycopg2 import extras # Import extras for batch insertion
 from dotenv import load_dotenv # Add dotenv import
@@ -17,12 +26,36 @@ from urllib.parse import urlparse # Add urlparse import
 from bs4 import BeautifulSoup # Add BeautifulSoup import
 import time # Add time import
 import logging # Add logging import
-from openai import OpenAI
-from openai import APIError, RateLimitError # Optional: for more specific error handling
 from collections import deque # Add deque import
 
 # --- Environment Variables ---
-load_dotenv() # Load .env file BEFORE accessing env vars
+load_dotenv(override=True) # Load .env file and override system env vars
+
+# Shared Azure/OpenAI helpers: one structured analysis call per post, relevance gate, embeddings.
+from llm_common import (
+    LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
+    generate_embeddings, is_ai_safety_content, check_llm_or_exit,
+)
+
+LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
+
+def disable_unreachable_local_proxies() -> None:
+    """
+    Disable loopback proxy env vars that can break feed/API requests.
+    Keeps non-local proxy settings untouched.
+    """
+    proxy_keys = (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    )
+    removed = []
+    for key in proxy_keys:
+        value = os.environ.get(key)
+        if value and LOCAL_PROXY_RE.match(value.strip()):
+            os.environ.pop(key, None)
+            removed.append(f"{key}={value}")
+    if removed:
+        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
 
 # --- Top Level Buffer ---
 SKIPPED_BUFFER = deque()   # (post_id, title_norm, url)
@@ -32,6 +65,12 @@ def normalise_title(t: str) -> str:
     """Normalize title: lowercase, replace multiple spaces with single, strip leading/trailing."""
     if not isinstance(t, str): return "" # Handle non-string input
     return re.sub(r'\s+', ' ', t).strip().lower()
+
+def clean_title_for_storage(title: str | None) -> str | None:
+    """Create a stable display-safe title variant for the cleaned_title column."""
+    if not title:
+        return None
+    return re.sub(r'\s+', ' ', title).strip()
 
 def buffer_skip(post_id, title, url):
     """Add a post to the skip buffer, avoiding duplicates."""
@@ -44,35 +83,55 @@ def buffer_skip(post_id, title, url):
              url)
         )
 
+def flush_skip_buffer(db_url: str) -> list:
+    """
+    Insert buffered gate/cutoff/paywall skips in their OWN transaction, so they
+    persist even when this run accepts no posts. Returns the rows written.
+    """
+    if not SKIPPED_BUFFER:
+        return []
+    rows = list(SKIPPED_BUFFER)
+    conn = psycopg2.connect(db_url)
+    try:
+        with conn.cursor() as cur:
+            extras.execute_values(
+                cur,
+                "INSERT INTO skipped_posts (post_id, title_norm, source_url) VALUES %s ON CONFLICT DO NOTHING",
+                rows,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    SKIPPED_BUFFER.clear()
+    logging.info("Recorded %d cutoff/guard-rail/paywall skips.", len(rows))
+    return rows
+
 # Setup logging early, before any potential logging calls
-# Use INFO level by default, adjust if needed
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Use WARNING level by default to reduce verbosity, but keep errors visible
+# Allow DEBUG mode via environment variable for troubleshooting
+DEBUG_MODE = os.getenv("DEBUG", "False").lower() == "true"
+# LOG_LEVEL=INFO shows per-post progress; DEBUG=true is more verbose still.
+log_level = logging.DEBUG if DEBUG_MODE else getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
+logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
+
+if DEBUG_MODE:
+    print("[DEBUG] DEBUG mode enabled - verbose logging active")
 
 # Suppress overly verbose logs from underlying libraries if desired
-logging.getLogger("google.generativeai").setLevel(logging.WARNING)
-logging.getLogger("urllib3").setLevel(logging.WARNING) # Added for requests/urllib3 noise
-logging.getLogger("httpcore").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("openai").setLevel(logging.WARNING) # Suppress OpenAI logs if needed
+logging.getLogger("urllib3").setLevel(logging.ERROR) # Added for requests/urllib3 noise
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("openai").setLevel(logging.ERROR) # Suppress OpenAI logs if needed
+disable_unreachable_local_proxies()
 
 # --- Essential Environment Variables ---
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-DATABASE_URL   = os.environ.get("AI_SAFETY_FEED_DB_URL")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") # <<< ADD THIS
+DATABASE_URL = os.environ.get("AI_SAFETY_FEED_DB_URL")
 
 # --- Initial Checks ---
-# Use logging instead of print for critical errors before exiting
-if not GEMINI_API_KEY:
-    logging.critical("CRITICAL ERROR: GEMINI_API_KEY environment variable not set. Cannot perform analysis.")
-    sys.exit(1) # Exit if API key is missing
-
 if not DATABASE_URL:
     logging.critical("CRITICAL ERROR: AI_SAFETY_FEED_DB_URL environment variable not set. Cannot connect to database.")
     sys.exit(1) # Exit if DB URL is missing
-
-if not OPENAI_API_KEY: # <<< ADD THIS CHECK
-    logging.critical("CRITICAL ERROR: OPENAI_API_KEY environment variable not set. Cannot generate embeddings.")
-    sys.exit(1) # Exit if OpenAI key is missing
+check_llm_or_exit(embeddings=True)  # env check + one preflight call; aborts on a bad deployment/key
 
 # --- Constants ---
 BATCH_SIZE = 1 # Size for batch database inserts
@@ -118,23 +177,8 @@ SUBSTACK_SOURCE_NAMES = {
     "helentoner.substack.com"          : "Rising Tide",
 }
 
-# --- Initialize API Clients --- # <<< ADD THIS SECTION
-logging.info("Initializing API clients...")
-gemini_client = None # Initialize to None
-openai_client = None # Initialize to None
-try:
-    # Gemini Client
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    logging.info("Gemini client initialized.")
-
-    # OpenAI Client
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    logging.info("OpenAI client initialized.")
-except Exception as e:
-    logging.critical(f"CRITICAL ERROR: Failed to initialize API clients: {e}", exc_info=True)
-    # Decide if you want to exit if API clients fail, or continue without analysis
-    # sys.exit(1) # Uncomment to exit if API clients fail
-logging.info("API clients initialized successfully.")
+# API clients (Azure chat + OpenAI embeddings) are created lazily by llm_common.
+print("[OK] LLM configuration loaded (see llm_common.py)")
 
 # --- Database Columns and Pre-computed INSERT statement ---
 # ================================================================
@@ -148,7 +192,8 @@ DB_COLS = (
     "topics", "score", "image_url", "sentence_summary", "paragraph_summary",
     "key_implication", "full_content", "full_content_markdown",
     "comment_count", "cluster_tag",
-    "embedding_short", "embedding_full" # <<< ADD THESE TWO
+    "embedding_short", "embedding_full",
+    "cleaned_title",
 )
 # Calculate the number of columns dynamically
 NUM_DB_COLS = len(DB_COLS)
@@ -164,7 +209,7 @@ ON CONFLICT (title_norm) DO NOTHING;
 SKIP_INSERT_SQL = """
 INSERT INTO skipped_posts (post_id, title_norm, source_url)
 VALUES (%s, %s, %s)
-ON CONFLICT (title_norm) DO NOTHING;
+ON CONFLICT DO NOTHING;
 """
 
 def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
@@ -177,382 +222,31 @@ def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
                  str(title_norm),
                  source_url))
 
-# --- Helper function for Gemini API calls ---
-def call_gemini_api(prompt, model_name="gemini-2.5-pro-preview-03-25"):
-    """Calls the Gemini API with the given prompt and model using the global client."""
-    if not GEMINI_API_KEY:
-        logging.warning("Gemini API call skipped: GEMINI_API_KEY not set.")
-        return "Analysis skipped (missing API key)."
-    
-    if not gemini_client:
-        logging.warning("Gemini API call skipped: Gemini client not initialized.")
-        return "Analysis skipped (client not initialized)."
+# --- Relevance gate (shared implementation in llm_common) ---
+GATE_SNIPPET_BYTES = 8000
 
-    try:
-        response = gemini_client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2),
-        )
-        # Extract text (same logic as original summarize_text/user provided example)
-        if hasattr(response, 'text'):
-            result = response.text.strip()
-        elif hasattr(response, 'parts') and response.parts:
-            result = "".join(part.text for part in response.parts).strip()
-        else:
-            logging.warning(f"Warning: Unexpected Gemini API response structure: {response}")
-            result = "Error: Could not extract text from API response."
+# Recurring non-article formats (open threads, link roundups, forecasting digests,
+# comment highlights). They mention AI often enough to fool the LLM gate on a short
+# snippet, so reject them by title before spending a model call.
+NON_ARTICLE_TITLE_RE = re.compile(
+    r"^\s*(open (hidden )?(open )?thread|mantic monday|links for \w+|model city monday|"
+    r"highlights from the comments|meetups everywhere|classifieds thread|berkeley meetup)",
+    re.IGNORECASE,
+)
 
-        # Basic check for empty or problematic results
-        if not result or result.startswith("Error:"):
-             logging.warning(f"Gemini API potentially problematic result: '{result[:100]}...'") # Log problematic result concisely
-             # Fallback or return the potentially problematic result
-
-        return result
-
-    except types.generation_types.BlockedPromptException as e: # More specific error
-        logging.error(f"Error: Gemini API call failed due to blocked prompt: {e}")
-        return f"Error: Analysis blocked due to prompt content."
-    except types.generation_types.StopCandidateException as e: # More specific error
-        logging.error(f"Error: Gemini API call failed due to stop candidate: {e}")
-        return f"Error: Analysis stopped unexpectedly by the model."
-    except Exception as e: # Catch other potential API errors
-        logging.error(f"Error during Gemini API call: {e}")
-        # Optionally log the prompt or part of it for debugging
-        # logging.debug(f"Prompt that caused error (first 100 chars): {prompt[:100]}...")
-        return f"Error during analysis: {e}"
-
-# --- Analysis Functions ---
-
-def summarize_text(text_to_summarize):
-    """Summarizes the input text using the Gemini API (1-2 sentences)."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        return "Content was empty."
-
-    prompt = f"Summarize the following AI safety content in 2 concise sentences (maximum 50 words). Focus on the core argument, key insight, or main conclusion rather than methodology. Use clear, accessible language while preserving technical accuracy. The summary should be very readable and should help readers quickly understand what makes this content valuable or interesting and decide if they want to read more.\\n\\nContent to summarize:\\n{text_to_summarize}"
-    return call_gemini_api(prompt) # Removed client argument
-
-def generate_paragraph_summary(text_to_summarize):
-    """Generates a detailed paragraph summary using the Gemini API."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        return "Content was empty."
-
-    prompt = f"""
-Generate a structured summary of the following AI safety content so the reader can quickly understand the main points. The summary should consist of:
-
-1. A brief 1-sentence introduction highlighting the main point.
-2. 3-5 bullet points covering key arguments, evidence, or insights. Format EACH bullet point as:
-   * **Key concept or term**: Explanation or elaboration of that point.
-3. A brief 1-sentence conclusion with the author's recommendation or final thoughts.
-
----
-
-Rules:
-- Make each bullet point concise (1 sentence) and focus on one distinct idea.
-- Bold only the key concept at the start of each bullet, not entire sentences.
-- This format should help readers quickly scan and understand the core content.
-- Only output the summary itself (don't include 'Summary:' or anything else).
-- Use markdown to format the bullet points and to improve readability with bolding and italics.
-- Include a double line break after the introduction and before the conclusion.
-
-Content to summarize:
-{text_to_summarize}
-"""
-    return call_gemini_api(prompt) # Removed client argument
-
-def generate_key_implication(text_to_analyze):
-    """Identifies the single most important logical consequence using the Gemini API."""
-    if not text_to_analyze or text_to_analyze.isspace():
-        return "Content was empty."
-
-    prompt = f"""
-Based on the AI safety content below, identify the single most important logical consequence or implication in one concise sentence (25-35 words). Focus on:
-
-- What change in thinking, strategy, or priorities follows from accepting this content's conclusions
-- How this might alter our understanding of AI safety or governance approaches
-- A specific actionable insight rather than a general statement of importance
-- The "so what" that would matter to an informed AI safety community member
-
-The implication should represent a direct consequence of the content's argument, not simply restate the main point.
-
-Content to analyze:
-{text_to_analyze}
-"""
-    return call_gemini_api(prompt) # Removed client argument
-
-# --- Helper function to remove parentheses ---
-def remove_parentheses(text: str) -> str:
-    """Remove everything in parentheses (including the parentheses themselves) from text."""
-    if not isinstance(text, str):
-        return text
-    # Use regex to remove parentheses and everything inside them
-    import re
-    return re.sub(r'\s*\([^)]*\)\s*', ' ', text).strip()
-
-def generate_cluster_tag(title, tags_list, content_markdown):
+def is_ai_safety_post(title: str, html_body: str, max_bytes: int = GATE_SNIPPET_BYTES) -> bool | None:
     """
-    Generates a cluster and canonical tags using the Gemini API.
-
-    Returns:
-        dict: Parsed JSON like {"cluster": "...", "tags": ["..."]} on success.
-        dict: {"error": "Reason string"} on failure (API error, empty content, parsing error).
+    Fast yes/no guard-rail on the title + start of the post.
+    Returns True/False from the model, or None when the model could not be
+    reached. Callers must treat None as "unknown": do not ingest AND do not
+    record a skip, so the post is retried on the next run.
     """
-    if not content_markdown or content_markdown.isspace():
-        return {"error": "Content was empty."} # Return error dict
-    if not title:
-        title = "Unknown" # Provide a default if title is missing
-    if not tags_list:
-        tags_list = ["Unknown"] # Provide a default if tags are missing
-
-    prompt = f"""
-You are the "AI-Safety-Tagger"—an expert taxonomist for an AI-safety news feed.
-
----  TASK  ---
-Given one blog-style post, do BOTH of the following:
-
-1. **Pick exactly one "Cluster"** that best captures the *main theme*
-   (see the list of Clusters below).
-
-2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
-   describe the post.
-   • Tags *must* come from the taxonomy.
-   • Prefer the most specific tags that materially help the reader; skip
-     generic or redundant ones.
-   • A tag may be selected even if it appears only in the "Synonyms"
-     column—use its Canonical form in your answer.
-
-Return your answer as valid JSON, with this schema:
-
-{{
-  "cluster": "<one Cluster name>",
-  "tags": ["<Canonical tag 1>", "... up to 4"]
-}}
-
-Do not output anything else.
-
---- INPUT ---
-
-Title:
-{title}
-
-Original author-supplied tags (may be noisy or missing):
-{tags_list}
-
-Markdown body:
-{content_markdown}
-
---- TAXONOMY ---
-
-The format is:
-• Cluster
-- Canonical tag (Synonyms; separated by "")
-
-• Core AI Safety & Alignment
-- AI alignment (Human alignment)
-- Existential risk (X-risk)
-- Threat models (AI) (AI threat models)
-- Interpretability (Interpretability (ML & AI); Transparency)
-- Inner alignment
-- Outer alignment
-- Deceptive alignment
-- Eliciting latent knowledge (ELK)
-- Robustness (Adversarial robustness)
-- Alignment field-building (AI alignment field-building)
-- Value learning (Preference learning; Alignment via human values)
-
-• AI Governance & Policy
-- AI governance (GovAI)
-- Compute governance (GPU export controls; Chip governance)
-- AI regulation (Regulation)
-- Standards & auditing (Safety standards; Red-teaming)
-- Responsible scaling (Scaling policies; RSF)
-- International coordination (Geopolitics)
-- Slowing down AI (Slow takeoff; Pause AI)
-- Open-source models (Open-source LLMs)
-- Policy (Public policy (generic))
-- Compute controls (Hardware throttling)
-
-• Technical ML Safety
-- Reinforcement learning (RL)
-- Human feedback (RLHF; RLAIF)
-- Model editing (Model surgery)
-- Scalable oversight (Debate; Tree-of-thought)
-- CoT alignment (CoT alignment)
-- Scaling laws
-- Benchmarks & evals
-- Mechanistic interpretability
-- Value decomposition (Shard theory)
-
-• Forecasting & World Modeling
-- World modeling
-- Forecasting (Quantitative forecasting)
-- Prediction markets
-
-• Biorisk & Other GCRs
-- Biorisk (Biosecurity; Pandemic preparedness)
-- Nuclear risk (Nuclear war; Nuclear winter)
-- Global catastrophic risk (GCR)
-
-• Effective Altruism & Meta
-- Cause prioritization
-- Effective giving
-- Career choice (Career planning)
-- Community building (Building effective altruism)
-- Field-building (AI)
-- Epistemics & rationality (Rationality)
-
-• Philosophy & Foundations
-- Decision theory (CDT; EDT; UDT)
-- Moral uncertainty
-- Population ethics
-- Agent foundations (Agent foundations research)
-- Value drift
-- Info hazards (Information hazards)
-
-• Org-specific updates
-- Anthropic
-- OpenAI
-- DeepMind
-- Meta
-- ARC (Alignment Research Center)
-
----
-
-Remember: return only JSON with "cluster" and "tags".
-"""
-    raw_response = call_gemini_api(prompt) # Removed client argument
-
-    # Check if the API call itself returned an error string
-    if raw_response.startswith("Error:") or raw_response.startswith("Analysis skipped"):
-        return {"error": raw_response}
-
-    # Clean the response: remove markdown fences and trim whitespace
-    cleaned_response = raw_response.strip()
-    if cleaned_response.startswith("```json"):
-        cleaned_response = cleaned_response[len("```json"):].strip()
-    if cleaned_response.endswith("```"):
-        cleaned_response = cleaned_response[:-len("```")].strip()
-
-    # Try parsing the cleaned string as JSON
-    try:
-        parsed_json = json.loads(cleaned_response)
-        # Basic validation of structure
-        if isinstance(parsed_json, dict) and "cluster" in parsed_json and "tags" in parsed_json and isinstance(parsed_json["tags"], list):
-            # Clean parentheses from cluster and tags
-            if parsed_json["cluster"]:
-                parsed_json["cluster"] = remove_parentheses(parsed_json["cluster"])
-            
-            if parsed_json["tags"]:
-                parsed_json["tags"] = [remove_parentheses(tag) for tag in parsed_json["tags"] if tag]
-            
-            return parsed_json
-        else:
-            logging.warning(f"Warning: Parsed JSON from cluster tag API has unexpected structure: {parsed_json}")
-            return {"error": "Parsed JSON has unexpected structure"}
-    except json.JSONDecodeError as e:
-        logging.error(f"Error: Failed to parse JSON from cluster tag API response. Error: {e}")
-        logging.debug(f"Cleaned response was: '{cleaned_response}'")
-        return {"error": f"Failed to parse JSON response: {e}"}
-    except Exception as e: # Catch other potential errors during parsing/validation
-        logging.error(f"Error: Unexpected error processing cluster tag API response: {e}")
-        return {"error": f"Unexpected error processing cluster tag response: {e}"}
-
-
-# --- OpenAI Embedding Helper ---
-def generate_embeddings(openai_client, short_text: str, full_text: str, model="text-embedding-3-small") -> tuple[list[float] | None, list[float] | None]:
-    """
-    Generates short and full embeddings for the given texts using OpenAI.
-
-    Args:
-        openai_client: Initialized OpenAI client.
-        short_text: Text to embed for the 'short' version (e.g., title).
-        full_text: Text to embed for the 'full' version (e.g., title + summaries).
-        model: The OpenAI embedding model to use.
-
-    Returns:
-        A tuple containing (embedding_short, embedding_full).
-        Returns (None, None) if the client is not available or if API call fails.
-    """
-    if not openai_client:
-        logging.warning("OpenAI client not initialized. Skipping embedding generation.")
-        return None, None
-
-    # Ensure inputs are strings, even if empty
-    short_text = short_text or ""
-    full_text = full_text or ""
-
-    # Avoid API call if both inputs are effectively empty
-    if not short_text.strip() and not full_text.strip():
-        logging.debug("Skipping embedding generation: Both short and full texts are empty.")
-        return None, None
-
-    try:
-        logging.debug(f"  -> Generating OpenAI embeddings using model '{model}'...")
-        response = openai_client.embeddings.create(
-            model=model,
-            input=[short_text, full_text] # Send both texts in one request
-        )
-        # response.data should contain two embedding objects
-        if len(response.data) == 2:
-            embedding_short = response.data[0].embedding
-            embedding_full = response.data[1].embedding
-            logging.debug(f"  -> OpenAI embeddings generated successfully.")
-            return embedding_short, embedding_full
-        else:
-            logging.warning(f"Unexpected number of embeddings received from OpenAI API: {len(response.data)}")
-            return None, None
-    except (APIError, RateLimitError) as e:
-        logging.error(f"OpenAI API error during embedding generation: {e}")
-        return None, None
-    except Exception as e:
-        logging.error(f"Unexpected error during OpenAI embedding generation: {e}", exc_info=True)
-        return None, None
-
-
-# --- Gemini Flash helper (yes/no classifier) -------------------------------
-def is_ai_safety_post(title: str, html_body: str,
-                      model="gemini-2.5-flash-preview-04-17",
-                      max_chars=5000) -> bool:
-    """
-    Fast yes/no guard-rail: returns True iff Gemini Flash says the post's
-    *primary topic* is AI-safety-related (alignment, governance, x-risk, etc.)
-    """
-    if not GEMINI_API_KEY:
-        logging.warning("Flash guard-rail check skipped: GEMINI_API_KEY not set. Defaulting to True (fail-open).")
-        return True        # fail-open so you still ingest during local tests
-    
-    if not gemini_client:
-        logging.warning("Flash guard-rail check skipped: Gemini client not initialized. Defaulting to True (fail-open).")
-        return True        # fail-open if client not available
-
-    # Very lightweight prompt; temp=0 for determinism
-    # --- Start safe truncation ---
+    if title and NON_ARTICLE_TITLE_RE.search(title):
+        logging.info(f"Guard-rail: rejecting recurring non-article format by title: '{title[:60]}'")
+        return False
     snippet = markdownify(html_body or "", heading_style="ATX", bullets='-')
-    snippet = snippet.encode('utf-8')[:max_chars].decode('utf-8', 'ignore')
-    # --- End safe truncation ---
-    prompt = f"""You are an expert AI-safety content curator.
-Answer YES or NO – nothing else.
-
-Is the following post primarily about AI safety or closely related topics (alignment, risk,
-governance, technical ML safety, policy, x-risk, etc.)?
-
-Title: {title[:120]}
-
-Content (markdown, truncated):
-{snippet}
-"""
-    try:
-        rsp = gemini_client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0)
-        )
-        answer = (rsp.text or "").strip().upper()
-        logging.debug(f"Flash guard-rail check for '{title[:50]}...': Answer={answer}")
-        return "yes" in answer.lower()   # accept YES, Yes, yes, etc.
-    except Exception as e:
-        logging.warning(f"Flash guard-rail failed for '{title[:50]}...' ({e}); admitting post (fail-open).")
-        return True  # fail-open on API hiccups
+    snippet = snippet.encode('utf-8')[:max_bytes].decode('utf-8', 'ignore')
+    return is_ai_safety_content(title, snippet, kind="Substack post")
 
 # --- Substack Fetching Helpers ---
 
@@ -596,8 +290,18 @@ def slug_from_thing(source: str) -> str | None:
     if not host:
         return None
 
-    host = host.lower().lstrip("www.")                 # normalise
-    return host
+    # Keep the host exactly as configured. Some publications only serve the API
+    # on the www. host (astralcodexten.com and safeai.news answer 404/406 on the
+    # apex), and str.lstrip("www.") strips characters, not a prefix.
+    return host.lower()
+
+def display_slug(slug: str) -> str:
+    """Slug without a leading 'www.' (used for author/source display)."""
+    return slug[4:] if slug.startswith("www.") else slug
+
+def source_name_for(slug: str) -> str:
+    """Friendly source name; SUBSTACK_SOURCE_NAMES is keyed without 'www.'."""
+    return SUBSTACK_SOURCE_NAMES.get(display_slug(slug)) or SUBSTACK_SOURCE_NAMES.get(slug) or display_slug(slug)
 
 # Recursive helper to extract text from body_json nodes
 def extract_text(node):
@@ -607,7 +311,7 @@ def extract_text(node):
         return extract_text(node.get("text") or node.get("children") or "")
     if isinstance(node, list):
         # Use newline for lists to better separate paragraphs/blocks
-        return "\\n\\n".join(extract_text(c) for c in node)
+        return "\n\n".join(extract_text(c) for c in node)
     return ""
 
 # Helper to convert Substack JSON API response to our standard post dict
@@ -646,8 +350,8 @@ def json_to_post(full: dict, slug: str) -> dict | None:
         full.get("body_html")
         or full.get("body_markdown")
         # Updated: Use extract_text helper for body_json
-        or ("\\n\\n".join(extract_text(p) for p in full.get("body_json", [])))
-        or f"<p>{full.get('truncated_body_text','')}</p>"
+        or ("\n\n".join(extract_text(p) for p in full.get("body_json", [])))
+        or (f"<p>{full['truncated_body_text']}</p>" if full.get('truncated_body_text') else "")
     )
     # Ensure it's never empty if description exists
     if not html_body and full.get("description"):
@@ -688,7 +392,7 @@ def json_to_post(full: dict, slug: str) -> dict | None:
         "htmlBody":   html_body,
         "image_url":  image_url, # Add extracted image_url
         "tags":       original_tags, # Use extracted original tags
-        "user":       {"displayName": slug}, # Use slug as a placeholder user/source identifier
+        "user":       {"displayName": display_slug(slug)}, # Use slug as a placeholder user/source identifier
         "coauthors":  [], # JSON API doesn't provide easily
         "baseScore":  score,
         "commentCount": full.get("comments_count", 0),
@@ -713,7 +417,7 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
     offset = 0
     while True:
         list_url = f"https://{slug}/api/v1/archive?sort=new&search=&offset={offset}&limit={batch}"
-        logging.debug(f"  Fetching archive page: slug={slug}, offset={offset}, limit={batch}")
+        # Remove debug logging here
         try:
             page_response = requests.get(list_url, timeout=45, headers=headers)
             page_response.raise_for_status()
@@ -731,10 +435,10 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
             raise
 
         if not stubs:
-            logging.debug(f"  No more post stubs found for '{slug}' at offset {offset}.")
+            # Remove debug logging here
             break
 
-        logging.debug(f"  Processing {len(stubs)} post stubs for '{slug}'.")
+        # Remove debug logging here
         reached_cutoff = False
         for stub in stubs:
             posted_at_dt = iso_to_dt(stub.get("post_date"))
@@ -742,7 +446,7 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
                 logging.warning(f"Skipping stub with missing/invalid 'post_date' in archive for '{slug}': ID {stub.get('id')}")
                 continue
             if posted_at_dt < cutoff:
-                logging.debug(f"  Reached cutoff date ({cutoff.date()}) for '{slug}'. Stopping.")
+                # Remove debug logging here
                 reached_cutoff = True
                 break
 
@@ -756,7 +460,9 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
 def fetch_single_post(slug: str, stub: dict, headers: dict):
     """
     Fetches a single full post from Substack API given a stub.
-    Returns the converted post_dict or None if failed.
+    Returns the converted post_dict, or one of the strings
+    "fetch_failed" | "unusable" (paywalled / missing fields) | "rejected" (gate said no)
+    | "gate_error" (gate unavailable; retry next run).
     """
     pid = stub.get("id")
     title = stub.get('title', 'Untitled')
@@ -776,24 +482,28 @@ def fetch_single_post(slug: str, stub: dict, headers: dict):
         
     except Exception as e:
         logging.warning(f"Failed fetching full post ID {pid} for '{slug}': {e}")
-        return None
+        return "fetch_failed"
         
     if not isinstance(full_post_data, dict):
         logging.warning(f"Substack API for post ID {pid} ('{slug}') returned unexpected type ({type(full_post_data).__name__}) instead of dict.")
-        return None
+        return "fetch_failed"
         
     # Convert to standard post dict
     post_dict = json_to_post(full_post_data, slug)
     if not post_dict:
-        return None
+        return "unusable"
         
     # AI safety check
-    if not is_ai_safety_post(post_dict["title"], post_dict["htmlBody"]):
-        logging.info(f"    Failed AI safety check: '{title[:50]}...'")
+    verdict = is_ai_safety_post(post_dict["title"], post_dict["htmlBody"])
+    if verdict is None:
+        # Model unavailable: don't ingest, don't blacklist; retry next run.
+        logging.warning(f"Guard-rail unavailable for '{title[:50]}...' ({slug}); will retry next run.")
+        return "gate_error"
+    if not verdict:
         buffer_skip(pid, post_dict["title"], post_dict.get("pageUrl"))
-        return None
+        return "rejected"
         
-    post_dict["source_type"] = SUBSTACK_SOURCE_NAMES.get(slug, slug)
+    post_dict["source_type"] = source_name_for(slug)
     return post_dict
 
 def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None):
@@ -819,7 +529,7 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
     
     # slug may already be 'domain.com' or 'xyz.substack.com'
     feed_url = f"https://{slug}/feed"
-    logging.info(f"Fetching RSS feed: {feed_url}") # Keep this INFO level
+    print(f"Fetching RSS: {slug}") # Keep this visible
     headers = { # Add headers dict
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -840,7 +550,7 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
          return # Stop iteration for this feed
 
     if not d or not d.entries:
-        logging.info(f"RSS feed for '{slug}' is empty or could not be fetched.")
+        print(f"[WARN] RSS feed for '{slug}' is empty or could not be fetched.")
         return # Nothing to iterate
 
     count = 0
@@ -865,14 +575,14 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
             continue
 
         if dt < cutoff:
-            logging.debug(f"    Skipping RSS entry (older than cutoff {cutoff.date()}): {title[:50]}...")
+            # Remove debug logging here
             buffer_skip(entry.get("id", link), title, link)
             continue # Skip posts older than cutoff
 
         # --- EARLY DATABASE CHECK (NEW) ---
         title_norm = normalise_title(title)
         if title_norm in known_titles:
-            logging.debug(f"  RSS: Skipping '{title[:50]}...' - already in database/skipped")
+            # Remove debug logging here
             continue # Skip if already known, avoiding expensive AI safety check
         # --- END EARLY DATABASE CHECK ---
 
@@ -898,16 +608,20 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
             "postedAt":   dt.isoformat(),
             "htmlBody":   html_body,
             "tags":       tag_objs, # Use tags parsed from RSS
-            "user":       {"displayName": slug}, # Use slug as placeholder user/source
+            "user":       {"displayName": display_slug(slug)}, # Use slug as placeholder user/source
             "coauthors":  [{"displayName": entry.get("author")}] if entry.get("author") else [],
             "baseScore":  None,     # RSS has no score
             "commentCount": None,   # RSS has no comments
-            "source_type": SUBSTACK_SOURCE_NAMES.get(slug, slug) # Use friendly name from mapping
+            "source_type": source_name_for(slug) # Use friendly name from mapping
         }
 
         # --- Guard-rail: Check if post is AI safety related (MOVED AFTER DB CHECK) ---
-        if not is_ai_safety_post(post_dict["title"], post_dict["htmlBody"]):
-            logging.info(f"    Skipping RSS entry '{title[:50]}...' (URL: {link}): Failed AI safety guard-rail.")
+        verdict = is_ai_safety_post(post_dict["title"], post_dict["htmlBody"])
+        if verdict is None:
+            print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
+            continue                      # not recorded as skipped
+        if not verdict:
+            print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
             buffer_skip(post_id, title, link)
             continue                      # discard & do NOT yield
 
@@ -942,10 +656,9 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
     posts_by_id = {}
     archive_failed = False
     
-    logging.info(f"Starting optimized Substack fetch for '{slug}' (cutoff: {cutoff.date()})")
+    print(f"\n[FETCH] Fetching from: {slug}")
     
     # STEP 1: Get all post stubs first (lightweight)
-    logging.info(f" -> Fetching post list from archive...")
     try:
         for stub in iter_substack_archive_stubs(slug, cutoff=cutoff, batch=archive_batch):
             # Check title against database
@@ -957,16 +670,17 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
             
             # Skip if already in database or previously skipped
             if title_norm in known_titles:
-                logging.debug(f"  Skipping '{title[:50]}...' - already in database/skipped")
+                # Remove debug logging here
                 continue
                 
             # This post needs to be fetched
             posts_to_fetch.append(stub)
             
-        logging.info(f" -> Found {len(posts_to_fetch)} new posts to fetch (after DB check)")
-        
+        print(f"   [OK] Found {len(posts_to_fetch)} new posts from archive")
+
     except Exception as e:
-        logging.warning(f" -> Archive API stub fetch FAILED for '{slug}': {e}. Will attempt RSS fallback.")
+        print(f"   [ERROR] Archive API failed: {e}")
+        logging.error(f"Archive API stub fetch FAILED for '{slug}': {e}. Will attempt RSS fallback.")
         archive_failed = True
     
     # STEP 2: Only fetch full details for posts not in database
@@ -978,26 +692,48 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
             )
         }
         
+        successful_fetches = 0
+        outcomes = {"rejected": 0, "gate_error": 0, "unusable": 0, "fetch_failed": 0}
         for i, stub in enumerate(posts_to_fetch):
             title = stub.get('title', 'Untitled')
-            logging.info(f"  [{i+1}/{len(posts_to_fetch)}] Fetching new post: '{title[:50]}...'")
+            # Only log every 5th post or failures to reduce verbosity
+            if (i + 1) % 5 == 0 or i == len(posts_to_fetch) - 1:
+                print(f"   [INFO] Fetching posts... [{i+1}/{len(posts_to_fetch)}]")
             
-            post_dict = fetch_single_post(slug, stub, headers)
-            if post_dict and post_dict.get('_id'):
-                posts_by_id[post_dict['_id']] = post_dict
-                
-        logging.info(f" -> Archive API optimized fetch finished for '{slug}'. Found {len(posts_by_id)} posts.")
+            result = fetch_single_post(slug, stub, headers)
+            if isinstance(result, dict) and result.get('_id'):
+                posts_by_id[result['_id']] = result
+                successful_fetches += 1
+            elif result == "rejected":
+                outcomes["rejected"] += 1
+                print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
+            elif result == "gate_error":
+                outcomes["gate_error"] += 1
+                print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
+            elif result == "unusable":
+                outcomes["unusable"] += 1
+                # Paywalled / missing fields is permanent: record it so we stop re-fetching.
+                buffer_skip(stub.get("id"), title, stub.get("canonical_url"))
+                print(f"   [SKIP] Paywalled or missing fields: '{title[:50]}...'")
+            else:
+                outcomes["fetch_failed"] += 1
+                print(f"   [FAIL] Failed to fetch: '{title[:50]}...'")
+
+        print(f"   [OK] Archive fetch complete: {successful_fetches} kept, "
+              f"{outcomes['rejected']} rejected by gate, {outcomes['unusable']} paywalled/unusable, "
+              f"{outcomes['fetch_failed']} fetch failures, {outcomes['gate_error']} gate errors "
+              f"(of {len(posts_to_fetch)})")
         
     elif archive_failed:
-        logging.info(f" -> Archive failed, will fall back to RSS.")
+        print(f"   → Will use RSS fallback")
     else:
-        logging.info(f" -> No new posts found in archive for '{slug}'.")
+        print(f"   → No new posts found in archive")
     
     # STEP 3: Handle RSS if needed (with similar pre-filtering)
     need_rss = archive_failed or always_add_rss
     if need_rss:
         reason = "fallback" if archive_failed else "always_add_rss"
-        logging.info(f" -> Fetching RSS feed for '{slug}' (Reason: {reason}, Limit: {rss_limit})...")
+        print(f"   [RSS] Fetching RSS ({reason})...")
         try:
             rss_count = 0
             # Use existing RSS iterator but with pre-filtering
@@ -1008,19 +744,17 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                     if title_norm not in known_titles:
                         posts_by_id.setdefault(post['_id'], post)
                         rss_count += 1
-                    else:
-                        logging.debug(f"  RSS: Skipping '{post.get('title', '')[:50]}...' - already known")
-            logging.info(f" -> RSS fetch finished for '{slug}'. Added {rss_count} new posts via RSS.")
+                    # Remove debug logging here
+            print(f"   [OK] RSS complete: {rss_count} new posts")
         except Exception as e:
-            logging.error(f" -> RSS fetch FAILED for '{slug}': {e}")
-    else:
-        logging.info(f" -> Skipping RSS fetch for '{slug}' (Archive successful and always_add_rss=False).")
+            print(f"   [ERROR] RSS failed: {e}")
+            logging.error(f"RSS fetch FAILED for '{slug}': {e}")
 
     # STEP 4: Return sorted results
     final_posts = list(posts_by_id.values())
     final_posts.sort(key=lambda p: p.get('postedAt', ''), reverse=True)
 
-    logging.info(f" -> Completed optimized fetch for '{slug}'. Total unique posts: {len(final_posts)}")
+    print(f"   [SUMMARY] Total for {slug}: {len(final_posts)} posts")
     return final_posts
 
 def fetch_substack(source_input: str, cutoff: datetime, rss_limit: int = 25, archive_batch: int = 100, always_add_rss: bool = False):
@@ -1054,7 +788,7 @@ def choose_highest_score(posts):
     # Filter out posts without titles first, as they cannot be deduplicated
     valid_posts = [p for p in posts if p and p.get('title')]
     original_valid_count = len(valid_posts)
-    logging.info(f"\n--- Deduplicating {original_valid_count} fetched Substack posts by normalized title ---")
+    print(f"\n[DEDUP] Deduplicating {original_valid_count} posts by title...")
 
     removed_count = 0
     for p in valid_posts:
@@ -1073,18 +807,18 @@ def choose_highest_score(posts):
             existing_score = existing_entry.get('baseScore') or 0
             # Replace if the current post has a strictly higher score
             if current_score > existing_score:
-                logging.debug(f"    Replacing post '{key}' (Score {existing_score}) with higher score ({current_score})")
+                # Remove debug logging here
                 by_title[key] = p
                 removed_count += 1 # Count the one that was replaced
             else:
-                logging.debug(f"    Keeping existing post '{key}' (Score {existing_score}), discarding lower/equal score ({current_score})")
+                # Remove debug logging here
                 removed_count += 1 # Count the one being discarded
 
     unique_posts = list(by_title.values())
     # Calculate removed duplicates based on the difference from the initial valid count
     # duplicates_removed = original_valid_count - len(unique_posts) # Old calculation was slightly off
 
-    logging.info(f"--- Kept {len(unique_posts)} unique posts (removed {removed_count} lower-scoring or duplicate title posts) ---")
+    print(f"   [OK] Kept {len(unique_posts)} unique posts (removed {removed_count} duplicates)")
     return unique_posts
 
 # --- Helper for title normalization ---
@@ -1093,9 +827,190 @@ def normalise_title(t: str) -> str:
     if not isinstance(t, str): return "" # Handle non-string input
     return re.sub(r'\s+', ' ', t).strip().lower()
 
+# --- Backfill Function for Missing Analysis ---
+
+def backfill_missing_analysis(batch_size=10):
+    """
+    Backfill missing sentence_summary, paragraph_summary, and key_implication
+    for existing Substack posts that have content but are missing analysis.
+    
+    Args:
+        batch_size: Number of rows to process per run
+    """
+    print(f"\n{'='*60}")
+    print("BACKFILL MODE: Re-analyzing existing Substack posts")
+    print(f"{'='*60}\n")
+    
+    conn = None
+    processed_count = 0
+    updated_count = 0
+    skipped_count = 0
+    
+    try:
+        print("[DB] Connecting to database...")
+        conn = psycopg2.connect(DATABASE_URL)
+        print("[OK] Database connected")
+        register_vector(conn)
+        
+        with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+            # Find Substack posts missing analysis
+            print(f"[INFO] Searching for Substack posts missing analysis...")
+            cur.execute("""
+                SELECT id, title, source_type, sentence_summary, paragraph_summary, 
+                       key_implication, full_content_markdown, full_content, topics, cluster_tag
+                FROM content
+                WHERE source_type = ANY(%s)
+                AND (sentence_summary IS NULL OR paragraph_summary IS NULL OR key_implication IS NULL 
+                     OR topics IS NULL OR cluster_tag IS NULL)
+                AND (full_content_markdown IS NOT NULL OR full_content IS NOT NULL)
+                ORDER BY published_date DESC NULLS LAST
+                LIMIT %s
+            """, (list(SUBSTACK_SOURCE_NAMES.values()), batch_size))
+            
+            rows = cur.fetchall()
+            
+            if not rows:
+                print("✓ No Substack posts need backfilling - all caught up!")
+                return
+            
+            print(f"[OK] Found {len(rows)} Substack posts to process\n")
+            
+            # Process each row
+            for i, row in enumerate(rows, 1):
+                row_id = row['id']
+                title = row['title'] or 'Untitled'
+                
+                try:
+                    print(f"[{i}/{len(rows)}] Processing: '{title[:60]}...'")
+                    print(f"   ID: {row_id}")
+                    print(f"   Source: {row['source_type']}")
+                    
+                    # Determine what content to use
+                    content = row['full_content_markdown'] or row['full_content']
+                    if not content or content.isspace():
+                        print(f"   [SKIP] No usable content")
+                        skipped_count += 1
+                        continue
+                    
+                    # Track what needs updating
+                    updates = {}
+                    needs_embeddings = False
+                    
+                    # One structured call regenerates every analysis field; keep only the missing ones.
+                    try:
+                        analysis = analyze_content(title, content, [])
+                    except (LLMError, ValueError) as e:
+                        print(f"   ✗ Analysis failed: {e}")
+                        skipped_count += 1
+                        continue
+                    if row['sentence_summary'] is None:
+                        updates['sentence_summary'] = analysis['sentence_summary']
+                        needs_embeddings = True
+                        print(f"   ✓ Sentence summary generated")
+                    if row['paragraph_summary'] is None:
+                        updates['paragraph_summary'] = analysis['paragraph_summary']
+                        needs_embeddings = True
+                        print(f"   ✓ Paragraph summary generated")
+                    if row['key_implication'] is None:
+                        updates['key_implication'] = analysis['key_implication']
+                        needs_embeddings = True
+                        print(f"   ✓ Key implication generated")
+                    if row['cluster_tag'] is None:
+                        updates['cluster_tag'] = analysis['cluster_tag']
+                        needs_embeddings = True
+                        print(f"   ✓ Cluster tag generated: {analysis['cluster_tag']}")
+                    if row['topics'] is None:
+                        updates['topics'] = analysis['tags']
+                        needs_embeddings = True
+                        print(f"   ✓ Topics generated: {analysis['tags']}")
+
+                    # Regenerate embeddings if we updated any summaries
+                    if needs_embeddings:
+                        print(f"   → Regenerating embeddings...")
+                        
+                        # Get current values (use newly generated or existing)
+                        sentence_sum = updates.get('sentence_summary') or row['sentence_summary'] or ""
+                        paragraph_sum = updates.get('paragraph_summary') or row['paragraph_summary'] or ""
+                        key_impl = updates.get('key_implication') or row['key_implication'] or ""
+                        topics = updates.get('topics') or row['topics'] or []
+                        
+                        # Prepare embedding texts
+                        text_for_short = title
+                        text_for_full = build_embedding_text(sentence_sum, paragraph_sum, key_impl, topics if isinstance(topics, list) else [])
+                        
+                        # Generate embeddings
+                        emb_short, emb_full = generate_embeddings(text_for_short, text_for_full)
+                        
+                        if emb_short and emb_full:
+                            updates['embedding_short'] = emb_short
+                            updates['embedding_full'] = emb_full
+                            print(f"   ✓ Embeddings regenerated")
+                        else:
+                            print(f"   ⚠ Embedding generation failed; not saving summaries so the row is retried")
+                            skipped_count += 1
+                            continue
+                    
+                    # Update database if we have changes
+                    if updates:
+                        set_clauses = []
+                        values = []
+                        
+                        for key, value in updates.items():
+                            set_clauses.append(f"{key}=%s")
+                            values.append(value)
+                        
+                        values.append(row_id)  # For WHERE clause
+                        
+                        update_sql = f"UPDATE content SET {', '.join(set_clauses)} WHERE id=%s"
+                        cur.execute(update_sql, values)
+                        conn.commit()
+                        
+                        print(f"   ✓ Database updated ({len(updates)} fields)")
+                        updated_count += 1
+                        processed_count += 1
+                    else:
+                        print(f"   [SKIP] No successful updates generated")
+                        skipped_count += 1
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(0.5)
+                    print()  # Blank line between posts
+                    
+                except Exception as e:
+                    print(f"   ✗ Error processing row {row_id}: {e}")
+                    logging.error(f"Failed to process row {row_id}: {e}", exc_info=True)
+                    if conn:
+                        conn.rollback()
+                    skipped_count += 1
+                    print()
+            
+            print(f"\n{'='*60}")
+            print("BACKFILL SUMMARY")
+            print(f"{'='*60}")
+            print(f"Posts found:       {len(rows)}")
+            print(f"Successfully updated: {updated_count}")
+            print(f"Skipped:           {skipped_count}")
+            print(f"{'='*60}\n")
+    
+    except psycopg2.Error as db_err:
+        print(f"\n✗ Database error: {db_err}")
+        logging.error(f"Database error: {db_err}", exc_info=True)
+        if conn:
+            conn.rollback()
+    except Exception as e:
+        print(f"\n✗ Unexpected error: {e}")
+        logging.error(f"Unexpected error: {e}", exc_info=True)
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            conn.close()
+            print("[OK] Database connection closed")
+
 # --- Main Execution & Database Handling ---
 
-def main():
+def main(limit: int | None = None):
+    # limit: process at most N new posts (canary runs)
     # Setup logging (already done at the top)
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1114,22 +1029,20 @@ def main():
     already_skipped = set()
     
     try:
-        logging.info("\n--- Database Connection & Title Fetch ---")
-        logging.info("Connecting to the database...")
+        print("\n[DB] Connecting to database...")
         conn = psycopg2.connect(DATABASE_URL)
-        logging.info("Database connection successful.")
+        print("[OK] Database connected")
         register_vector(conn) # Register pgvector type with the connection
-        logging.info("pgvector type registered with psycopg2 connection.")
+        print("[OK] pgvector registered")
 
         with conn.cursor() as cur:
             # Fetch existing titles BEFORE processing any feeds
-            logging.info("Fetching existing titles from database...")
+            print("[INFO] Fetching existing data...")
             cur.execute("SELECT title_norm FROM content")
             existing_titles = {row[0] for row in cur.fetchall()}
-            logging.info(f"→ {len(existing_titles):,} titles already in content table")
+            print(f"   → {len(existing_titles):,} titles in content table")
 
             # Fetch already skipped titles
-            logging.info("Fetching already skipped titles from database...")
             cur.execute("SELECT title_norm FROM skipped_posts")
             already_skipped = {row[0] for row in cur.fetchall()}
             logging.info(f"→ {len(already_skipped):,} titles already in skipped_posts table")
@@ -1149,13 +1062,15 @@ def main():
             logging.info("Initial database connection closed.")
 
     # --- Fetch Substack Data with Database Info ---
-    logging.info("--- Starting Optimized Substack Feed Fetch ---")
+    print("\n[START] Starting Substack feed fetch...")
     substack_posts_all = []
     # Option to always fetch RSS as a safety net for very new posts
     # Set this via env var or keep False
     ALWAYS_FETCH_RSS_NET = os.getenv("SUBSTACK_ALWAYS_FETCH_RSS", "False").lower() == "true"
 
-    for feed_url_or_slug in SUBSTACK_FEEDS:
+    early_skips = []
+    for feed_index, feed_url_or_slug in enumerate(SUBSTACK_FEEDS, 1):
+        print(f"\n[FEED {feed_index}/{len(SUBSTACK_FEEDS)}] {feed_url_or_slug}", flush=True)
         # Use the optimized fetch_substack function with database info
         posts_for_feed = fetch_substack_optimized(
             source_input=feed_url_or_slug,
@@ -1167,29 +1082,36 @@ def main():
             always_add_rss=ALWAYS_FETCH_RSS_NET
         )
         substack_posts_all.extend(posts_for_feed)
-        # Detailed logging is now handled inside fetch_substack_optimized
+        # Persist this feed's gate/cutoff/paywall skips right away (own transaction), so a
+        # killed run does not lose them and progress is visible in the DB.
+        flushed = flush_skip_buffer(DATABASE_URL)
+        early_skips.extend(flushed)
+        already_skipped.update(t for _, t, _ in flushed)
+        print(f"   [DB] {len(flushed)} skips recorded for this feed; {len(substack_posts_all)} candidate posts so far", flush=True)
+
+    early_skip_count = len(early_skips)
 
     initial_fetched_count = len(substack_posts_all)
-    logging.info(f"--- Finished Optimized Substack Fetch: {initial_fetched_count} posts fetched (before deduplication) ---")
+    print(f"\n[COMPLETE] Fetch complete: {initial_fetched_count} posts total")
 
     # --- Deduplicate in memory before processing ---
     unique_posts = choose_highest_score(substack_posts_all)
     total_unique_count = len(unique_posts)
 
     if not unique_posts:
-        logging.info("No unique Substack posts remaining after deduplication. Exiting.")
-        sys.exit(1) # Exit with error code
+        print(f"[INFO] No new posts to process ({early_skip_count} skips recorded).")
+        return
 
     # --- Process Posts and Insert into Database ---
     processed_count = 0
     affected_rows_count = 0 # Tracks total rows inserted
     failed_analysis_count = 0 # Track posts where analysis failed/skipped
-    batch_data = [] # List to hold data tuples for batch insert
     total_failures = 0 # Track failures during batch insert
     skipped_in_db_count = 0 # Track skipped due to being in DB
     skipped_missing_data_count = 0 # Track skipped due to missing URL/Title
     skipped_analysis_error_count = 0 # Track skipped due to HTML/Markdown error
-    total_skipped_by_record_count = 0 # Track posts recorded in skipped_posts table
+    new_posts_started = 0 # For --limit
+    total_skipped_by_record_count = early_skip_count # Track posts recorded in skipped_posts table (incl. skips flushed above)
 
     conn = None # Initialize conn outside the try block
 
@@ -1203,19 +1125,6 @@ def main():
         logging.info("pgvector type registered with psycopg2 connection.")
 
         with conn.cursor() as cur:
-            # --- Process skipped buffer ---
-            if SKIPPED_BUFFER:
-                extras.execute_values(cur,
-                    "INSERT INTO skipped_posts (post_id, title_norm, source_url) VALUES %s "
-                    "ON CONFLICT (title_norm) DO NOTHING",
-                    list(SKIPPED_BUFFER))
-                total_skipped_by_record_count += len(SKIPPED_BUFFER) # Add buffer size to counter
-                logging.info("Inserted %s cutoff/guard-rail skips.", len(SKIPPED_BUFFER))
-                # Update already_skipped cache with titles from buffer
-                already_skipped.update(t for _, t, _ in SKIPPED_BUFFER)
-                # Clear the buffer after successful insertion
-                SKIPPED_BUFFER.clear()
-
             logging.info(f"\n--- Processing {total_unique_count} Unique Posts ---")
             posts_to_insert = 0 # Count posts added to batch_data
             for i, post in enumerate(unique_posts): # Iterate over unique posts
@@ -1233,7 +1142,7 @@ def main():
                 title_norm = normalise_title(title) # Normalize title once for checks
                 if url == 'N/A' or title == 'N/A':
                      logging.warning(f"  -> Skipping post (ID: {post_id}): Missing URL or Title.")
-                     record_skip(cur, post_id, title_norm, url) # Record skip
+                     record_skip(cur, post_id, title_norm, url); conn.commit() # Record skip
                      already_skipped.add(title_norm) # Add to in-memory cache
                      total_skipped_by_record_count += 1 # Increment counter
                      skipped_missing_data_count += 1
@@ -1254,6 +1163,13 @@ def main():
                     continue
                 # --- End already_skipped check ---
 
+                if limit is not None:
+                    if new_posts_started >= limit:
+                        logging.warning(f"  --limit {limit} reached; stopping before this post.")
+                        print(f"[INFO] --limit {limit} reached; stopping.")
+                        break
+                    new_posts_started += 1
+
                 # --- Check for invalid publication date before extensive processing ---
                 published_date_str = post.get('postedAt', '')
                 published_date_dt = None
@@ -1263,19 +1179,19 @@ def main():
                         # Check against CUTOFF_DATE (though iterators should handle this, good for safety)
                         if published_date_dt < CUTOFF_DATE:
                             logging.warning(f"  -> Skipping post (ID: {post_id}): Publication date {published_date_dt.date()} is before cutoff {CUTOFF_DATE.date()}.")
-                            record_skip(cur, post_id, title_norm, url)
+                            record_skip(cur, post_id, title_norm, url); conn.commit()
                             already_skipped.add(title_norm)
                             total_skipped_by_record_count += 1
                             continue
                     except ValueError:
                         logging.warning(f"  -> Skipping post (ID: {post_id}): Invalid publication date string '{published_date_str}'.")
-                        record_skip(cur, post_id, title_norm, url)
+                        record_skip(cur, post_id, title_norm, url); conn.commit()
                         already_skipped.add(title_norm)
                         total_skipped_by_record_count += 1
                         continue
                 else: # No 'postedAt' field
                     logging.warning(f"  -> Skipping post (ID: {post_id}): Missing publication date ('postedAt').")
-                    record_skip(cur, post_id, title_norm, url)
+                    record_skip(cur, post_id, title_norm, url); conn.commit()
                     already_skipped.add(title_norm)
                     total_skipped_by_record_count += 1
                     continue
@@ -1287,15 +1203,13 @@ def main():
 
                 source_type = post.get('source_type', 'Unknown') # Get added source_type
 
-                score = post.get('baseScore') # Keep as number (or None) for DB
+                score = safe_int_or_zero(post.get('baseScore'))
                 comment_count = post.get('commentCount') # Keep as number (or None) for DB
                 full_content = post.get('htmlBody', '') or "" # Ensure it's a string
 
                 # --- Prepend title to HTML content ---
                 if title != 'N/A' and full_content: # Only add if title exists and content exists
                     full_content = f"<h1>{title}</h1>\n\n{full_content}" # Use \n\n for markdown friendliness later
-                elif title != 'N/A': # If content is empty but title exists
-                    full_content = f"<h1>{title}</h1>"
                 # --- End prepend title ---
 
                 # --- Clean HTML with BeautifulSoup (Moved after duplicate check) ---
@@ -1311,7 +1225,7 @@ def main():
                         logging.error(f"ERROR: BeautifulSoup cleaning failed for post '{title}' ({url}). Error: {e}. Content and analysis will be skipped.")
                         cleaned_html = "" # Keep it empty on error
                         analysis_successful = False # Skip analysis if cleaning fails
-                        record_skip(cur, post_id, title_norm, url) # Record skip
+                        record_skip(cur, post_id, title_norm, url); conn.commit() # Record skip
                         already_skipped.add(title_norm) # Add to in-memory cache
                         total_skipped_by_record_count += 1 # Increment counter
                         skipped_analysis_error_count += 1 # Count this specific skip reason
@@ -1320,7 +1234,7 @@ def main():
                     # This case implies full_content was empty. If this is a reason to skip, record it.
                     # Assuming empty HTML means we should skip and record.
                     logging.warning(f"  -> Skipping post (ID: {post_id}): HTML content is empty.")
-                    record_skip(cur, post_id, title_norm, url)
+                    record_skip(cur, post_id, title_norm, url); conn.commit()
                     already_skipped.add(title_norm)
                     total_skipped_by_record_count += 1
                     skipped_analysis_error_count += 1 # Or a more specific counter for empty content
@@ -1342,7 +1256,7 @@ def main():
                         analysis_successful = False # Skip analysis if markdown fails
                         # Only count skip if cleaning didn't already fail
                         if cleaned_html is not None:
-                            record_skip(cur, post_id, title_norm, url) # Record skip
+                            record_skip(cur, post_id, title_norm, url); conn.commit() # Record skip
                             already_skipped.add(title_norm) # Add to in-memory cache
                             total_skipped_by_record_count += 1 # Increment counter
                             skipped_analysis_error_count += 1
@@ -1354,7 +1268,7 @@ def main():
                     # or if we want to explicitly skip if full_content_markdown is empty after processing.
                     if not full_content_markdown and analysis_successful: # analysis_successful means HTML was processed
                         logging.warning(f"  -> Skipping post (ID: {post_id}): Markdown content is empty after conversion.")
-                        record_skip(cur, post_id, title_norm, url)
+                        record_skip(cur, post_id, title_norm, url); conn.commit()
                         already_skipped.add(title_norm)
                         total_skipped_by_record_count += 1
                         skipped_analysis_error_count += 1
@@ -1369,7 +1283,7 @@ def main():
                      # and it hasn't been recorded yet, record it.
                      if not analysis_successful and title_norm not in already_skipped:
                          logging.warning(f"  -> Recording skip for (ID: {post_id}) due to prior content processing failure.")
-                         record_skip(cur, post_id, title_norm, url)
+                         record_skip(cur, post_id, title_norm, url); conn.commit()
                          already_skipped.add(title_norm)
                          total_skipped_by_record_count += 1
                          # Note: skipped_analysis_error_count might have already been incremented.
@@ -1389,7 +1303,7 @@ def main():
                     logging.warning(f"  -> Final check: Skipping DB preparation for (ID: {post_id}) as analysis_successful is false.")
                     # Ensure it was recorded if not already. This is a safeguard.
                     if title_norm not in already_skipped:
-                        record_skip(cur, post_id, title_norm, url)
+                        record_skip(cur, post_id, title_norm, url); conn.commit()
                         already_skipped.add(title_norm)
                         total_skipped_by_record_count += 1
                     continue # Skip to the next post if analysis failed
@@ -1403,87 +1317,49 @@ def main():
                 db_tags = [] # Default for ARRAY type
                 embedding_short_vector = None
                 embedding_full_vector = None
-                current_post_analysis_failed = False # Flag for this post's AI analysis
 
-                # Only perform AI analysis if markdown content is available and usable
-                if full_content_markdown and not full_content_markdown.isspace():
-                    logging.debug(f"  Performing Gemini analysis on markdown content...")
-
-                    sentence_summary = summarize_text(full_content_markdown)
-                    if sentence_summary.startswith("Error:") or sentence_summary.startswith("Content was empty.") or sentence_summary.startswith("Analysis skipped"):
-                        logging.warning(f"    Failed to generate sentence summary: {sentence_summary}")
-                        current_post_analysis_failed = True
-                        sentence_summary = None # Ensure it's None if failed
-
-                    paragraph_summary = generate_paragraph_summary(full_content_markdown)
-                    if paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Content was empty.") or paragraph_summary.startswith("Analysis skipped"):
-                        logging.warning(f"    Failed to generate paragraph summary: {paragraph_summary}")
-                        current_post_analysis_failed = True
-                        paragraph_summary = None # Ensure it's None if failed
-
-                    key_implication = generate_key_implication(full_content_markdown)
-                    if key_implication.startswith("Error:") or key_implication.startswith("Content was empty.") or key_implication.startswith("Analysis skipped"):
-                        logging.warning(f"    Failed to generate key implication: {key_implication}")
-                        current_post_analysis_failed = True
-                        key_implication = None # Ensure it's None if failed
-
-                    # Cluster Tagging
-                    logging.debug(f"  Performing cluster tagging...")
-                    # title and tag_names are defined earlier in the loop
-                    cluster_info = generate_cluster_tag(title, tag_names, full_content_markdown) # Renamed variable
-                    if cluster_info.get("error"): # Use renamed variable
-                        logging.warning(f"    Failed to generate cluster/tags: {cluster_info.get('error')}") # Use renamed variable
-                        current_post_analysis_failed = True
-                        # db_cluster remains None, db_tags remains [] (due to initialization)
-                    else:
-                        db_cluster = cluster_info.get("cluster") # Use renamed variable
-                        db_tags = cluster_info.get("tags")     # Use user's specified assignment (no default list)
-                        if not db_cluster: # Consider it a partial failure if cluster is missing
-                            logging.warning(f"    Cluster tagging returned no cluster. Tags: {db_tags}")
-                            # Optionally: current_post_analysis_failed = True
-
-                    # OpenAI Embeddings
-                    # Prepare text for embeddings (matching backfill script format)
-                    text_for_short_embedding = title if title and title != 'N/A' else ""
-                    
-                    # Prepare components for full embedding text, using empty string for None/failed values
-                    sentence_summary_text = sentence_summary if sentence_summary and not (sentence_summary.startswith("Error:") or sentence_summary.startswith("Content was empty.") or sentence_summary.startswith("Analysis skipped")) else ""
-                    paragraph_summary_text = paragraph_summary if paragraph_summary and not (paragraph_summary.startswith("Error:") or paragraph_summary.startswith("Content was empty.") or paragraph_summary.startswith("Analysis skipped")) else ""
-                    key_implication_text = key_implication if key_implication and not (key_implication.startswith("Error:") or key_implication.startswith("Content was empty.") or key_implication.startswith("Analysis skipped")) else ""
-                    
-                    # Convert db_tags list to string representation (matching topics field in backfill script)
-                    topics_text = ", ".join(db_tags) if db_tags and isinstance(db_tags, list) else ""
-                    
-                    # Combine full embedding components with single newlines (matching backfill format)
-                    text_for_full_embedding = f"{sentence_summary_text}\n{paragraph_summary_text}\n{key_implication_text}\n{topics_text}"
-
-                    # Check if openai_client is available and there's text to embed
-                    if openai_client and (text_for_short_embedding.strip() or text_for_full_embedding.strip()):
-                        logging.debug(f"  Performing OpenAI embedding generation...")
-                        embedding_short_vector, embedding_full_vector = generate_embeddings(
-                            openai_client,
-                            text_for_short_embedding,
-                            text_for_full_embedding
-                        )
-                        # generate_embeddings logs its own errors and returns (None, None) on failure
-                        if embedding_short_vector is None and embedding_full_vector is None:
-                            logging.warning(f"    OpenAI embedding generation resulted in None for both short and full embeddings.")
-                            # This is already logged by generate_embeddings, but we can note it here.
-                            # Depending on strictness, could set current_post_analysis_failed = True
-                    elif not openai_client:
-                        logging.warning("    Skipping OpenAI embeddings: OpenAI client not initialized or not configured.")
-                    else: # Text for embedding was empty
-                        logging.debug("    Skipping OpenAI embeddings: Text for embedding is empty after preparation.")
-                        # This case might not be a "failure" but rather a lack of input.
-
-                else: # full_content_markdown was empty or whitespace
-                    logging.warning(f"  -> Skipping AI analysis for '{title[:60]}...' because markdown content is empty or invalid.")
-                    current_post_analysis_failed = True # This counts as an analysis failure if content wasn't suitable
-
-                if current_post_analysis_failed:
+                # One structured call returns all analyses (see llm_common.analyze_content).
+                # Any failure means the post is NOT inserted: a transient error leaves the
+                # title out of both tables so the next run retries it; a content-filter
+                # rejection is recorded in skipped_posts so we stop retrying it.
+                if not full_content_markdown or full_content_markdown.isspace():
+                    logging.warning(f"  -> Skipping '{title[:60]}...': markdown content is empty. Recording skip.")
+                    record_skip(cur, post_id, title_norm, url); conn.commit()
+                    already_skipped.add(title_norm)
+                    total_skipped_by_record_count += 1
                     failed_analysis_count += 1
-                
-                logging.info(f"  -> AI analysis finished for '{title[:60]}...'. Summary: {'Yes' if sentence_summary else 'No'}, Cluster: {'Yes' if db_cluster else 'No'}, Embeddings: {'Yes' if embedding_short_vector else 'No'}")
+                    continue
+
+                try:
+                    analysis = analyze_content(title, full_content_markdown, tag_names)
+                except LLMContentFiltered as e:
+                    logging.warning(f"  -> Content filter blocked '{title[:60]}...': {e}. Recording skip.")
+                    record_skip(cur, post_id, title_norm, url); conn.commit()
+                    already_skipped.add(title_norm)
+                    total_skipped_by_record_count += 1
+                    failed_analysis_count += 1
+                    continue
+                except (LLMError, ValueError) as e:
+                    logging.error(f"  -> Analysis failed for '{title[:60]}...': {e}. Not inserted; will retry next run.")
+                    failed_analysis_count += 1
+                    continue
+
+                sentence_summary = analysis["sentence_summary"]
+                paragraph_summary = analysis["paragraph_summary"]
+                key_implication = analysis["key_implication"]
+                db_cluster = analysis["cluster_tag"]
+                db_tags = analysis["tags"]
+
+                embedding_short_vector, embedding_full_vector = generate_embeddings(
+                    title if title and title != 'N/A' else "",
+                    build_embedding_text(sentence_summary, paragraph_summary, key_implication, db_tags),
+                )
+                if embedding_short_vector is None or embedding_full_vector is None:
+                    logging.error(f"  -> Embedding generation failed for '{title[:60]}...'. Not inserted; will retry next run.")
+                    failed_analysis_count += 1
+                    continue
+
+                logging.info(f"  -> AI analysis finished for '{title[:60]}...'. Cluster: {db_cluster}, Tags: {db_tags}")
                 # --- End AI Analysis Block ---
 
                 # --- Extract other data ---
@@ -1522,6 +1398,7 @@ def main():
                 # --- Prepare data tuple for batch insertion ---
                 logging.debug(f"  -> Preparing data tuple for DB insertion for post ID {post_id}.")
                 # Ensure order matches DB_COLS
+                cleaned_title = None  # left NULL on insert; rewrite_titles.py --mode titles fills it (frontend/backend fall back to title)
                 data_tuple = (
                     url,                            # source_url
                     title,                          # title
@@ -1539,83 +1416,22 @@ def main():
                     comment_count,                  # comment_count (int)
                     db_cluster,                     # cluster_tag (AI generated cluster or None)
                     embedding_short_vector,         # embedding_short (list[float] or None)
-                    embedding_full_vector           # embedding_full (list[float] or None)
+                    embedding_full_vector,          # embedding_full (list[float] or None)
+                    cleaned_title,                  # cleaned_title (str or None)
                 )
-                batch_data.append(data_tuple)
-                posts_to_insert += 1 # Increment count for this batch
+                posts_to_insert += 1
 
-                # --- Insert in batches ---
-                if len(batch_data) >= BATCH_SIZE:
-                    logging.info(f"DB Batch Insert: Attempting to insert {len(batch_data)} posts...")
-                    try:
-                        # Use extras.execute_batch with ON CONFLICT
-                        extras.execute_batch(cur, INSERT_SQL, batch_data)
-                        committed_rows = len(batch_data) # Assume all rows were potentially affected
-                        conn.commit() # Commit after successful batch execution
-                        logging.info(f"DB Batch Insert: Successfully committed batch ({committed_rows} rows processed).")
-                        affected_rows_count += committed_rows # Use committed_rows
-                    except psycopg2.DatabaseError as e:
-                        logging.error(f"DB Batch Insert FAILED: {e}. Retrying {len(batch_data)} rows individually...")
-                        conn.rollback() # Rollback the failed batch
-                        # Retry rows individually
-                        individual_successes = 0
-                        for row_idx, row in enumerate(batch_data):
-                            row_title = row[1] # Get title from tuple for logging
-                            try:
-                                # execute_values expects a list of tuples
-                                extras.execute_values(cur, INSERT_SQL, [row])
-                                conn.commit() # Commit each successful individual insert
-                                logging.info(f"  -> DB Insert OK (Retry {row_idx+1}/{len(batch_data)}): '{row_title[:60]}...'")
-                                affected_rows_count += 1
-                                individual_successes += 1
-                            except psycopg2.DatabaseError as inner_e:
-                                logging.warning(f"  -> DB Insert FAILED (Retry {row_idx+1}/{len(batch_data)}): '{row_title[:60]}...' Error: {inner_e}. Skipping this row.")
-                                conn.rollback() # Rollback the failed individual insert
-                                total_failures += 1 # Count this as a failure
-                        logging.info(f"DB Individual Retry completed: {individual_successes} succeeded, {len(batch_data) - individual_successes} failed.")
-                    except Exception as e:
-                        logging.error(f"Unexpected error during batch execution: {e}")
-                        conn.rollback() # Rollback on unexpected errors
-                        total_failures += len(batch_data) # Increment total failures by batch size
-                        logging.error(f"Unexpected error caused failure for {len(batch_data)} rows in batch.")
-                    finally:
-                        batch_data = [] # Clear the batch list whether it succeeded or failed
-
-            # --- Insert any remaining posts in the last batch ---
-            if batch_data:
-                logging.info(f"DB Final Batch Insert: Attempting to insert {len(batch_data)} remaining posts...")
+                # --- Insert this post (one row per transaction) ---
                 try:
-                    extras.execute_batch(cur, INSERT_SQL, batch_data)
-                    committed_rows = len(batch_data)
-                    conn.commit() # Commit the final batch
-                    logging.info(f"DB Final Batch Insert: Successfully committed batch ({committed_rows} rows processed).")
-                    affected_rows_count += committed_rows
+                    cur.execute(INSERT_SQL, data_tuple)
+                    conn.commit()
+                    affected_rows_count += 1
+                    existing_titles.add(title_norm)
+                    logging.info(f"  -> DB insert OK: '{title[:60]}...'")
                 except psycopg2.DatabaseError as e:
-                    logging.error(f"DB Final Batch Insert FAILED: {e}. Retrying {len(batch_data)} rows individually...")
-                    conn.rollback() # Rollback the failed batch
-                    # Retry rows individually
-                    individual_successes = 0
-                    for row_idx, row in enumerate(batch_data):
-                        row_title = row[1] # Get title from tuple for logging
-                        try:
-                            # execute_values expects a list of tuples
-                            extras.execute_values(cur, INSERT_SQL, [row])
-                            conn.commit() # Commit each successful individual insert
-                            logging.info(f"  -> DB Insert OK (Final Retry {row_idx+1}/{len(batch_data)}): '{row_title[:60]}...'")
-                            affected_rows_count += 1
-                            individual_successes += 1
-                        except psycopg2.DatabaseError as inner_e:
-                            logging.warning(f"  -> DB Insert FAILED (Final Retry {row_idx+1}/{len(batch_data)}): '{row_title[:60]}...' Error: {inner_e}. Skipping this row.")
-                            conn.rollback() # Rollback the failed individual insert
-                            total_failures += 1 # Count this as a failure
-                    logging.info(f"DB Final Individual Retry completed: {individual_successes} succeeded, {len(batch_data) - individual_successes} failed.")
-                except Exception as e:
-                    logging.error(f"Unexpected error during final batch execution: {e}")
+                    logging.error(f"  -> DB insert FAILED for '{title[:60]}...': {e}")
                     conn.rollback()
-                    total_failures += len(batch_data) # Increment total failures by batch size
-                    logging.error(f"Unexpected error caused failure for {len(batch_data)} rows in final batch.")
-                finally:
-                    batch_data = [] # Clear list
+                    total_failures += 1
 
     except psycopg2.OperationalError as e:
         logging.critical(f"FATAL: Database connection failed: {e}")
@@ -1650,4 +1466,47 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Substack AI Safety Feed Scraper - Fetch and analyze Substack posts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Normal mode - fetch new posts:
+  python substack_query.py
+  
+  # Backfill mode - re-analyze existing posts missing analysis:
+  python substack_query.py --backfill
+  
+  # Backfill with custom batch size:
+  python substack_query.py --backfill --batch-size 20
+        """
+    )
+    
+    parser.add_argument(
+        '--backfill',
+        action='store_true',
+        help='Backfill missing analysis for existing Substack posts instead of fetching new posts'
+    )
+    
+    parser.add_argument(
+        '--limit',
+        type=int,
+        default=None,
+        help='Process at most N new posts (canary runs)'
+    )
+
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=10,
+        help='Number of posts to process in backfill mode (default: 10)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Run in appropriate mode
+    if args.backfill:
+        backfill_missing_analysis(batch_size=args.batch_size)
+    else:
+        main(limit=args.limit)

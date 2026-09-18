@@ -57,7 +57,7 @@ print("Checking environment variables...")
 ARXIV_QUERY_TERM         = os.environ.get("ARXIV_QUERY_TERM", "ai safety")
 ARXIV_MAX_RESULTS        = 4            # per user request
 ARXIV_MIN_AGE_DAYS       = int(os.environ.get("ARXIV_MIN_AGE_DAYS", "30"))  # Default: 30 days
-ARXIV_API_URL           = "http://export.arxiv.org/api/query"
+ARXIV_API_URL           = "https://export.arxiv.org/api/query"
 S2_API_URL               = "https://api.semanticscholar.org/graph/v1"
 S2_API_KEY               = os.environ.get("SEMANTIC_SCHOLAR_API_KEY")
 
@@ -155,17 +155,20 @@ def fetch_arxiv_entries(query_term: str, max_results: int = 25, min_age_days: in
         max_results: Maximum number of results to return
         min_age_days: Minimum age in days for papers (default 30 days)
     """
-    # Calculate the cutoff date (papers must be older than this)
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=min_age_days)
-    # ArXiv date format: YYYYMMDDTTTT where TTTT is HHMM in 24-hour format GMT
-    cutoff_str = cutoff_date.strftime("%Y%m%d%H%M")
-    
-    # Build query with date range - papers submitted before the cutoff date
-    # ArXiv date format: [* TO YYYYMMDDTTTT] for papers from beginning of time to cutoff
-    search_query = f'all:"{query_term}" AND submittedDate:[* TO {cutoff_str}]'
-    logging.info(f"→ ArXiv search: '{query_term}' (excluding papers newer than {min_age_days} days)")
-    
-    url = f"{ARXIV_API_URL}?search_query={quote_plus(search_query)}&sortBy=submittedDate&sortOrder=descending&max_results={max_results}"
+
+    # ArXiv's submittedDate filter is brittle and has been returning 500s.
+    # Fetch a wider recent window and apply the age cutoff locally instead.
+    fetch_results = max(max_results * 10, 25)
+    search_query = f'all:"{query_term}"'
+    logging.info(
+        f"→ ArXiv search: '{query_term}' (fetch {fetch_results}, exclude papers newer than {min_age_days} days client-side)"
+    )
+
+    url = (
+        f"{ARXIV_API_URL}?search_query={quote_plus(search_query)}"
+        f"&sortBy=submittedDate&sortOrder=descending&max_results={fetch_results}"
+    )
     
     # Add retry logic for connection errors
     max_retries = 3
@@ -190,12 +193,33 @@ def fetch_arxiv_entries(query_term: str, max_results: int = 25, min_age_days: in
                     logging.error("→ Zero entries returned due to parse error")
                 raise RuntimeError(f"ArXiv feed parse error: {feed.bozo_exception}")
             
-            logging.info(f"→ Retrieved {len(feed.entries)} entries from ArXiv")
+            logging.info(f"→ Retrieved {len(feed.entries)} entries from ArXiv before age filtering")
+
+            eligible_entries = []
+            skipped_too_new = 0
+            for entry in feed.entries:
+                published_dt = iso_to_dt(entry.published) if hasattr(entry, "published") else None
+                updated_dt = iso_to_dt(entry.updated) if hasattr(entry, "updated") else None
+                entry_dt = published_dt or updated_dt
+                if entry_dt is None:
+                    logging.debug("→ Entry missing published/updated date; keeping for downstream validation")
+                    eligible_entries.append(entry)
+                elif entry_dt <= cutoff_date:
+                    eligible_entries.append(entry)
+                else:
+                    skipped_too_new += 1
+
+                if len(eligible_entries) >= max_results:
+                    break
+
+            logging.info(
+                f"→ Kept {len(eligible_entries)} entries after age filtering ({skipped_too_new} newer papers skipped)"
+            )
             
             # Honor ArXiv rate-limit: sleep after each call
             time.sleep(3)
             
-            return feed.entries
+            return eligible_entries
             
         except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
             if attempt < max_retries - 1:
@@ -329,7 +353,7 @@ def enrich_with_semanticscholar(batch: List[str]) -> Dict[str, Any]:
 #                          Gemini Helpers
 # ================================================================
 
-def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-17") -> str: # Updated to match example model
+def call_gemini_api(prompt: str, model_name: str = "gemini-3.8-flash") -> str:
     """
     Utility wrapper around the Gemini API.
 
@@ -374,12 +398,9 @@ def call_gemini_api(prompt: str, model_name: str = "gemini-2.5-flash-preview-04-
 
         return result
 
-    except types.generation_types.BlockedPromptException as e: # Fixed: use types instead of gtypes
-        logging.error(f"Gemini API call failed due to blocked prompt: {e}")
-        return "Error: Analysis blocked due to prompt content."
-    except types.generation_types.StopCandidateException as e: # Fixed: use types instead of gtypes
-        logging.error(f"Gemini API call failed due to stop candidate: {e}")
-        return "Error: Analysis stopped unexpectedly by the model."
+    except Exception as e:
+        logging.error(f"Unexpected error during Gemini API call: {e}", exc_info=True)
+        return f"Error: {e}"
     except Exception as e:
         logging.error(f"Unexpected error during Gemini API call: {e}", exc_info=True)
         return f"Error during analysis: {e}"

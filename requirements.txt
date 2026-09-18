@@ -1,24 +1,26 @@
-# Core dependencies
-openai>=1.3.8
-numpy>=1.21.0
+# --- Scrapers + post-processing (ea_lw_query, substack_query, podcast_query,
+#     novelty_analysis, rewrite_titles, backfill_*) ---
+openai>=1.97.0            # AzureOpenAI + structured outputs; 1.97.1 is the tested version
+google-genai>=2.23.0      # Gemini: transcription, classifier, summary backfill, images; 2.23.0 tested
 tenacity>=8.0.0
+python-dotenv>=0.19.0
+requests>=2.31.0
+feedparser>=6.0.0
+beautifulsoup4>=4.12.0
+markdownify>=0.11.0
+psycopg2-binary>=2.9.0
+pgvector>=0.2.0
+numpy>=1.21.0
+cloudinary
+Pillow
 
-# BERTopic and topic modeling
+# --- Twitter scraper ---
+twscrape
+
+# --- embedding_analysis.py (one-off topic modelling; optional) ---
 bertopic>=0.15.0
 umap-learn>=0.5.3
 hdbscan>=0.8.29
 scikit-learn>=1.0.0
-
-# Database (for backfill script)
-psycopg2-binary>=2.9.0
-
-# Optional but recommended for visualization
 plotly>=5.0.0
 matplotlib>=3.5.0
-
-# For handling environment variables (optional)
-python-dotenv>=0.19.0
-
-assemblyai
-cloudinary
-Pillow 

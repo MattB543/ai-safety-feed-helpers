@@ -2,16 +2,16 @@
 Ingest podcast episodes from various RSS feeds relevant to AI Safety
 into the `content` table of the AI-Safety-Feed database.
 
-This script fetches episodes via RSS, attempts to transcribe audio using
-AssemblyAI if an audio URL is present, and falls back to HTML show notes
-if transcription fails or is unavailable. It filters episodes based on date
+This script fetches episodes via RSS, transcribes audio with Gemini
+(gemini_transcribe.py, Files API) if an audio URL is present, and falls back
+to HTML show notes if transcription fails or is unavailable. It filters episodes based on date
 and an AI safety guardrail, performs analysis (summarization, implication
-identification, clustering/tagging using OpenAI GPT-4o; embeddings using OpenAI)
+identification, clustering/tagging via Azure OpenAI chat; embeddings via OpenAI)
 on the available content (transcript preferred), and inserts the processed
 data into a PostgreSQL database, handling duplicates based on normalized titles.
 
-*** MODIFIED: Google Cloud Storage and Speech-to-Text transcription code REMOVED. ***
-***           AssemblyAI transcription ADDED. HTML show notes used as fallback.   ***
+LLM analysis (one structured call per episode), the relevance gate and
+embeddings live in llm_common.py and are shared with the other scrapers.
 """
 
 # ================================================================
@@ -36,15 +36,37 @@ from psycopg2 import OperationalError as Psycopg2OpError # Alias for clarity
 from pgvector.psycopg2 import register_vector # <-- ADDED for pgvector
 from dotenv import load_dotenv
 
-# --- AI/ML Libs ---
-from openai import OpenAI, APIError as OpenAI_APIError, RateLimitError as OpenAI_RateLimitError
-import assemblyai as aai # <-- ADDED
-from assemblyai import TranscriptStatus # <-- ADDED
+# --- AI/ML helpers (shared) ---
+from llm_common import (
+    LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
+    generate_embeddings, is_ai_safety_content, check_llm_or_exit,
+)
+from gemini_transcribe import transcribe_audio_gemini, gemini_transcription_configured
 
 # ================================================================
 #                      Environment & Setup
 # ================================================================
-load_dotenv()  # Load .env BEFORE using env vars
+load_dotenv(override=True)  # Load .env BEFORE using env vars, override OS environment
+
+LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
+
+def disable_unreachable_local_proxies() -> None:
+    """
+    Disable loopback proxy env vars that can break feed/API requests.
+    Keeps non-local proxy settings untouched.
+    """
+    proxy_keys = (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    )
+    removed = []
+    for key in proxy_keys:
+        value = os.environ.get(key)
+        if value and LOCAL_PROXY_RE.match(value.strip()):
+            os.environ.pop(key, None)
+            removed.append(f"{key}={value}")
+    if removed:
+        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, # Changed default to INFO
@@ -56,398 +78,39 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("feedparser").setLevel(logging.INFO) # Allow feedparser info logs
+disable_unreachable_local_proxies()
 
 
 # --- Essential Environment Variables ---
-DATABASE_URL   = os.environ.get("AI_SAFETY_FEED_DB_URL")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY") # <-- ADDED
-
-# --- Initial Checks ---
+DATABASE_URL = os.environ.get("AI_SAFETY_FEED_DB_URL")
 if not DATABASE_URL:
     logging.critical("CRITICAL ERROR: AI_SAFETY_FEED_DB_URL environment variable not set. Cannot connect to database.")
     sys.exit(1)
-if not OPENAI_API_KEY:
-    logging.critical("CRITICAL ERROR: OPENAI_API_KEY environment variable not set. Cannot generate embeddings.")
-    sys.exit(1)
-if not ASSEMBLYAI_API_KEY: # <-- ADDED Check
-    # Make this a warning, not critical, as HTML fallback exists
-    logging.warning("WARNING: ASSEMBLYAI_API_KEY environment variable not set. Audio transcription will be skipped.")
+check_llm_or_exit(embeddings=True)  # env check + one preflight call; aborts on a bad deployment/key
 
-
-# --- Initialize API Clients ---
-logging.info("Initializing API clients...")
-openai_client = None
-# AssemblyAI configuration (done globally)
-assemblyai_configured = False #
-if ASSEMBLYAI_API_KEY:
-    try:
-        aai.settings.api_key = ASSEMBLYAI_API_KEY
-        assemblyai_configured = True
-        logging.info("AssemblyAI client configured.")
-    except Exception as e:
-        logging.error(f"Error configuring AssemblyAI: {e}. Transcription will be disabled.")
-        ASSEMBLYAI_API_KEY = None # Ensure it's None if config fails
-else:
-    logging.info("AssemblyAI transcription skipped (no API key).")
-
-try:
-    # Initialize OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    logging.info("OpenAI client initialized.")
-
-
-except Exception as e:
-    logging.critical(f"CRITICAL ERROR initializing API clients (OpenAI): {e}", exc_info=True)
-    # Decide if script should exit if *any* client fails
-    sys.exit(1) # Exit if essential clients fail
-
-logging.info("API client initialization complete.")
+# Transcription (Gemini) is optional: without GEMINI_API_KEY we fall back to show notes.
+transcription_configured = gemini_transcription_configured()
+if not transcription_configured:
+    logging.warning("GEMINI_API_KEY not set: audio transcription disabled, show notes will be used instead.")
 
 # ================================================================
-#    OpenAI Chat Helper  (replaces call_gemini_api)
+#    Relevance gate (shared implementation in llm_common)
 # ================================================================
 
-def call_gpt_api(prompt: str,
-                 model: str = "gpt-4.1",      # GPT-4.1 public name
-                 temperature: float = 0.2) -> str:
+def is_ai_safety_post(title: str, html_body: str) -> Optional[bool]:
     """
-    Sends a single-prompt exchange to OpenAI ChatCompletions and
-    returns the content string. Raises exceptions on failure.
-    
-    Raises:
-        ValueError: If OpenAI client not initialized or API returns no content
-        OpenAI_APIError: For OpenAI API errors
-        OpenAI_RateLimitError: For OpenAI rate limit errors
-        Exception: For other unexpected errors
+    Fast yes/no guard-rail on the episode title + show notes.
+    Returns True/False from the model, or None when the model could not be
+    reached (the caller must then neither ingest nor record a skip).
     """
-    if not openai_client:
-        raise ValueError("OpenAI client not initialized")
-
-    try:
-        response = openai_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system",
-                 "content": "You are a helpful assistant specialised in AI-safety content analysis."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=temperature)
-        
-        # Check if choices is not empty and message content exists
-        if response.choices and response.choices[0].message and response.choices[0].message.content:
-            return response.choices[0].message.content.strip()
-        else:
-            raise ValueError("OpenAI API returned no content or unexpected response structure")
-            
-    except (OpenAI_APIError, OpenAI_RateLimitError) as e:
-        logging.error(f"OpenAI API error: {e}")
-        raise
-    except Exception as e:
-        logging.error(f"Unexpected error during OpenAI API call: {e}", exc_info=True)
-        raise
-
-# ---------- Specific Analysis Functions ----------
-
-def summarize_text(text_to_summarize: str) -> str:
-    """Generates a concise 1-2 sentence summary using the OpenAI GPT model."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        logging.info("Skipping sentence summary: Input content was empty.")
-        return "Content was empty."
-    
-    prompt = f"Summarize the following AI safety content in 2 concise sentences (maximum 50 words). Focus on the core argument, key insight, or main conclusion rather than methodology. Use clear, accessible language while preserving technical accuracy. The summary should be very readable and should help readers quickly understand what makes this content valuable or interesting and decide if they want to read more.\n\nContent to summarize:\n{text_to_summarize}"
-    
-    try:
-        return call_gpt_api(prompt)
-    except Exception as e:
-        logging.warning(f"Sentence summary failed: {type(e).__name__}: {e}")
-        return None
-
-def generate_paragraph_summary(text_to_summarize: str) -> str:
-    """Generates a structured paragraph summary using the OpenAI GPT model."""
-    if not text_to_summarize or text_to_summarize.isspace():
-        logging.info("Skipping paragraph summary: Input content was empty.")
-        return "Content was empty."
-    
-    prompt = f"""
-Generate a structured summary of the following AI safety content so the reader can quickly understand the main points. The summary should consist of:
-
-1. A brief 1-sentence introduction highlighting the main point.
-2. 3-5 bullet points covering key arguments, evidence, or insights. Format EACH bullet point as:
-   * **Key concept or term**: Explanation or elaboration of that point.
-3. A brief 1-sentence conclusion with the author's recommendation or final thoughts.
-
----
-
-Rules:
-- Make each bullet point concise (1 sentence) and focus on one distinct idea.
-- Bold only the key concept at the start of each bullet, not entire sentences.
-- This format should help readers quickly scan and understand the core content.
-- Only output the summary itself (don't include 'Summary:' or anything else).
-- Use markdown to format the bullet points and to improve readability with bolding and italics.
-- Include a double line break after the introduction and before the conclusion.
-
-Content to summarize:
-{text_to_summarize}
-"""
-    
-    try:
-        return call_gpt_api(prompt)
-    except Exception as e:
-        logging.warning(f"Paragraph summary failed: {type(e).__name__}: {e}")
-        return None
-
-def generate_key_implication(text_to_analyze: str) -> str:
-    """Identifies the single most important logical consequence using the OpenAI GPT model."""
-    if not text_to_analyze or text_to_analyze.isspace():
-        logging.info("Skipping key implication: Input content was empty.")
-        return "Content was empty."
-    
-    prompt = f"""
-Based on the AI safety content below, identify the single most important logical consequence or implication in one concise sentence (25-35 words). Focus on:
-
-- What change in thinking, strategy, or priorities follows from accepting this content's conclusions
-- How this might alter our understanding of AI safety or governance approaches
-- A specific actionable insight rather than a general statement of importance
-- The "so what" that would matter to an informed AI safety community member
-
-The implication should represent a direct consequence of the content's argument, not simply restate the main point.
-
-Content to analyze:
-{text_to_analyze}
-"""
-    
-    try:
-        return call_gpt_api(prompt)
-    except Exception as e:
-        logging.warning(f"Key implication generation failed: {type(e).__name__}: {e}")
-        return None
-
-def generate_cluster_tag(title: str, tags_list: List[str], content_markdown: str) -> Dict[str, Any]:
-    """
-    Generates a cluster and canonical tags using the OpenAI GPT model.
-    Returns: dict: Parsed JSON or {"error": "Reason string"}.
-    """
-    if not content_markdown or content_markdown.isspace():
-        logging.info("Skipping cluster tag generation: Input content was empty.")
-        return {"error": "Input content was empty."}
-
-    def remove_parentheses(text: str) -> str:
-        """Remove everything in parentheses and the parentheses themselves."""
-        if not text:
-            return text
-        # Use regex to remove parentheses and their contents
-        cleaned = re.sub(r'\s*\([^)]*\)\s*', '', text)
-        # Clean up any extra whitespace
-        return cleaned.strip()
-
-    prompt = f"""
-You are the "AI-Safety-Tagger"—an expert taxonomist for an AI-safety news feed.
-
----  TASK  ---
-Given one blog-style post, do BOTH of the following:
-
-1. **Pick exactly one "Cluster"** that best captures the *main theme*
-   (see the list of Clusters below).
-
-2. **Choose 1 to 4 "Canonical Tags"** from the same list that most precisely
-   describe the post.
-   • Tags *must* come from the taxonomy.
-   • Prefer the most specific tags that materially help the reader; skip
-     generic or redundant ones.
-   • A tag may be selected even if it appears only in the "Synonyms"
-     column—use its Canonical form in your answer.
-
-Return your answer as valid JSON, with this schema:
-
-{{
-  "cluster": "<one Cluster name>",
-  "tags": ["<Canonical tag 1>", "... up to 4"]
-}}
-
-Do not output anything else.
-
---- INPUT ---
-
-Title:
-{title}
-
-Original author-supplied tags (may be noisy or missing):
-{tags_list}
-
-Markdown body:
-{content_markdown}
-
---- TAXONOMY ---
-
-The format is:
-• Cluster
-- Canonical tag (Synonyms; separated by "")
-
-• Core AI Safety & Alignment
-- AI alignment (Human alignment)
-- Existential risk (X-risk)
-- Threat models (AI) (AI threat models)
-- Interpretability (Interpretability (ML & AI); Transparency)
-- Inner alignment
-- Outer alignment
-- Deceptive alignment
-- Eliciting latent knowledge (ELK)
-- Robustness (Adversarial robustness)
-- Alignment field-building (AI alignment field-building)
-- Value learning (Preference learning; Alignment via human values)
-
-• AI Governance & Policy
-- AI governance (GovAI)
-- Compute governance (GPU export controls; Chip governance)
-- AI regulation (Regulation)
-- Standards & auditing (Safety standards; Red-teaming)
-- Responsible scaling (Scaling policies; RSF)
-- International coordination (Geopolitics)
-- Slowing down AI (Slow takeoff; Pause AI)
-- Open-source models (Open-source LLMs)
-- Policy (Public policy (generic))
-- Compute controls (Hardware throttling)
-
-• Technical ML Safety
-- Reinforcement learning (RL)
-- Human feedback (RLHF; RLAIF)
-- Model editing (Model surgery)
-- Scalable oversight (Debate; Tree-of-thought)
-- CoT alignment (CoT alignment)
-- Scaling laws
-- Benchmarks & evals
-- Mechanistic interpretability
-- Value decomposition (Shard theory)
-
-• Forecasting & World Modeling
-- World modeling
-- Forecasting (Quantitative forecasting)
-- Prediction markets
-
-• Biorisk & Other GCRs
-- Biorisk (Biosecurity; Pandemic preparedness)
-- Nuclear risk (Nuclear war; Nuclear winter)
-- Global catastrophic risk (GCR)
-
-• Effective Altruism & Meta
-- Cause prioritization
-- Effective giving
-- Career choice (Career planning)
-- Community building (Building effective altruism)
-- Field-building (AI)
-- Epistemics & rationality (Rationality)
-
-• Philosophy & Foundations
-- Decision theory (CDT; EDT; UDT)
-- Moral uncertainty
-- Population ethics
-- Agent foundations (Agent foundations research)
-- Value drift
-- Info hazards (Information hazards)
-
-• Org-specific updates
-- Anthropic
-- OpenAI
-- DeepMind
-- Meta
-- ARC (Alignment Research Center)
-
----
-
-Remember: return only JSON with "cluster" and "tags".
-"""
-    
-    try:
-        raw_response = call_gpt_api(prompt)
-        # Try to parse the response as JSON
-        json_response = json.loads(raw_response)
-        # Basic validation
-        if not isinstance(json_response, dict):
-            return {"error": "Response was not a JSON object"}
-        if "cluster" not in json_response or "tags" not in json_response:
-            return {"error": "Response missing required fields"}
-        if not isinstance(json_response["tags"], list):
-            return {"error": "Tags field was not a list"}
-        
-        # Clean parentheses from cluster and tags
-        if json_response.get("cluster"):
-            json_response["cluster"] = remove_parentheses(json_response["cluster"])
-        
-        if json_response.get("tags") and isinstance(json_response["tags"], list):
-            json_response["tags"] = [remove_parentheses(tag) for tag in json_response["tags"] if tag]
-        
-        # Return the cleaned response
-        return json_response
-    except (ValueError, OpenAI_APIError, OpenAI_RateLimitError) as e:
-        logging.warning(f"Cluster/tag generation failed: {type(e).__name__}: {e}")
-        return {"error": f"API error: {type(e).__name__}"}
-    except json.JSONDecodeError as e:
-        logging.error(f"Failed to parse cluster/tag JSON response: {e}")
-        return {"error": f"JSON parse error: {str(e)}"}
-    except Exception as e:
-        logging.error(f"Unexpected error processing cluster/tag response: {e}")
-        return {"error": f"Processing error: {type(e).__name__}"}
-
-def is_ai_safety_post(title: str, html_body: str) -> bool:
-    """
-    Fast yes/no guard-rail: returns True iff the post's title and content
-    are sufficiently focused on AI safety topics to be included in the feed.
-    Uses OpenAI's GPT-4o-mini model for fast classification.
-    """
-    if not openai_client:
-        logging.warning("AI safety guard-rail check skipped: OpenAI client not initialized. Defaulting to True (fail-open).")
-        return True
-
-    # Clean and extract text from HTML if present
     text_content = ""
     if html_body:
         try:
-            soup = BeautifulSoup(html_body, 'html.parser')
-            text_content = soup.get_text(separator=' ', strip=True)
+            text_content = BeautifulSoup(html_body, 'html.parser').get_text(separator=' ', strip=True)
         except Exception as e:
             logging.warning(f"Failed to extract text from HTML: {e}")
-            text_content = html_body  # Fall back to raw HTML
-
-    # Prepare content for analysis (first ~500 chars of text + title)
-    analysis_text = f"Title: {title}\n\nContent excerpt: {text_content[:500]}..."
-
-    prompt = f"""
-Analyze this podcast episode's title and content excerpt to determine if it is sufficiently focused on AI safety topics to be included in an AI safety content feed.
-
-Content to analyze:
-{analysis_text}
-
-Rules for inclusion:
-1. The content must substantially discuss AI safety, AI alignment, AI governance, AI policy, etc.
-2. Very general AI/ML technical content is NOT sufficient - there must be a clear safety/ethics/governance/etc. angle.
-3. Brief mentions of AI safety in otherwise unrelated content is NOT sufficient.
-
-Respond with ONLY "yes" or "no". Use "yes" if you are reasonably confident the content meets the criteria, otherwise use "no".
-"""
-    
-    try:
-        response = call_gpt_api(
-            prompt=prompt,
-            model="gpt-4.1",  # Use the fast model for this guardrail
-            temperature=0.1   # Low temperature for more consistent yes/no
-        )
-        
-        # Clean and validate response
-        response = response.strip().lower()
-        is_relevant = response == "yes"
-
-        # Log the decision
-        if is_relevant:
-            logging.debug(f"Guard-rail: Content accepted as AI safety relevant.")
-        else:
-            logging.info(f"Guard-rail: Content rejected as not sufficiently AI safety focused.")
-
-        return is_relevant
-        
-    except Exception as e:
-        logging.warning(f"AI safety guard-rail check failed: {type(e).__name__}: {e}. Defaulting to True (fail-open).")
-        return True
+            text_content = html_body
+    return is_ai_safety_content(title, text_content[:1500], kind="podcast episode")
 
 # ================================================================
 #                         Constants
@@ -456,8 +119,10 @@ Respond with ONLY "yes" or "no". Use "yes" if you are reasonably confident the c
 
 # Ingest only posts published on/after this date (UTC, inclusive)
 CUTOFF_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
-# MODIFIED: Target 2 successful insertions per feed
-TARGET_INSERTIONS_PER_FEED = 2
+# Successful insertions per feed per run (a cost cap; raise via env once Gemini transcription cost is acceptable)
+TARGET_INSERTIONS_PER_FEED = int(os.environ.get("PODCAST_MAX_INSERTS_PER_FEED", "2"))
+# Process only the first N feeds (canary runs); None = all
+MAX_FEEDS = None
 # Safety limit: Max posts to *check* per feed if target not reached
 MAX_POSTS_PER_FEED = 100
 
@@ -469,6 +134,7 @@ SOURCE_FEEDS = {
     "https://axrp.net/feed.xml": "AXRP",
     "https://anchor.fm/s/1e4a0eac/podcast/rss": "Machine Learning Street Talk",
     "https://futureoflife.org/podcast/feed/": "FLI Podcast",
+    # NOTE: subscriber feed; currently returns HTML (token expired?). Refresh the uid from your account.
     "https://samharris.org/subscriber-rss/?uid=PNIypzHCbq78upz": "Making Sense with Sam Harris",
     "https://lexfridman.com/feed/podcast/": "Lex Fridman Podcast",
     "https://anchor.fm/s/ebbe3a98/podcast/rss": "For Humanity: An AI Safety Podcast",
@@ -476,12 +142,13 @@ SOURCE_FEEDS = {
     "http://feeds.libsyn.com/182816/rss": "Alignment Newsletter Podcast",
     "https://www.machine-ethics.net/itunes-rss-feed/": "Machine Ethics Podcast",
     "https://feeds.transistor.fm/intoaisafety": "Into AI Safety",
-    "https://feeds.buzzsprout.com/2210416.rss": "Center for AI Policy Podcast",
+    # Center for AI Policy Podcast: official feed (feed.podbean.com/aipolicyus/feed.xml) returns 410 Gone
+    # as of 2026-09; the show appears discontinued. Re-add if it resurfaces.
     "https://pinecast.com/feed/hear-this-idea": "Hear This Idea",
     "https://feeds.libsyn.com/539322/rss": "AI Governance Podcast",
-    "https://pod.link/1526725061.rss": "TechTank Podcast",
-    "https://feeds.simplecast.com/9YNI3WaL": "Your Undivided Attention",
-    "https://feeds.buzzsprout.com/2172898.rss": "Cognitive Revolution",
+    "https://feeds.acast.com/public/shows/5f2827aa17f940498f691817": "TechTank Podcast",
+    "https://feeds.simplecast.com/rZ0cYk12": "Your Undivided Attention",
+    "https://feeds.megaphone.fm/RINTP3108857801": "Cognitive Revolution",
 }
 
 # ================================================================
@@ -498,6 +165,7 @@ DB_COLS = (
     "comment_count", "cluster_tag",
     "embedding_short", "embedding_full", 
     "audio_url",
+    "cleaned_title",
 )
 NUM_DB_COLS = len(DB_COLS)
 
@@ -513,7 +181,7 @@ ON CONFLICT (title_norm) DO NOTHING;
 SKIP_INSERT_SQL = """
 INSERT INTO skipped_posts (post_id, title_norm, source_url)
 VALUES (%s, %s, %s)
-ON CONFLICT (title_norm) DO NOTHING;
+ON CONFLICT DO NOTHING;
 """
 
 def record_skip(cur, post_id: str, title_norm: str, source_url: Optional[str]):
@@ -540,6 +208,12 @@ def normalise_title(title: str) -> str:
     # 3. Strip leading/trailing whitespace
     normalized = normalized.strip()
     return normalized
+
+def clean_title_for_storage(title: Optional[str]) -> Optional[str]:
+    """Create a stable display-safe title variant for the cleaned_title column."""
+    if not title:
+        return None
+    return re.sub(r'\s+', ' ', title).strip()
 
 def iso_to_dt(iso_string: Optional[str]) -> Optional[datetime]:
     """Converts ISO 8601 string to timezone-aware datetime object (UTC)."""
@@ -577,137 +251,6 @@ def get_hostname_from_url(url: str) -> Optional[str]:
     except Exception as e:
         logging.warning(f"Could not parse hostname from URL '{url}': {e}")
         return None
-
-# ================================================================
-#                  AssemblyAI Transcription Helper
-# ================================================================
-
-def transcribe_audio_assemblyai(audio_url: str, entry_title: str) -> Optional[str]:
-    """
-    Transcribes audio from a URL using AssemblyAI.
-
-    Args:
-        audio_url: The public URL of the audio file.
-        entry_title: The title of the entry (for logging).
-
-    Returns:
-        The transcribed text as a string, or None if transcription fails,
-        is skipped, or the URL is invalid.
-    """
-    # Check if AssemblyAI was configured successfully during startup
-    if not assemblyai_configured:
-        logging.info(f"Skipping AssemblyAI transcription for '{entry_title[:50]}...': Client not configured.")
-        return None
-    if not audio_url:
-        logging.debug(f"Skipping AssemblyAI transcription for '{entry_title[:50]}...': No audio URL provided.")
-        return None
-
-    # Basic URL validation
-    if not urlparse(audio_url).scheme in ['http', 'https']:
-         logging.warning(f"Skipping AssemblyAI transcription for '{entry_title[:50]}...': Invalid audio URL scheme ({audio_url[:60]}...).")
-         return None
-
-    logging.info(f"  Attempting AssemblyAI transcription for '{entry_title[:50]}...' (URL: {audio_url[:60]}...)")
-    start_transcribe_time = time.time()
-
-    try:
-        # Configure transcription options
-        # You can add more options here like speaker_labels=True, auto_highlights=True etc.
-        config = aai.TranscriptionConfig(
-            speech_model=aai.SpeechModel.best # Use 'best' for higher accuracy, 'nano' for speed/cost
-            # speaker_labels=True # Uncomment if you want speaker diarization
-        )
-        transcriber = aai.Transcriber(config=config)
-
-        # The transcribe method with a URL handles polling for completion
-        transcript = transcriber.transcribe(audio_url)
-
-        duration = time.time() - start_transcribe_time
-
-        # --- Check Transcript Status ---
-        if transcript.status == TranscriptStatus.error.value:
-            logging.error(f"  AssemblyAI transcription FAILED for '{entry_title[:50]}...' after {duration:.2f}s. Error: {transcript.error}")
-            return None
-        elif transcript.status == TranscriptStatus.completed.value:
-            logging.info(f"  AssemblyAI transcription SUCCEEDED for '{entry_title[:50]}...' in {duration:.2f}s. Transcript length: {len(transcript.text or '')} chars.")
-
-            # --- Optional: Format with Speaker Labels ---
-            # if config.speaker_labels and transcript.utterances:
-            #     formatted_text = "\\n".join(
-            #         f"Speaker {u.speaker}: {u.text}" for u in transcript.utterances
-            #     )
-            #     return formatted_text
-            # else:
-            #     return transcript.text # Return plain text if no speaker labels or utterances
-
-            return transcript.text # Return the plain text transcript
-
-        else:
-            # Handle unexpected statuses (queued, processing - though SDK should wait)
-            logging.warning(f"  AssemblyAI transcription for '{entry_title[:50]}...' finished with unexpected status: {transcript.status} after {duration:.2f}s.")
-            return None
-
-    except aai.ApiError as e:
-        # Handle AssemblyAI specific API errors (auth, rate limits, etc.)
-        logging.error(f"  AssemblyAI API error during transcription for '{entry_title[:50]}...': {e}", exc_info=False) # Keep log cleaner
-        logging.debug(f"AssemblyAI API error details", exc_info=True) # Full trace in debug
-        return None
-    except Exception as e:
-        # Catch potential network errors, timeouts, SDK issues etc.
-        logging.error(f"  Unexpected error during AssemblyAI transcription for '{entry_title[:50]}...': {type(e).__name__} - {e}", exc_info=True)
-        return None
-
-# ================================================================
-#                     OpenAI Embedding Helper
-# ================================================================
-
-def generate_embeddings(short_text: str, full_text: str, model="text-embedding-3-small") -> tuple[list[float] | None, list[float] | None]:
-    """
-    Generates short and full embeddings for the given texts using OpenAI.
-
-    Args:
-        short_text: Text to embed for the 'short' version (e.g., title).
-        full_text: Text to embed for the 'full' version (e.g., title + summaries).
-        model: The OpenAI embedding model to use.
-
-    Returns:
-        A tuple containing (embedding_short, embedding_full).
-        Returns (None, None) if the client is not available or if API call fails.
-    """
-    if not openai_client:
-        logging.warning("OpenAI client not initialized. Skipping embedding generation.")
-        return None, None
-
-    # Ensure inputs are strings, even if empty
-    short_text = short_text or ""
-    full_text = full_text or ""
-
-    # Avoid API call if both inputs are effectively empty
-    if not short_text.strip() and not full_text.strip():
-        logging.debug("Skipping embedding generation: Both short and full texts are empty.")
-        return None, None
-
-    try:
-        logging.debug(f"  -> Generating OpenAI embeddings using model '{model}'...")
-        response = openai_client.embeddings.create(
-            model=model,
-            input=[short_text, full_text] # Send both texts in one request
-        )
-        # response.data should contain two embedding objects
-        if len(response.data) == 2:
-            embedding_short = response.data[0].embedding
-            embedding_full = response.data[1].embedding
-            logging.debug(f"  -> OpenAI embeddings generated successfully.")
-            return embedding_short, embedding_full
-        else:
-            logging.warning(f"Unexpected number of embeddings received from OpenAI API: {len(response.data)}")
-            return None, None
-    except (OpenAI_APIError, OpenAI_RateLimitError) as e:
-        logging.error(f"OpenAI API error during embedding generation: {e}")
-        return None, None
-    except Exception as e:
-        logging.error(f"Unexpected error during OpenAI embedding generation: {e}", exc_info=True)
-        return None, None
 
 # ================================================================
 #                      Feed Fetching Iterator
@@ -768,11 +311,20 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         return # Stop iteration if no entries
 
     logging.info(f"Found {len(feed_data.entries)} entries in feed '{source_name}'.")
+    feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
+    significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
+    if feed_title and significant and not any(w in feed_title.lower() for w in significant):
+        logging.warning(f"FEED MISMATCH: configured '{source_name}' but the feed calls itself '{feed_title}' ({feed_url}). The feed may have moved.")
 
     for i, entry in enumerate(feed_data.entries):
         # --- Basic Data Extraction ---
         title = entry.get("title", "").strip()
-        link = entry.get("link", "").strip()
+        link = (entry.get("link") or "").strip()
+        audio_url = extract_audio_url(entry)
+        if not link:
+            # Some feeds have no per-episode web page; fall back to the audio URL or GUID
+            # so the episode is not silently dropped.
+            link = (audio_url or entry.get("id") or "").strip()
         # Use link as fallback ID, ensure it's not empty
         post_id = entry.get("id", link) or f"{link}-{title}" # Create a more robust fallback ID
 
@@ -824,9 +376,6 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         
         # Ensure it's a string
         html_body = str(html_body) if html_body else ""
-
-        # --- Extract Audio URL ---
-        audio_url = extract_audio_url(entry)
 
         # --- Extract Image URL ---
         image_url = None
@@ -907,7 +456,7 @@ def main():
     start_time = time.time()
     print("================================================================")
     print(f"Starting Podcast Feed Ingestion Script at {datetime.now(timezone.utc)}")
-    print("*** NOTE: Google Transcription code has been REMOVED. Using HTML show notes only. ***")
+    print("*** Transcription: Gemini (gemini_transcribe.py); show notes used as fallback. ***")
     print("================================================================")
     # MODIFIED: Add a comment about the performance trade-off
     print("INFO: This version inserts rows individually, which may be slower than batching.")
@@ -921,12 +470,15 @@ def main():
     conn = None
     existing_title_norms: Set[str] = set()
     already_skipped: Set[str] = set()
+    skipped_post_ids: Set[str] = set()
     total_processed_count = 0
     total_skipped_count = 0
     total_inserted_count = 0
     total_failed_analysis_count = 0
     # MODIFIED: Renamed counter for clarity
     total_db_insert_failures = 0
+    total_gate_errors = 0
+    total_transcription_failures = 0
 
     try:
         # -------- 1. Database Connection & Setup --------
@@ -946,18 +498,23 @@ def main():
             print(f"--> Found {len(existing_title_norms):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_title_norms)} existing titles.")
 
-            print("Fetching already skipped titles from database...")
-            cur.execute("SELECT title_norm FROM skipped_posts WHERE title_norm IS NOT NULL") # Ensure not null
-            already_skipped = {row[0] for row in cur.fetchall() if row[0]}
-            print(f"--> Found {len(already_skipped):,} already skipped titles in the database.")
-            logging.info(f"Fetched {len(already_skipped)} already skipped titles.")
+            print("Fetching already skipped titles and IDs from database...")
+            # Cache BOTH keys: skipped_posts' primary key is post_id, so a retitled episode
+            # must still be recognised (otherwise the gate re-runs and the insert collides).
+            cur.execute("SELECT post_id, title_norm FROM skipped_posts")
+            skipped_rows = cur.fetchall()
+            already_skipped = {r[1] for r in skipped_rows if r[1]}
+            skipped_post_ids = {r[0] for r in skipped_rows if r[0]}
+            print(f"--> Found {len(skipped_rows):,} already skipped posts in the database.")
+            logging.info(f"Fetched {len(skipped_rows)} already skipped posts.")
 
         # -------- 3. Process Feeds --------
-        print(f"\n--- Starting Processing for {len(SOURCE_FEEDS)} Feeds ---")
+        feeds_to_run = list(SOURCE_FEEDS.items())[:MAX_FEEDS] if MAX_FEEDS else list(SOURCE_FEEDS.items())
+        print(f"\n--- Starting Processing for {len(feeds_to_run)} Feeds (max {TARGET_INSERTIONS_PER_FEED} inserts each) ---")
         feed_counter = 0
-        for feed_url, source_name in SOURCE_FEEDS.items():
+        for feed_url, source_name in feeds_to_run:
             feed_counter += 1
-            print(f"\n===== [{feed_counter}/{len(SOURCE_FEEDS)}] Processing Feed: {source_name} =====")
+            print(f"\n===== [{feed_counter}/{len(feeds_to_run)}] Processing Feed: {source_name} =====")
             posts_in_feed_count = 0
             posts_processed_in_feed = 0
             posts_skipped_in_feed = 0
@@ -985,12 +542,6 @@ def main():
                         logging.error(f"  ERROR: Failed to save first entry sample for '{title_for_log}...': {sample_err}", exc_info=True)
                     # --- End Save Sample Data ---
 
-                posts_in_feed_count += 1
-                # --- Safety Break (Check before processing) ---
-                if posts_in_feed_count > MAX_POSTS_PER_FEED:
-                     logging.warning(f"SAFETY BREAK: Reached max check limit ({MAX_POSTS_PER_FEED}) for feed '{source_name}' without reaching target insertions ({TARGET_INSERTIONS_PER_FEED}). Moving to next feed.")
-                     break # Stop processing this feed
-
                 total_processed_count += 1
                 title = entry_data['title']
                 link = entry_data['link']
@@ -1005,12 +556,18 @@ def main():
                 # --- End DEBUG ---
 
                 # Check if already processed or known to be skipped
-                if title_norm in existing_title_norms or title_norm in already_skipped:
+                if title_norm in existing_title_norms or title_norm in already_skipped or post_id in skipped_post_ids:
                     logging.debug(f"  SKIP (silent): Normalized title '{title_norm[:70]}...' already in content or skipped_posts cache.")
                     # No counter increment for this type of skip, as it's a pre-existing state.
                     # posts_skipped_in_feed might still be relevant if we want to track how many were skipped *per feed* due to cache.
                     # For now, keeping it truly silent as per instruction for global counters.
                     continue
+
+                # Count only entries that need work, so cached duplicates don't eat the limit.
+                posts_in_feed_count += 1
+                if posts_in_feed_count > MAX_POSTS_PER_FEED:
+                     logging.warning(f"SAFETY BREAK: Reached max check limit ({MAX_POSTS_PER_FEED}) for feed '{source_name}' without reaching target insertions ({TARGET_INSERTIONS_PER_FEED}). Moving to next feed.")
+                     break # Stop processing this feed
 
                 if not title_norm:
                     logging.warning(f"  SKIP: Could not normalize title for post ID {post_id}. Recording skip.")
@@ -1018,7 +575,7 @@ def main():
                         with conn.cursor() as skip_cur:
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
-                        already_skipped.add(title_norm)
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (empty title_norm) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post ID {post_id} (empty title_norm). Error: {db_err_skip}", exc_info=False)
@@ -1035,7 +592,7 @@ def main():
                         with conn.cursor() as skip_cur:
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
-                        already_skipped.add(title_norm)
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (invalid date) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (invalid date). Error: {db_err_skip}", exc_info=False)
@@ -1049,7 +606,7 @@ def main():
                         with conn.cursor() as skip_cur:
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
-                        already_skipped.add(title_norm)
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (before cutoff) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (before cutoff). Error: {db_err_skip}", exc_info=False)
@@ -1060,14 +617,18 @@ def main():
 
                 # --- 3c. AI Safety Guardrail ---
                 html_body = entry_data.get('html_body', '')
-                # MODIFIED: Skip guardrail if testing with MAX_POSTS_PER_FEED = 1
-                if not is_ai_safety_post(title, html_body):
+                gate_verdict = is_ai_safety_post(title, html_body)
+                if gate_verdict is None:
+                    logging.warning(f"  RETRY LATER: Guard-rail unavailable for '{title[:70]}...'. Not recorded; will retry next run.")
+                    total_gate_errors += 1
+                    continue
+                if not gate_verdict:
                     logging.info(f"  SKIP: Post '{title[:70]}...' failed AI safety guardrail check. Recording skip.")
                     try:
                         with conn.cursor() as skip_cur:
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
-                        already_skipped.add(title_norm)
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (guardrail fail) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (guardrail fail). Error: {db_err_skip}", exc_info=False)
@@ -1078,7 +639,6 @@ def main():
 
                 # --- If passed checks, proceed with full processing ---
                 posts_processed_in_feed += 1
-                analysis_step_failed = False # Track if any AI step fails for this post
 
                 # --- Initialize content variables ---
                 # MODIFIED: Clearer variable names
@@ -1091,18 +651,25 @@ def main():
                 final_full_content_markdown = "" # This will be saved to DB 'full_content_markdown'
                 audio_url = entry_data.get('audio_url') # Get audio URL
 
-                # --- 3d. Attempt Transcription with AssemblyAI ---
-                # Only attempt if the client was configured and we have a URL
-                if assemblyai_configured and audio_url:
-                    transcript_text = transcribe_audio_assemblyai(audio_url, title)
+                # --- 3d. Attempt Transcription with Gemini ---
+                transcription_failed = False
+                if transcription_configured and audio_url:
+                    tr = transcribe_audio_gemini(audio_url, title)
+                    transcript_text = tr.text if tr.ok else None
+                    transcription_failed = (tr.status == "failed")
+                    if transcription_failed:
+                        logging.warning(f"  Transcription failed ({tr.reason}); episode will be retried next run.")
                 elif not audio_url:
                      logging.info("  Skipping transcription: No audio URL found in feed entry.")
-                # else: # assemblyai_configured is False
-                #    logging.info("  Skipping transcription: AssemblyAI client not configured.")
 
-                # --- 3e. Prepare Content for Analysis (Always use HTML now) ---
+                if transcription_failed:
+                    # A transient failure must not become a notes-only row or a permanent skip.
+                    total_transcription_failures += 1
+                    continue
+
+                # --- 3e. Prepare Content for Analysis ---
                 if transcript_text:
-                    logging.info("  Using AssemblyAI transcript for content analysis.")
+                    logging.info("  Using Gemini transcript for content analysis.")
                     final_analysis_content = transcript_text
                     final_full_content_raw = transcript_text
                     # Use the raw transcript as markdown for now.
@@ -1150,91 +717,61 @@ def main():
                         with conn.cursor() as skip_cur:
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
-                        already_skipped.add(title_norm)
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (no usable content) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (no usable content). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
                     total_skipped_count += 1
                     posts_skipped_in_feed += 1
-                    analysis_step_failed = True # Also mark as analysis failed for consistency, though we skip insertion.
                     continue # Skip AI analysis and DB insertion
 
-                # --- 3f. Perform AI Analyses (using processed show notes) ---
-                sentence_summary, paragraph_summary, key_implication = None, None, None
-                db_cluster, db_tags = None, None
-                embedding_short_vector, embedding_full_vector = None, None
-
-                # Use the raw text content extracted from the show notes
-                # analysis_content = final_analysis_content # Moved up for the skip check
-
-                if analysis_content and analysis_content.strip(): # This check is now somewhat redundant due to the new skip.
-                    logging.info("  -> Performing AI analyses on available content...")
-                    # OpenAI GPT-4o Analyses
-                    sentence_summary = summarize_text(analysis_content)
-                    if sentence_summary is None or sentence_summary == "Content was empty.":
-                        logging.warning(f"     Sentence summary failed/skipped: {sentence_summary}")
-                        sentence_summary = None; analysis_step_failed = True
-                    else: logging.debug("     Sentence summary generated.")
-
-                    paragraph_summary = generate_paragraph_summary(analysis_content)
-                    if paragraph_summary is None or paragraph_summary == "Content was empty.":
-                        logging.warning(f"     Paragraph summary failed/skipped: {paragraph_summary}")
-                        paragraph_summary = None; analysis_step_failed = True
-                    else: logging.debug("     Paragraph summary generated.")
-
-                    key_implication = generate_key_implication(analysis_content)
-                    if key_implication is None or key_implication == "Content was empty.":
-                        logging.warning(f"     Key implication failed/skipped: {key_implication}")
-                        key_implication = None; analysis_step_failed = True
-                    else: logging.debug("     Key implication generated.")
-
-                    original_tags = entry_data.get('tags', [])
-                    # Use raw content (from show notes) for tagging
-                    cluster_info = generate_cluster_tag(title, original_tags, analysis_content)
-                    if isinstance(cluster_info, dict) and "error" in cluster_info:
-                         logging.warning(f"     Cluster/tag generation failed/skipped: {cluster_info['error']}")
-                         analysis_step_failed = True
-                    elif isinstance(cluster_info, dict):
-                         db_cluster = cluster_info.get("cluster")
-                         db_tags = cluster_info.get("tags")
-                         logging.debug(f"     Cluster='{db_cluster}', Tags={db_tags}")
-                    else: # Should not happen if helper validation is correct
-                         logging.warning(f"     Cluster/tag generation returned unexpected result: {cluster_info}")
-                         analysis_step_failed = True
-
-                    # OpenAI Embeddings
-                    logging.info("  -> Generating Embeddings...")
-                    # Format embeddings to match the standard format
-                    short_text_for_embedding = title or ""
-                    
-                    # Convert topics list to string for embedding
-                    topics_str = ""
-                    if db_tags:
-                        topics_str = ", ".join(db_tags) if isinstance(db_tags, list) else str(db_tags)
-                    
-                    full_text_for_embedding = f"{sentence_summary or ''}\n{paragraph_summary or ''}\n{key_implication or ''}\n{topics_str}"
-
-                    embedding_short_vector, embedding_full_vector = generate_embeddings(
-                        short_text=short_text_for_embedding,
-                        full_text=full_text_for_embedding
-                    )
-                    if embedding_short_vector is None and embedding_full_vector is None:
-                        logging.warning(f"     Embedding Generation failed or skipped.")
-                        # Not necessarily marking analysis_step_failed, depends if embeddings are critical
-                    else: logging.debug("     Embeddings generated.")
-
-                else: # This else block should ideally not be hit if content was empty, due to the new skip.
-                      # However, keeping it as a fallback or if the definition of "empty" changes.
-                    logging.warning(f"  Skipping AI analysis for post ID {post_id}: No usable content from transcript or HTML (this log might be redundant if already skipped).")
-                    analysis_step_failed = True
-
-                if analysis_step_failed:
+                # --- 3f. Perform AI Analyses (one structured call, see llm_common) ---
+                # A failure means the episode is NOT inserted. Transient errors leave it
+                # unrecorded so the next run retries; content-filter rejections are recorded.
+                logging.info("  -> Performing AI analysis on available content...")
+                try:
+                    analysis = analyze_content(title, analysis_content, entry_data.get('tags', []))
+                except LLMContentFiltered as e:
+                    logging.warning(f"  SKIP: Content filter blocked '{title[:70]}...': {e}. Recording skip.")
+                    try:
+                        with conn.cursor() as skip_cur:
+                            record_skip(skip_cur, post_id, title_norm, link)
+                        conn.commit()
+                        already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                    except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
+                        logging.error(f"  DB ERROR: Failed to record skip for '{title_norm[:70]}...' (content filter). Error: {db_err_skip}", exc_info=False)
+                        if conn: conn.rollback()
+                    total_skipped_count += 1
                     total_failed_analysis_count += 1
+                    continue
+                except (LLMError, ValueError) as e:
+                    logging.error(f"  RETRY LATER: Analysis failed for '{title[:70]}...': {e}. Not inserted.")
+                    total_failed_analysis_count += 1
+                    continue
+
+                sentence_summary = analysis["sentence_summary"]
+                paragraph_summary = analysis["paragraph_summary"]
+                key_implication = analysis["key_implication"]
+                db_cluster = analysis["cluster_tag"]
+                db_tags = analysis["tags"]
+                logging.debug(f"     Cluster='{db_cluster}', Tags={db_tags}")
+
+                # OpenAI Embeddings
+                logging.info("  -> Generating Embeddings...")
+                embedding_short_vector, embedding_full_vector = generate_embeddings(
+                    title or "",
+                    build_embedding_text(sentence_summary, paragraph_summary, key_implication, db_tags),
+                )
+                if embedding_short_vector is None or embedding_full_vector is None:
+                    logging.error(f"  RETRY LATER: Embedding generation failed for '{title[:70]}...'. Not inserted.")
+                    total_failed_analysis_count += 1
+                    continue
 
                 # --- 3g. Prepare Data Tuple for Insertion ---
                 # Ensure order matches DB_COLS exactly!
                 # 'full_content' is raw text from notes, 'full_content_markdown' is markdown from notes.
+                cleaned_title = None  # left NULL on insert; rewrite_titles.py --mode titles fills it (frontend/backend fall back to title)
                 data_tuple = (
                     link,                           # source_url
                     title,                          # title
@@ -1242,7 +779,7 @@ def main():
                     entry_data.get('authors_list', ['Unknown']), # authors (list for ARRAY type)
                     published_dt,                   # published_date (datetime or None)
                     db_tags,                        # topics (list[str] or None)
-                    None,                           # score (Podcasts don't usually have score) - Use None
+                    0,                              # score (Podcasts do not provide score; default to 0)
                     entry_data.get('image_url'),    # image_url (str or None)
                     sentence_summary,               # sentence_summary (str or None)
                     paragraph_summary,              # paragraph_summary (str or None)
@@ -1254,6 +791,7 @@ def main():
                     embedding_short_vector,         # embedding_short (list[float] or None)
                     embedding_full_vector,          # embedding_full (list[float] or None)
                     audio_url,                      # audio_url (original URL, kept for reference)
+                    cleaned_title,                  # cleaned_title (str or None)
                     # title_norm                      # Removed: Generated by the database
                 )
 
@@ -1309,9 +847,29 @@ def main():
          print("\nKeyboard interrupt detected. Shutting down...")
          if conn: conn.rollback() # Rollback any pending transaction
     except Exception as e:
-        logging.critical(f"CRITICAL ERROR initializing API clients (OpenAI): {e}", exc_info=True)
-        # Decide if script should exit if *any* client fails
-        sys.exit(1) # Exit if essential clients fail
+        logging.critical(f"CRITICAL ERROR in main processing loop: {e}", exc_info=True)
+        if conn: conn.rollback()
+        sys.exit(1)
+    finally:
+        if conn:
+            conn.close()
+        print("\n--- Podcast Ingestion Summary ---")
+        print(f"Entries examined:                 {total_processed_count}")
+        print(f"Rows inserted (or already there): {total_inserted_count}")
+        print(f"Skipped and recorded:             {total_skipped_count}")
+        print(f"Analysis/embedding failures:      {total_failed_analysis_count}")
+        print(f"Gate unavailable (retry later):   {total_gate_errors}")
+        print(f"Transcription failed (retry later): {total_transcription_failures}")
+        print(f"DB insert failures:               {total_db_insert_failures}")
+        print(f"Elapsed:                          {time.time() - start_time:.0f}s")
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Podcast RSS ingestion")
+    ap.add_argument("--max-feeds", type=int, default=None, help="Process only the first N feeds (canary runs)")
+    ap.add_argument("--max-inserts-per-feed", type=int, default=None, help="Override PODCAST_MAX_INSERTS_PER_FEED")
+    _args = ap.parse_args()
+    if _args.max_inserts_per_feed:
+        TARGET_INSERTIONS_PER_FEED = _args.max_inserts_per_feed
+    MAX_FEEDS = _args.max_feeds
     main()
