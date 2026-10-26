@@ -211,7 +211,13 @@ def _generate_transcript(client, uploaded_file):
             temperature=0,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             thinking_config=types.ThinkingConfig(thinking_level="low"),
-            http_options=types.HttpOptions(timeout=GENERATE_TIMEOUT_MS),
+            # Set X-Server-Timeout explicitly: google-genai writes the client-level 120s value into the
+            # shared client headers on the first call without per-request options (e.g. files.delete),
+            # and after that it wins over `timeout` here, so long episodes 504 at 120s.
+            http_options=types.HttpOptions(
+                timeout=GENERATE_TIMEOUT_MS,
+                headers={"X-Server-Timeout": str(GENERATE_TIMEOUT_MS // 1000)},
+            ),
         ),
     )
 

@@ -436,10 +436,17 @@ def main():
         type=str,
         help="Directory containing generated images (for upload mode). If not specified, will look for the most recent generated_images_* directory."
     )
+    parser.add_argument(
+        "--created-since",
+        type=str,
+        help="Only select rows with created_at >= this date/timestamp (e.g. 2026-10-25), so a run only covers newly ingested rows."
+    )
     args = parser.parse_args()
     mode = args.mode
     batch_size = args.batch_size
     images_dir = args.images_dir
+    created_clause = "AND created_at >= %s" if args.created_since else ""
+    query_params = (args.created_since, batch_size) if args.created_since else (batch_size,)
     
     logging.info(f"Running in mode: {mode}")
     if mode == "images-batch":
@@ -468,33 +475,33 @@ def main():
         select_query = ""
         if mode == "titles":
             logging.info("Selecting rows where cleaned_title IS NULL …")
-            select_query = """
+            select_query = f"""
                 SELECT id, title, sentence_summary, paragraph_summary, full_content_markdown, cleaned_title, cleaned_image, image_prompt
                 FROM   content
-                WHERE  cleaned_title IS NULL
+                WHERE  cleaned_title IS NULL {created_clause}
                 ORDER  BY published_date DESC NULLS LAST
                 LIMIT  %s
             """
         elif mode in ["images", "images-batch", "images-auto"]:
             logging.info("Selecting rows where cleaned_image IS NULL and cleaned_title IS NOT NULL …")
-            select_query = """
+            select_query = f"""
                 SELECT id, title, sentence_summary, paragraph_summary, full_content_markdown, cleaned_title, cleaned_image, image_prompt
                 FROM   content
-                WHERE  cleaned_image IS NULL AND cleaned_title IS NOT NULL
+                WHERE  cleaned_image IS NULL AND cleaned_title IS NOT NULL {created_clause}
                 ORDER  BY published_date DESC NULLS LAST
                 LIMIT  %s
             """
         elif mode == "both":
             logging.info("Selecting rows where cleaned_title IS NULL or cleaned_image IS NULL …")
-            select_query = """
+            select_query = f"""
                 SELECT id, title, sentence_summary, paragraph_summary, full_content_markdown, cleaned_title, cleaned_image, image_prompt
                 FROM   content
-                WHERE  cleaned_title IS NULL OR cleaned_image IS NULL
+                WHERE  (cleaned_title IS NULL OR cleaned_image IS NULL) {created_clause}
                 ORDER  BY published_date DESC NULLS LAST
                 LIMIT  %s
             """
-        
-        cur.execute(select_query, (batch_size,))
+
+        cur.execute(select_query, query_params)
         rows = cur.fetchall()
 
         if not rows:
