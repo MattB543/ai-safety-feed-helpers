@@ -118,7 +118,7 @@ def is_ai_safety_post(title: str, html_body: str) -> Optional[bool]:
 
 
 # Ingest only posts published on/after this date (UTC, inclusive)
-CUTOFF_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+CUTOFF_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 # Successful insertions per feed per run (a cost cap; raise via env once Gemini transcription cost is acceptable)
 TARGET_INSERTIONS_PER_FEED = int(os.environ.get("PODCAST_MAX_INSERTS_PER_FEED", "2"))
 # Process only the first N feeds (canary runs); None = all
