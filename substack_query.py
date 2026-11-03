@@ -477,9 +477,10 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         )
     }
     try:
-        # Feedparser handles network errors internally to some extent
-        # Pass request_headers to feedparser.parse
-        d = feedparser.parse(feed_url, request_headers=headers)
+        # Fetch with requests (feedparser's built-in fetch has no timeout), then parse the bytes.
+        resp = requests.get(feed_url, headers=headers, timeout=45)
+        resp.raise_for_status()
+        d = feedparser.parse(resp.content)
         if d.bozo: # Check if feedparser encountered issues
              logging.warning(f"Error parsing RSS feed for '{slug}': {d.bozo_exception}")
              # Optionally return here if strict error handling is needed
