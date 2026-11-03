@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PARKED: not part of the nightly pipeline (still writes the dead `posts` table); see "Parked for a future iteration" in README.md.
 """
 Ingest "AI Safety" papers from ArXiv, enrich with
 Semantic Scholar, summarise with Gemini, embed with OpenAI & Gemini,
