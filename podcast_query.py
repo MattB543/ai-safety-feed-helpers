@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify
 import psycopg2
@@ -109,6 +110,7 @@ TARGET_INSERTIONS_PER_FEED = int(os.environ.get("PODCAST_MAX_INSERTS_PER_FEED", 
 MAX_FEEDS = None
 # Safety limit: Max posts to *check* per feed if target not reached
 MAX_POSTS_PER_FEED = 100
+RSS_TIMEOUT = (15, 60)  # (connect, read) seconds; feedparser's own fetch has no timeout
 
 # --- Source Feeds ---
 SOURCE_FEEDS = {
@@ -118,8 +120,6 @@ SOURCE_FEEDS = {
     "https://axrp.net/feed.xml": "AXRP",
     "https://anchor.fm/s/1e4a0eac/podcast/rss": "Machine Learning Street Talk",
     "https://futureoflife.org/podcast/feed/": "FLI Podcast",
-    # NOTE: subscriber feed; currently returns HTML (token expired?). Refresh the uid from your account.
-    "https://samharris.org/subscriber-rss/?uid=PNIypzHCbq78upz": "Making Sense with Sam Harris",
     "https://lexfridman.com/feed/podcast/": "Lex Fridman Podcast",
     "https://anchor.fm/s/ebbe3a98/podcast/rss": "For Humanity: An AI Safety Podcast",
     "https://podcast.clearerthinking.org/rss.xml": "Clearer Thinking",
@@ -134,6 +134,15 @@ SOURCE_FEEDS = {
     "https://feeds.simplecast.com/rZ0cYk12": "Your Undivided Attention",
     "https://feeds.megaphone.fm/RINTP3108857801": "Cognitive Revolution",
 }
+
+# Making Sense is a subscriber feed keyed by a personal uid, read from .env and never logged
+# (feed URLs are logged without their query string). If the feed returns HTML instead of RSS,
+# the uid has probably expired: refresh it from the samharris.org account.
+SAM_HARRIS_RSS_UID = (os.environ.get("SAM_HARRIS_RSS_UID") or "").strip()
+if SAM_HARRIS_RSS_UID:
+    SOURCE_FEEDS["https://samharris.org/subscriber-rss/?uid=" + SAM_HARRIS_RSS_UID] = "Making Sense with Sam Harris"
+else:
+    logging.info("SAM_HARRIS_RSS_UID not set: skipping the Making Sense with Sam Harris subscriber feed.")
 
 # ================================================================
 #                      Database Configuration
@@ -220,12 +229,18 @@ def extract_audio_url(entry):
     
     return None
 
+def redact_feed_url(text: str, feed_url: str) -> str:
+    """Remove a feed URL's query string (e.g. a subscriber uid) from text that is about to be logged."""
+    query = urlparse(feed_url).query
+    return text.replace(query, "<redacted>") if query else text
+
 def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
     """
     Simplified iterator: Fetches and yields basic info for each entry in an RSS feed.
     Handles feed parsing errors gracefully.
     """
-    logging.info(f"Fetching RSS feed: {source_name} ({feed_url})")
+    log_url = redact_feed_url(feed_url, feed_url)
+    logging.info(f"Fetching RSS feed: {source_name} ({log_url})")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
@@ -234,19 +249,23 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         "Cache-Control": "no-cache",
     }
     feed_data = None
+    status_code = 'N/A'
     try:
-        # Consider adding timeout via requests if feedparser hangs
-        feed_data = feedparser.parse(feed_url, request_headers=headers, agent=headers["User-Agent"])
+        # Fetch with requests (feedparser's built-in fetch has no timeout), then parse the bytes.
+        resp = requests.get(feed_url, headers=headers, timeout=RSS_TIMEOUT)
+        status_code = resp.status_code
+        resp.raise_for_status()
+        feed_data = feedparser.parse(resp.content)
         if feed_data.bozo:
              logging.warning(f"Feed '{source_name}' is not well-formed: {feed_data.bozo_exception}")
              # Continue processing if entries exist despite bozo flag
 
     except Exception as e:
-         logging.error(f"Fatal error fetching or parsing feed '{source_name}' ({feed_url}): {e}", exc_info=True)
+         # No exc_info: request tracebacks contain the full URL (and so any subscriber uid).
+         logging.error(f"Fatal error fetching or parsing feed '{source_name}' ({log_url}): {redact_feed_url(f'{type(e).__name__}: {e}', feed_url)}")
          return # Stop iteration for this feed on fatal error
 
     if not feed_data or not feed_data.entries:
-        status_code = feed_data.get('status', 'N/A') if feed_data else 'N/A'
         logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', []))} entries.")
         return # Stop iteration if no entries
 
@@ -254,7 +273,7 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
     feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
     significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
     if feed_title and significant and not any(w in feed_title.lower() for w in significant):
-        logging.warning(f"FEED MISMATCH: configured '{source_name}' but the feed calls itself '{feed_title}' ({feed_url}). The feed may have moved.")
+        logging.warning(f"FEED MISMATCH: configured '{source_name}' but the feed calls itself '{feed_title}' ({log_url}). The feed may have moved.")
 
     for i, entry in enumerate(feed_data.entries):
         # --- Basic Data Extraction ---
