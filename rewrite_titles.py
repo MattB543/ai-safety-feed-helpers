@@ -59,7 +59,7 @@ import cloudinary, cloudinary.uploader, requests
 from llm_common import (
     AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
 )
-from common import get_db_connection
+from common import LOG_DIR, get_db_connection
 
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL         = os.getenv("AI_SAFETY_FEED_DB_URL")
@@ -390,7 +390,8 @@ def handle_auto_image_generation(rows):
             cur.close()
         if conn:
             conn.close()
-    csv_filename = f"image_cost_{timestamp}.csv"
+    os.makedirs(LOG_DIR, exist_ok=True)
+    csv_filename = os.path.join(LOG_DIR, f"image_cost_{timestamp}.csv")
     with open(csv_filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(cost_rows[0].keys()) if cost_rows else ["id"])
         writer.writeheader()
