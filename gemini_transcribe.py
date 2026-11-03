@@ -16,6 +16,10 @@ Result semantics (callers rely on this):
   status "failed"   a download/upload/model error -> caller should NOT persist a
                     notes-only row or a skip; leave the episode for the next run
 
+Successful transcripts are cached on disk (cache/transcripts/<sha1 of the audio URL>.json,
+gitignored, with a `truncated` flag), so an episode whose analysis or insert fails is not
+transcribed again on the next run. Delete a file to force a fresh transcription.
+
 Limits (Gemini API): up to 9.5 hours of audio per prompt at 32 tokens per
 second of audio; files up to 2 GB through the Files API. Output is capped by
 the model's 65,536-token limit (roughly 45k words).
@@ -25,11 +29,14 @@ Environment: GEMINI_API_KEY (required), GEMINI_TRANSCRIBE_MODEL (optional).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -56,6 +63,7 @@ GENERATE_TIMEOUT_MS = 30 * 60 * 1000      # a 3-hour episode can take several mi
 FILE_PROCESSING_POLL_SEC = 3
 FILE_PROCESSING_MAX_SEC = 15 * 60
 MAX_OUTPUT_TOKENS = 65536
+TRANSCRIPT_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "transcripts")
 
 TRANSCRIPT_PROMPT = (
     "Transcribe this podcast episode verbatim in the language spoken (use English if unsure). "
@@ -292,13 +300,58 @@ def transcribe_local_file(path: str, mime_type: str, title: str) -> Transcriptio
                 logger.debug("  Could not delete uploaded Gemini file %s: %s", uploaded.name, e)
 
 
+def _cache_path(audio_url: str) -> str:
+    return os.path.join(TRANSCRIPT_CACHE_DIR, hashlib.sha1(audio_url.encode("utf-8")).hexdigest() + ".json")
+
+
+def load_cached_transcript(audio_url: str) -> TranscriptionResult | None:
+    """The cached transcript for this audio URL, or None."""
+    path = _cache_path(audio_url)
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        logger.warning("  Ignoring unreadable transcript cache file %s: %s", os.path.basename(path), e)
+        return None
+    text = (data.get("text") or "").strip() if isinstance(data, dict) else ""
+    if not text:
+        return None
+    return TranscriptionResult("ok", text=text, reason="cached", truncated=bool(data.get("truncated")))
+
+
+def save_transcript(audio_url: str, title: str, result: TranscriptionResult) -> None:
+    """Cache a successful transcript (atomic write; failures are logged, never raised)."""
+    path = _cache_path(audio_url)
+    try:
+        os.makedirs(TRANSCRIPT_CACHE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({
+                "title": title,
+                "model": GEMINI_TRANSCRIBE_MODEL,
+                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "truncated": result.truncated,
+                "text": result.text,
+            }, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning("  Could not cache transcript for '%s': %s", title[:50], e)
+
+
 def transcribe_audio_gemini(audio_url: str, title: str) -> TranscriptionResult:
-    """Download an episode's audio and transcribe it with Gemini."""
-    if not GEMINI_API_KEY:
-        return TranscriptionResult("skipped", reason="GEMINI_API_KEY not set")
+    """Return the cached transcript, or download the episode's audio and transcribe it with Gemini."""
     if not audio_url or urlparse(audio_url).scheme not in ("http", "https"):
         logger.warning("  Skipping transcription for '%s': invalid audio URL (%s).", title[:50], str(audio_url)[:60])
         return TranscriptionResult("skipped", reason="invalid audio URL")
+    cached = load_cached_transcript(audio_url)
+    if cached:
+        logger.info("  Using cached transcript for '%s' (%d chars%s).",
+                    title[:50], len(cached.text), ", truncated" if cached.truncated else "")
+        return cached
+    if not GEMINI_API_KEY:
+        return TranscriptionResult("skipped", reason="GEMINI_API_KEY not set")
 
     logger.info("  Transcribing '%s' with Gemini (URL: %s...)", title[:50], audio_url[:60])
     downloaded = _download_audio(audio_url, title)
@@ -306,7 +359,10 @@ def transcribe_audio_gemini(audio_url: str, title: str) -> TranscriptionResult:
         return downloaded
     path, mime = downloaded
     try:
-        return transcribe_local_file(path, mime, title)
+        result = transcribe_local_file(path, mime, title)
+        if result.ok:
+            save_transcript(audio_url, title, result)
+        return result
     finally:
         try:
             os.remove(path)

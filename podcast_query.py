@@ -615,9 +615,11 @@ def main():
                 # --- 3d. Attempt Transcription with Gemini ---
                 transcription_failed = False
                 if transcription_configured and audio_url:
-                    tr = transcribe_audio_gemini(audio_url, title)
+                    tr = transcribe_audio_gemini(audio_url, title)  # reuses cache/transcripts/ when present
                     transcript_text = tr.text if tr.ok else None
                     transcription_failed = (tr.status == "failed")
+                    if tr.ok and tr.truncated:
+                        logging.warning(f"  Transcript for '{title[:70]}' is truncated (output-token limit); ingesting the partial transcript.")
                     if transcription_failed:
                         logging.warning(f"  Transcription failed ({tr.reason}); episode will be retried next run.")
                 elif not audio_url:

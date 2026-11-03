@@ -169,3 +169,6 @@ tag_frequency_report.csv
 
 # Pipeline logs, image cost reports and the poison-row retry state (logs/retry_state.json)
 logs/
+
+# Cached podcast transcripts (gemini_transcribe.py)
+cache/
