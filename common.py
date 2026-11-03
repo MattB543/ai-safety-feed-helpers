@@ -271,3 +271,24 @@ class RetryState:
                 rows.pop(rid, None)
         if ids:
             self._update(change)
+
+
+# ────────────────────────── Feeds ──────────────────────────
+def parse_feed_response(resp):
+    """feedparser.parse() for a requests response, passing its headers and final URL
+    (as content-location) so relative links and enclosures resolve."""
+    import feedparser
+    headers = {k.lower(): v for k, v in resp.headers.items()}
+    headers["content-location"] = resp.url
+    return feedparser.parse(resp.content, response_headers=headers)
+
+
+def is_duplicate_episode_url(link: str | None, audio_url: str | None, stored_audio_by_url: dict) -> bool:
+    """
+    True if a podcast entry's link is already stored as some row's source_url AND that row
+    has the same audio URL. A link alone can be a show homepage shared by many episodes,
+    so without the audio match the caller falls back to the title_norm check.
+    """
+    if not link or not audio_url or link not in stored_audio_by_url:
+        return False
+    return stored_audio_by_url[link] == audio_url

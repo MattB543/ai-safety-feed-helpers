@@ -38,13 +38,16 @@ from llm_common import (
 # Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
 from common import (
     EXIT_DONE, EXIT_FAILED,
-    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
+    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, parse_feed_response,
+    record_skip,
 )
 
 # --- Top Level Buffer ---
 SKIPPED_BUFFER = deque()   # (post_id, title_norm, url)
 # Fetch-phase failures left for the next run (gate unavailable, full-post fetch failed); used for the exit code.
 FETCH_RETRY_LATER = {"gate_error": 0, "fetch_failed": 0}
+# Publications where the archive API failed AND the RSS fallback failed (any makes the stage exit 1).
+FEED_FAILURES: list = []
 
 def buffer_skip(post_id, title, url):
     """Add a post to the skip buffer, avoiding duplicates."""
@@ -483,19 +486,19 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         # Fetch with requests (feedparser's built-in fetch has no timeout), then parse the bytes.
         resp = requests.get(feed_url, headers=headers, timeout=45)
         resp.raise_for_status()
-        d = feedparser.parse(resp.content)
+        d = parse_feed_response(resp)
         if d.bozo: # Check if feedparser encountered issues
              logging.warning(f"Error parsing RSS feed for '{slug}': {d.bozo_exception}")
              # Optionally return here if strict error handling is needed
              # return
     except Exception as e:
-         # Catch unexpected errors during parsing setup
+         # Raised so fetch_substack_optimized can tell a failed RSS fallback from an empty result.
          logging.error(f"Unexpected error initializing feedparser for '{slug}': {e}")
-         return # Stop iteration for this feed
+         raise RuntimeError(f"RSS fetch failed for '{slug}': {e}") from e
 
     if not d or not d.entries:
         print(f"[WARN] RSS feed for '{slug}' is empty or could not be fetched.")
-        return # Nothing to iterate
+        raise RuntimeError(f"RSS feed for '{slug}' is empty or could not be parsed")
 
     count = 0
     for entry in d.entries:
@@ -702,6 +705,9 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         except Exception as e:
             print(f"   [ERROR] RSS failed: {e}")
             logging.error(f"RSS fetch FAILED for '{slug}': {e}")
+            if archive_failed:
+                FEED_FAILURES.append(slug)
+                print(f"   [FAIL] Both the archive API and RSS failed for {slug}.")
 
     # STEP 4: Return sorted results
     final_posts = list(posts_by_id.values())
@@ -957,8 +963,9 @@ def backfill_missing_analysis(batch_size=10):
 
 def main(limit: int | None = None):
     # limit: process at most N new posts (canary runs)
-    # Returns EXIT_FAILED when something failed and nothing succeeded (no insert, no recorded
-    # skip); fatal DB errors sys.exit(1) directly. Otherwise EXIT_DONE.
+    # Returns EXIT_FAILED when a publication could not be fetched at all (archive and RSS
+    # fallback both failed) or when something failed and nothing succeeded (no insert, no
+    # recorded skip); fatal DB errors sys.exit(1) directly. Otherwise EXIT_DONE.
     # Setup logging (already done at the top)
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1053,6 +1060,9 @@ def main(limit: int | None = None):
     if not unique_posts:
         print(f"[INFO] No new posts to process ({early_skip_count} skips recorded).")
         retry_later = sum(FETCH_RETRY_LATER.values())
+        if FEED_FAILURES:
+            print(f"EXIT: stage FAILED (could not fetch: {', '.join(FEED_FAILURES)}).")
+            return EXIT_FAILED
         if retry_later and not early_skip_count:
             print(f"EXIT: stage FAILED ({retry_later} gate/fetch failures and nothing succeeded).")
             return EXIT_FAILED
@@ -1426,9 +1436,10 @@ def main(limit: int | None = None):
     print(f"Gate/fetch failures (retry next run):   {FETCH_RETRY_LATER['gate_error'] + FETCH_RETRY_LATER['fetch_failed']}")
 
     succeeded = affected_rows_count + total_skipped_by_record_count
+    print(f"Publications that could not be fetched: {len(FEED_FAILURES)} {FEED_FAILURES or ''}")
     failed = failed_analysis_count + total_failures + sum(FETCH_RETRY_LATER.values())
-    if failed and not succeeded:
-        print("EXIT: stage FAILED (every post needing work failed).")
+    if FEED_FAILURES or (failed and not succeeded):
+        print("EXIT: stage FAILED (a publication could not be fetched, or every post needing work failed).")
         return EXIT_FAILED
     return EXIT_DONE
 

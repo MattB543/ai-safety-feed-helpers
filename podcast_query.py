@@ -24,8 +24,7 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 import sys
-from collections import Counter
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 import feedparser
@@ -46,7 +45,8 @@ from gemini_transcribe import transcribe_audio_gemini, gemini_transcription_conf
 # Shared non-LLM helpers (DB connection, title_norm, skips, proxy cleanup).
 from common import (
     EXIT_DONE, EXIT_FAILED,
-    disable_unreachable_local_proxies, get_db_connection, normalise_title, record_skip,
+    disable_unreachable_local_proxies, get_db_connection, is_duplicate_episode_url, normalise_title,
+    parse_feed_response, record_skip,
 )
 
 # ================================================================
@@ -112,6 +112,8 @@ MAX_FEEDS = None
 # Safety limit: Max posts to *check* per feed if target not reached
 MAX_POSTS_PER_FEED = 100
 RSS_TIMEOUT = (15, 60)  # (connect, read) seconds; feedparser's own fetch has no timeout
+# Feeds that could not be fetched or had no entries this run (any makes the stage exit 1).
+FEED_FETCH_FAILURES: List[str] = []
 
 # --- Source Feeds ---
 SOURCE_FEEDS = {
@@ -256,7 +258,7 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         resp = requests.get(feed_url, headers=headers, timeout=RSS_TIMEOUT)
         status_code = resp.status_code
         resp.raise_for_status()
-        feed_data = feedparser.parse(resp.content)
+        feed_data = parse_feed_response(resp)
         if feed_data.bozo:
              logging.warning(f"Feed '{source_name}' is not well-formed: {feed_data.bozo_exception}")
              # Continue processing if entries exist despite bozo flag
@@ -264,15 +266,15 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
     except Exception as e:
          # No exc_info: request tracebacks contain the full URL (and so any subscriber uid).
          logging.error(f"Fatal error fetching or parsing feed '{source_name}' ({log_url}): {redact_feed_url(f'{type(e).__name__}: {e}', feed_url)}")
+         FEED_FETCH_FAILURES.append(source_name)
          return # Stop iteration for this feed on fatal error
 
     if not feed_data or not feed_data.entries:
         logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', []))} entries.")
+        FEED_FETCH_FAILURES.append(source_name)
         return # Stop iteration if no entries
 
     logging.info(f"Found {len(feed_data.entries)} entries in feed '{source_name}'.")
-    # Some feeds put the show's homepage in every item's <link>; such links can't identify an episode.
-    link_counts = Counter((e.get("link") or "").strip() for e in feed_data.entries)
     feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
     significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
     if feed_title and significant and not any(w in feed_title.lower() for w in significant):
@@ -283,6 +285,9 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         title = entry.get("title", "").strip()
         link = (entry.get("link") or "").strip()
         audio_url = extract_audio_url(entry)
+        if audio_url:
+            # feedparser resolves <link> against the feed URL but not enclosure URLs.
+            audio_url = urljoin(resp.url, audio_url)
         if not link:
             # Some feeds have no per-episode web page; fall back to the audio URL or GUID
             # so the episode is not silently dropped.
@@ -368,7 +373,6 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
             "post_id": post_id,
             "title": title,
             "link": link,
-            "link_is_unique": link_counts[link] <= 1,  # safe to dedup on source_url
             "published_parsed": entry.get("published_parsed"), # Keep as struct_time for now
             "html_body": html_body,
             "audio_url": audio_url, # Still yield audio_url
@@ -416,8 +420,9 @@ def make_serializable(obj):
         return repr(obj) # Represent as string
 
 def main():
-    """Returns EXIT_FAILED on a DB connection failure or when something failed and nothing
-    succeeded (no insert, no recorded skip); otherwise EXIT_DONE."""
+    """Returns EXIT_FAILED on a DB connection failure, when any feed could not be fetched or
+    parsed, or when something failed and nothing succeeded (no insert, no recorded skip);
+    otherwise EXIT_DONE."""
     start_time = time.time()
     print("================================================================")
     print(f"Starting Podcast Feed Ingestion Script at {datetime.now(timezone.utc)}")
@@ -444,6 +449,7 @@ def main():
     total_db_insert_failures = 0
     total_gate_errors = 0
     total_transcription_failures = 0
+    total_skip_write_failures = 0
     fatal_error = False
 
     try:
@@ -458,11 +464,11 @@ def main():
         # -------- 2. Fetch Existing Titles --------
         with conn.cursor() as cur:
             print("Fetching existing normalized titles and URLs from database...")
-            cur.execute("SELECT title_norm, source_url FROM content")
+            cur.execute("SELECT title_norm, source_url, audio_url FROM content")
             content_rows = cur.fetchall()
             existing_title_norms = {row[0] for row in content_rows if row[0]} # Filter None just in case
-            # Dedup by source_url first (catches renamed episodes), then by title_norm.
-            existing_urls = {row[1] for row in content_rows if row[1]}
+            # Dedup by source_url + audio_url first (catches renamed episodes), then by title_norm.
+            stored_audio_by_url = {row[1]: row[2] for row in content_rows if row[1]}
             print(f"--> Found {len(existing_title_norms):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_title_norms)} existing titles.")
 
@@ -524,8 +530,8 @@ def main():
                 # --- End DEBUG ---
 
                 # Check if already processed or known to be skipped
-                if entry_data.get('link_is_unique') and link in existing_urls:
-                    logging.debug(f"  SKIP (silent): source_url of '{title[:70]}...' already in content.")
+                if is_duplicate_episode_url(link, entry_data.get('audio_url'), stored_audio_by_url):
+                    logging.debug(f"  SKIP (silent): source_url + audio_url of '{title[:70]}...' already in content.")
                     continue
                 if title_norm in existing_title_norms or title_norm in already_skipped or post_id in skipped_post_ids:
                     logging.debug(f"  SKIP (silent): Normalized title '{title_norm[:70]}...' already in content or skipped_posts cache.")
@@ -547,11 +553,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (empty title_norm) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post ID {post_id} (empty title_norm). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -564,11 +571,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (invalid date) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (invalid date). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
                 if published_dt < CUTOFF_DATE:
@@ -578,11 +586,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (before cutoff) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (before cutoff). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -600,11 +609,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (guardrail fail) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (guardrail fail). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -691,11 +701,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (no usable content) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (no usable content). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue # Skip AI analysis and DB insertion
 
@@ -712,10 +723,11 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for '{title_norm[:70]}...' (content filter). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     total_failed_analysis_count += 1
                     continue
                 except (LLMError, ValueError) as e:
@@ -787,7 +799,7 @@ def main():
                         # Add to set to prevent reprocessing duplicates later in this run
                         # even if ON CONFLICT ignored the insert.
                         existing_title_norms.add(title_norm)
-                        existing_urls.add(link)
+                        stored_audio_by_url[link] = audio_url
                         successful_insertions_in_feed += 1 # Increment feed-specific counter
                 except (psycopg2.DatabaseError, Psycopg2OpError) as db_err:
                     logging.error(f"  DB ERROR: Failed to insert post '{title[:70]}...' (ID: {post_id}). Error: {db_err}", exc_info=False) # Keep log concise
@@ -836,12 +848,15 @@ def main():
         print(f"Gate unavailable (retry later):   {total_gate_errors}")
         print(f"Transcription failed (retry later): {total_transcription_failures}")
         print(f"DB insert failures:               {total_db_insert_failures}")
+        print(f"Skip writes failed:               {total_skip_write_failures}")
+        print(f"Feeds failed to fetch/parse:      {len(FEED_FETCH_FAILURES)} {FEED_FETCH_FAILURES or ''}")
         print(f"Elapsed:                          {time.time() - start_time:.0f}s")
 
     succeeded = total_inserted_count + total_skipped_count
-    failed = total_failed_analysis_count + total_gate_errors + total_transcription_failures + total_db_insert_failures
-    if fatal_error or (failed and not succeeded):
-        print("EXIT: stage FAILED (database error, or every episode needing work failed).")
+    failed = (total_failed_analysis_count + total_gate_errors + total_transcription_failures
+              + total_db_insert_failures + total_skip_write_failures)
+    if fatal_error or FEED_FETCH_FAILURES or (failed and not succeeded):
+        print("EXIT: stage FAILED (database error, a feed could not be fetched, or every episode needing work failed).")
         return EXIT_FAILED
     return EXIT_DONE
 
