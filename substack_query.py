@@ -20,7 +20,6 @@ from markdownify import markdownify # Add markdownify import
 import psycopg2 # Add psycopg2 import
 from psycopg2 import extras # Import extras for batch insertion
 from dotenv import load_dotenv # Add dotenv import
-from pgvector.psycopg2 import register_vector # Add pgvector import
 import feedparser # Add feedparser import
 from urllib.parse import urlparse # Add urlparse import
 from bs4 import BeautifulSoup # Add BeautifulSoup import
@@ -36,41 +35,13 @@ from llm_common import (
     LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
     generate_embeddings, is_ai_safety_content, check_llm_or_exit,
 )
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break feed/API requests.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
+# Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
+from common import (
+    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
+)
 
 # --- Top Level Buffer ---
 SKIPPED_BUFFER = deque()   # (post_id, title_norm, url)
-
-# --- Helper for title normalization ---
-def normalise_title(t: str) -> str:
-    """Normalize title: lowercase, replace multiple spaces with single, strip leading/trailing."""
-    if not isinstance(t, str): return "" # Handle non-string input
-    return re.sub(r'\s+', ' ', t).strip().lower()
-
-def clean_title_for_storage(title: str | None) -> str | None:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r'\s+', ' ', title).strip()
 
 def buffer_skip(post_id, title, url):
     """Add a post to the skip buffer, avoiding duplicates."""
@@ -83,7 +54,7 @@ def buffer_skip(post_id, title, url):
              url)
         )
 
-def flush_skip_buffer(db_url: str) -> list:
+def flush_skip_buffer() -> list:
     """
     Insert buffered gate/cutoff/paywall skips in their OWN transaction, so they
     persist even when this run accepts no posts. Returns the rows written.
@@ -91,7 +62,7 @@ def flush_skip_buffer(db_url: str) -> list:
     if not SKIPPED_BUFFER:
         return []
     rows = list(SKIPPED_BUFFER)
-    conn = psycopg2.connect(db_url)
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             extras.execute_values(
@@ -205,23 +176,6 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-# --- Helper SQL & function for skipping posts ---
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
-    """
-    Insert one row into skipped_posts and keep the caller side-effect-free
-    (no commit here – caller decides when to commit or roll back).
-    """
-    cur.execute(SKIP_INSERT_SQL,
-                (str(post_id) if post_id else "N/A",
-                 str(title_norm),
-                 source_url))
-
 # --- Relevance gate (shared implementation in llm_common) ---
 GATE_SNIPPET_BYTES = 8000
 
@@ -256,23 +210,6 @@ def safe_int_or_zero(value):
     if value is None: return 0
     try: return int(value)
     except (ValueError, TypeError): return 0
-
-# Helper to parse ISO date strings reliably
-def iso_to_dt(iso_string: str) -> datetime | None:
-    """Converts ISO 8601 string to timezone-aware datetime object (UTC)."""
-    if not iso_string:
-        return None
-    try:
-        # Handle 'Z' suffix for UTC
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        # Ensure timezone is UTC if naive
-        if dt_obj.tzinfo is None:
-            return dt_obj.replace(tzinfo=timezone.utc)
-        # Convert to UTC if it has another timezone
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError):
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'")
-        return None
 
 # Helper to extract Substack slug from URL or pass through if already a slug
 def slug_from_thing(source: str) -> str | None:
@@ -821,12 +758,6 @@ def choose_highest_score(posts):
     print(f"   [OK] Kept {len(unique_posts)} unique posts (removed {removed_count} duplicates)")
     return unique_posts
 
-# --- Helper for title normalization ---
-def normalise_title(t: str) -> str:
-    """Normalize title: lowercase, replace multiple spaces with single, strip leading/trailing."""
-    if not isinstance(t, str): return "" # Handle non-string input
-    return re.sub(r'\s+', ' ', t).strip().lower()
-
 # --- Backfill Function for Missing Analysis ---
 
 def backfill_missing_analysis(batch_size=10):
@@ -848,9 +779,8 @@ def backfill_missing_analysis(batch_size=10):
     
     try:
         print("[DB] Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True)
         print("[OK] Database connected")
-        register_vector(conn)
         
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
             # Find Substack posts missing analysis
@@ -1030,9 +960,8 @@ def main(limit: int | None = None):
     
     try:
         print("\n[DB] Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # Register pgvector type with the connection
         print("[OK] Database connected")
-        register_vector(conn) # Register pgvector type with the connection
         print("[OK] pgvector registered")
 
         with conn.cursor() as cur:
@@ -1084,7 +1013,7 @@ def main(limit: int | None = None):
         substack_posts_all.extend(posts_for_feed)
         # Persist this feed's gate/cutoff/paywall skips right away (own transaction), so a
         # killed run does not lose them and progress is visible in the DB.
-        flushed = flush_skip_buffer(DATABASE_URL)
+        flushed = flush_skip_buffer()
         early_skips.extend(flushed)
         already_skipped.update(t for _, t, _ in flushed)
         print(f"   [DB] {len(flushed)} skips recorded for this feed; {len(substack_posts_all)} candidate posts so far", flush=True)
@@ -1119,9 +1048,8 @@ def main(limit: int | None = None):
         # Establish a new connection for processing
         logging.info("\n--- Database Operations ---")
         logging.info("Connecting to the database for processing...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # Register pgvector type with the connection
         logging.info("Database connection successful.")
-        register_vector(conn) # Register pgvector type with the connection
         logging.info("pgvector type registered with psycopg2 connection.")
 
         with conn.cursor() as cur:

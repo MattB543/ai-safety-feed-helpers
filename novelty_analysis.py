@@ -10,18 +10,19 @@ using **Azure OpenAI**.
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, psycopg2
 from psycopg2 import extras
-from openai import AzureOpenAI
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv(override=True)
 
+# Azure settings and the client constructor are shared with the scrapers.
+from llm_common import (  # noqa: E402
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
+)
+from common import get_db_connection  # noqa: E402
+
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL = os.getenv("AI_SAFETY_FEED_DB_URL")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
 MODEL = AZURE_OPENAI_DEPLOYMENT
 BATCH = 21
 K_NEIGHBOURS = 20
@@ -45,13 +46,8 @@ logging.basicConfig(
 )
 
 # ───── Azure OpenAI client ────────────────────────────────────
-client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_OPENAI_API_VERSION,
-    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
-    timeout=180,
-)
+# SDK default retries (2) on purpose: this script has no tenacity layer of its own.
+client = make_azure_client(timeout=180)
 
 
 def extract_response_text(response) -> str:
@@ -260,7 +256,7 @@ def main():
     cur  = None
     processed_count = 0
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=extras.RealDictCursor)
 
         # 1️⃣  newest refs lacking novelty_score

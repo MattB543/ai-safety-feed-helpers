@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
+from common import get_db_connection
 from tenacity import (
     before_sleep_log,
     retry,
@@ -179,7 +180,7 @@ def main():
     skipped_count = 0
 
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
 
         # Find rows missing any analysis field that have content to summarize.

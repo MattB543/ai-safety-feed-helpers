@@ -37,7 +37,6 @@ Environment variables (same as the other backfills):
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, re, psycopg2
 from psycopg2 import extras
-from openai import AzureOpenAI
 from dotenv import load_dotenv
 import argparse # Added import
 from PIL import Image
@@ -56,21 +55,19 @@ load_dotenv(override=True)  # Load environment variables from .env file
 
 import cloudinary, cloudinary.uploader, requests
 
+# Azure settings (already stripped) and the client constructor are shared with the scrapers.
+from llm_common import (
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
+)
+from common import get_db_connection
+
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL         = os.getenv("AI_SAFETY_FEED_DB_URL")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
 # Strip potential whitespace from keys
 if DB_URL: DB_URL = DB_URL.strip()
-if AZURE_OPENAI_API_KEY: AZURE_OPENAI_API_KEY = AZURE_OPENAI_API_KEY.strip()
-if AZURE_OPENAI_ENDPOINT: AZURE_OPENAI_ENDPOINT = AZURE_OPENAI_ENDPOINT.strip()
-if AZURE_OPENAI_DEPLOYMENT: AZURE_OPENAI_DEPLOYMENT = AZURE_OPENAI_DEPLOYMENT.strip()
-if AZURE_OPENAI_API_VERSION: AZURE_OPENAI_API_VERSION = AZURE_OPENAI_API_VERSION.strip()
 if GEMINI_API_KEY: GEMINI_API_KEY = GEMINI_API_KEY.strip()
 if CLOUDINARY_URL: CLOUDINARY_URL = CLOUDINARY_URL.strip()
 
@@ -128,12 +125,7 @@ logging.basicConfig(
 
 # ───── LLM/Image clients ───────────────────────────────────────
 try:
-    text_client = AzureOpenAI(
-        api_key=AZURE_OPENAI_API_KEY,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version=AZURE_OPENAI_API_VERSION,
-        azure_deployment=MODEL,
-    )
+    text_client = make_azure_client()  # SDK default timeout/retries
     image_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     sys.exit(f"Failed to initialize Azure/Gemini clients: {e}")
@@ -361,7 +353,7 @@ def handle_auto_image_generation(rows):
     updated = 0
     conn = cur = None
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         for row in rows:
             cid = row["id"]
@@ -457,7 +449,7 @@ def main():
         return handle_interactive_upload(images_dir)
 
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=extras.RealDictCursor)
 
         # Check if image_prompt column exists
@@ -733,7 +725,7 @@ def handle_batch_image_generation(rows):
     # Database connection for saving image prompts
     conn = cur = None
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         
         for row in rows:
@@ -866,7 +858,7 @@ def handle_interactive_upload(images_dir: str = None):
     updated = 0
     
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         
         # Process each content ID

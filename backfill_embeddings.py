@@ -16,14 +16,13 @@ import logging
 import os
 import sys
 
-import psycopg2
 from psycopg2 import extras
-from pgvector.psycopg2 import register_vector
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
 from llm_common import build_embedding_text, generate_embeddings_batch, require_env  # noqa: E402
+from common import get_db_connection  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 require_env(azure=False, embeddings=True)
@@ -36,8 +35,7 @@ BATCH = 100  # rows per embeddings request (2 vectors per row)
 
 
 def main() -> None:
-    conn = psycopg2.connect(DB_URL)
-    register_vector(conn)
+    conn = get_db_connection(register_vectors=True)
     updated = skipped = failed = 0
     try:
         with conn.cursor() as cur:

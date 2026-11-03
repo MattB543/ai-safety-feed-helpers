@@ -163,20 +163,29 @@ _openai_client: Optional[OpenAI] = None
 _reasoning_effort_supported = True
 
 
+def make_azure_client(**overrides: Any) -> AzureOpenAI:
+    """
+    A new AzureOpenAI client for the configured deployment. `overrides` (timeout,
+    max_retries, ...) go straight to the SDK; anything omitted keeps the SDK default.
+    Used by get_azure_client() and by novelty_analysis.py / rewrite_titles.py, which
+    keep their own request code and retry settings.
+    """
+    if not (AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT):
+        raise LLMConfigError("Azure OpenAI is not configured (key/endpoint/deployment missing).")
+    return AzureOpenAI(
+        api_key=AZURE_OPENAI_API_KEY,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_deployment=AZURE_OPENAI_DEPLOYMENT,
+        **overrides,
+    )
+
+
 def get_azure_client() -> AzureOpenAI:
     global _azure_client
     if _azure_client is None:
-        if not (AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_DEPLOYMENT):
-            raise LLMConfigError("Azure OpenAI is not configured (key/endpoint/deployment missing).")
         # max_retries=0: tenacity below is the single retry layer (SDK retries would multiply it).
-        _azure_client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_version=AZURE_OPENAI_API_VERSION,
-            azure_deployment=AZURE_OPENAI_DEPLOYMENT,
-            timeout=LLM_REQUEST_TIMEOUT_SEC,
-            max_retries=0,
-        )
+        _azure_client = make_azure_client(timeout=LLM_REQUEST_TIMEOUT_SEC, max_retries=0)
     return _azure_client
 
 

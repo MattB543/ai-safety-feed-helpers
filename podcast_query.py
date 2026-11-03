@@ -33,7 +33,6 @@ from markdownify import markdownify
 import psycopg2
 from psycopg2 import extras # For batch insertion
 from psycopg2 import OperationalError as Psycopg2OpError # Alias for clarity
-from pgvector.psycopg2 import register_vector # <-- ADDED for pgvector
 from dotenv import load_dotenv
 
 # --- AI/ML helpers (shared) ---
@@ -42,31 +41,13 @@ from llm_common import (
     generate_embeddings, is_ai_safety_content, check_llm_or_exit,
 )
 from gemini_transcribe import transcribe_audio_gemini, gemini_transcription_configured
+# Shared non-LLM helpers (DB connection, title_norm, skips, proxy cleanup).
+from common import disable_unreachable_local_proxies, get_db_connection, normalise_title, record_skip
 
 # ================================================================
 #                      Environment & Setup
 # ================================================================
 load_dotenv(override=True)  # Load .env BEFORE using env vars, override OS environment
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break feed/API requests.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, # Changed default to INFO
@@ -178,54 +159,10 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: Optional[str]):
-    """Insert one row into skipped_posts (no commit)."""
-    cur.execute(SKIP_INSERT_SQL, (post_id, title_norm, source_url))
-
 # ================================================================
 #                          Utility Helpers
 # ================================================================
-
-def normalise_title(title: str) -> str:
-    """Normalizes a title string to match the database `title_norm` generation.
-
-    This involves:
-    1. Lowercasing the title.
-    2. Replacing one or more whitespace characters with a single space.
-    3. Stripping leading/trailing whitespace.
-    """
-    if not title: return ""
-    # 1. Lowercase
-    normalized = title.lower()
-    # 2. Replace multiple whitespace chars with a single space
-    normalized = re.sub(r'\s+', ' ', normalized)
-    # 3. Strip leading/trailing whitespace
-    normalized = normalized.strip()
-    return normalized
-
-def clean_title_for_storage(title: Optional[str]) -> Optional[str]:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r'\s+', ' ', title).strip()
-
-def iso_to_dt(iso_string: Optional[str]) -> Optional[datetime]:
-    """Converts ISO 8601 string to timezone-aware datetime object (UTC)."""
-    if not iso_string: return None
-    try:
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        if dt_obj.tzinfo is None:
-            return dt_obj.replace(tzinfo=timezone.utc)
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError) as e:
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'. Error: {e}")
-        return None
+# normalise_title and record_skip live in common.py.
 
 def struct_time_to_dt(st: Optional[time.struct_time]) -> Optional[datetime]:
     """Converts feedparser's time.struct_time to timezone-aware datetime (UTC)."""
@@ -484,9 +421,8 @@ def main():
         # -------- 1. Database Connection & Setup --------
         print("\n--- Connecting to Database ---")
         logging.info(f"Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # pgvector type handler registered
         conn.autocommit = False # Manual transaction control
-        register_vector(conn) # <-- ADDED for pgvector
         print("Database connection successful.")
         logging.info("Database connection successful.")
 

@@ -34,7 +34,6 @@ from markdownify import markdownify
 from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2 import extras # Explicit import for batch insertion
-from pgvector.psycopg2 import register_vector # <<< ADD THIS IMPORT
 from dotenv import load_dotenv
 
 # ================================================================
@@ -47,26 +46,10 @@ from llm_common import (
     LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
     generate_embeddings, check_llm_or_exit,
 )
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break outbound fetches in sandboxed runs.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
+# Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
+from common import (
+    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
+)
 
 # --- Essential Environment Variables ---
 DATABASE_URL = os.environ.get("AI_SAFETY_FEED_DB_URL")
@@ -152,71 +135,10 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-# SQL and helper for recording skipped posts
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
-    """Insert one row into skipped_posts (no commit)."""
-    # Ensure post_id and source_url are strings, handle None for source_url
-    cur.execute(SKIP_INSERT_SQL, (
-        str(post_id) if post_id is not None else 'N/A',
-        str(title_norm),
-        str(source_url) if source_url is not None else None
-    ))
-
 # ================================================================
 #                         Utility Helpers
 # ================================================================
-
-def normalise_title(title: str) -> str:
-    """
-    Normalizes a title string for consistent comparison and database indexing.
-    Converts to lowercase, replaces multiple whitespace chars with a single space,
-    and strips leading/trailing whitespace.
-
-    Args:
-        title: The original title string.
-
-    Returns:
-        The normalized title string.
-    """
-    if not title: return ""
-    return re.sub(r"\s+", " ", title).strip().lower()
-
-def clean_title_for_storage(title: str | None) -> str | None:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r"\s+", " ", title).strip()
-
-def iso_to_dt(iso_string: str | None) -> datetime | None:
-    """
-    Safely converts an ISO 8601 timestamp string to a timezone-aware
-    datetime object (UTC). Handles 'Z' notation and naive datetimes.
-
-    Args:
-        iso_string: The ISO 8601 formatted string.
-
-    Returns:
-        A timezone-aware datetime object (UTC) or None if parsing fails.
-    """
-    if not iso_string:
-        return None
-    try:
-        # Handle 'Z' suffix for UTC and ensure timezone awareness
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        if dt_obj.tzinfo is None:
-            # Assume UTC if timezone is naive
-            return dt_obj.replace(tzinfo=timezone.utc)
-        # Convert to UTC if it has another timezone
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError) as e:
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'. Error: {e}")
-        return None
+# normalise_title, iso_to_dt and record_skip live in common.py.
 
 def safe_int_or_zero(value: any) -> int:
     """
@@ -630,9 +552,8 @@ def main(limit: int | None = None):
     try:
         print("\n--- Connecting to Database ---")
         logging.info(f"Connecting to database using URL: {DATABASE_URL[:20]}...") # Log partial URL
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # pgvector type handler registered
         conn.autocommit = False # Ensure transactions are handled manually
-        register_vector(conn) # <<< REGISTER VECTOR TYPE HANDLER
         print("Database connection successful.")
         logging.info("Database connection successful.")
 
