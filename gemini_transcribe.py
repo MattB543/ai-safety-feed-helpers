@@ -315,27 +315,27 @@ def load_cached_transcript(audio_url: str) -> TranscriptionResult | None:
     except (OSError, ValueError) as e:
         logger.warning("  Ignoring unreadable transcript cache file %s: %s", os.path.basename(path), e)
         return None
-    text = (data.get("text") or "").strip() if isinstance(data, dict) else ""
+    if (not isinstance(data, dict) or not isinstance(data.get("text"), str)
+            or not isinstance(data.get("truncated", False), bool)):
+        logger.warning("  Ignoring malformed transcript cache file %s.", os.path.basename(path))
+        return None
+    text = data["text"].strip()
     if not text:
         return None
-    return TranscriptionResult("ok", text=text, reason="cached", truncated=bool(data.get("truncated")))
+    return TranscriptionResult("ok", text=text, reason="cached", truncated=data.get("truncated", False))
 
 
 def save_transcript(audio_url: str, title: str, result: TranscriptionResult) -> None:
     """Cache a successful transcript (atomic write; failures are logged, never raised)."""
-    path = _cache_path(audio_url)
+    from common import write_json_atomic  # unique temp file + os.replace
     try:
-        os.makedirs(TRANSCRIPT_CACHE_DIR, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({
-                "title": title,
-                "model": GEMINI_TRANSCRIBE_MODEL,
-                "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "truncated": result.truncated,
-                "text": result.text,
-            }, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        write_json_atomic(_cache_path(audio_url), {
+            "title": title,
+            "model": GEMINI_TRANSCRIBE_MODEL,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "truncated": bool(result.truncated),
+            "text": result.text,
+        })
     except OSError as e:
         logger.warning("  Could not cache transcript for '%s': %s", title[:50], e)
 
