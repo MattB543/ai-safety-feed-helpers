@@ -497,6 +497,10 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
          raise RuntimeError(f"RSS fetch failed for '{slug}': {e}") from e
 
     if not d or not d.entries:
+        if d and not d.bozo and d.get("feed"):
+            # Well-formed feed that simply has no items: nothing to yield, not a failure.
+            logging.info(f"RSS feed for '{slug}' is valid but has no entries.")
+            return
         print(f"[WARN] RSS feed for '{slug}' is empty or could not be fetched.")
         raise RuntimeError(f"RSS feed for '{slug}' is empty or could not be parsed")
 

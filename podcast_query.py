@@ -270,7 +270,11 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
          return # Stop iteration for this feed on fatal error
 
     if not feed_data or not feed_data.entries:
-        logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', []))} entries.")
+        if feed_data and not feed_data.bozo and feed_data.get("feed"):
+            # Well-formed feed that simply has no items: nothing to do, not a failure.
+            logging.info(f"RSS feed for '{source_name}' is valid but has no entries.")
+            return
+        logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', [])) if feed_data else 0} entries.")
         FEED_FETCH_FAILURES.append(source_name)
         return # Stop iteration if no entries
 
@@ -468,7 +472,11 @@ def main():
             content_rows = cur.fetchall()
             existing_title_norms = {row[0] for row in content_rows if row[0]} # Filter None just in case
             # Dedup by source_url + audio_url first (catches renamed episodes), then by title_norm.
-            stored_audio_by_url = {row[1]: row[2] for row in content_rows if row[1]}
+            # One link can be a show homepage shared by many episodes, so keep every audio URL.
+            stored_audio_by_url = {}
+            for row in content_rows:
+                if row[1] and row[2]:
+                    stored_audio_by_url.setdefault(row[1], set()).add(row[2])
             print(f"--> Found {len(existing_title_norms):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_title_norms)} existing titles.")
 
@@ -799,7 +807,8 @@ def main():
                         # Add to set to prevent reprocessing duplicates later in this run
                         # even if ON CONFLICT ignored the insert.
                         existing_title_norms.add(title_norm)
-                        stored_audio_by_url[link] = audio_url
+                        if audio_url:
+                            stored_audio_by_url.setdefault(link, set()).add(audio_url)
                         successful_insertions_in_feed += 1 # Increment feed-specific counter
                 except (psycopg2.DatabaseError, Psycopg2OpError) as db_err:
                     logging.error(f"  DB ERROR: Failed to insert post '{title[:70]}...' (ID: {post_id}). Error: {db_err}", exc_info=False) # Keep log concise

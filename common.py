@@ -139,7 +139,7 @@ def _validated_state(data, path: str) -> dict[str, dict[str, int]]:
             continue
         good = {}
         for rid, n in rows.items():
-            if isinstance(rid, str) and rid.isdigit() and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            if isinstance(rid, str) and rid.isascii() and rid.isdigit() and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
                 good[rid] = n
             else:
                 dropped += 1
@@ -285,10 +285,11 @@ def parse_feed_response(resp):
 
 def is_duplicate_episode_url(link: str | None, audio_url: str | None, stored_audio_by_url: dict) -> bool:
     """
-    True if a podcast entry's link is already stored as some row's source_url AND that row
-    has the same audio URL. A link alone can be a show homepage shared by many episodes,
-    so without the audio match the caller falls back to the title_norm check.
+    True if a podcast entry's link is already stored as some row's source_url AND one of the
+    rows with that link has the same audio URL. stored_audio_by_url maps source_url -> set of
+    audio URLs: a link alone can be a show homepage shared by many episodes, so without the
+    audio match the caller falls back to the title_norm check.
     """
-    if not link or not audio_url or link not in stored_audio_by_url:
+    if not link or not audio_url:
         return False
-    return stored_audio_by_url[link] == audio_url
+    return audio_url in stored_audio_by_url.get(link, ())
