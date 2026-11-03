@@ -229,8 +229,8 @@ GATE_SNIPPET_BYTES = 8000
 # comment highlights). They mention AI often enough to fool the LLM gate on a short
 # snippet, so reject them by title before spending a model call.
 NON_ARTICLE_TITLE_RE = re.compile(
-    r"^\s*(open (hidden )?(open )?thread|mantic monday|links for \w+|model city monday|"
-    r"highlights from the comments|meetups everywhere|classifieds thread|berkeley meetup)",
+    r"^\s*(open (hidden )?(open )?thread\b|mantic monday\b|links for \w+|model city monday\b|"
+    r"highlights from the comments\b|meetups everywhere\b|classifieds thread\b|berkeley meetup\b)",
     re.IGNORECASE,
 )
 
