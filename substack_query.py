@@ -446,7 +446,8 @@ def fetch_single_post(slug: str, stub: dict, headers: dict):
     post_dict["source_type"] = source_name_for(slug)
     return post_dict
 
-def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None):
+def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None,
+                      existing_urls: set = None):
     """
     Yields post objects parsed from a Substack RSS feed for a given slug,
     up to a limit and respecting the cutoff date.
@@ -458,12 +459,14 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         limit: Maximum number of posts to process
         existing_titles: Set of normalized titles already in content table (for early filtering)
         already_skipped: Set of normalized titles already in skipped_posts table (for early filtering)
+        existing_urls: Set of source_urls already in content table (checked before titles)
     """
     # Initialize sets if not provided (backward compatibility)
     if existing_titles is None:
         existing_titles = set()
     if already_skipped is None:
         already_skipped = set()
+    existing_urls = existing_urls or set()
     
     known_titles = existing_titles | already_skipped
     
@@ -521,6 +524,8 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
             continue # Skip posts older than cutoff
 
         # --- EARLY DATABASE CHECK (NEW) ---
+        if link in existing_urls:
+            continue # Same source_url already in content (e.g. a renamed post)
         title_norm = normalise_title(title)
         if title_norm in known_titles:
             # Remove debug logging here
@@ -573,7 +578,8 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
 # --- Substack Orchestration Function ---
 def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_titles: set, 
                            already_skipped: set, rss_limit: int = 25, 
-                           archive_batch: int = 100, always_add_rss: bool = False):
+                           archive_batch: int = 100, always_add_rss: bool = False,
+                           existing_urls: set | None = None):
     """
     Optimized version that checks database before fetching full posts.
     
@@ -585,6 +591,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         rss_limit: Max posts to fetch via RSS fallback.
         archive_batch: Batch size for archive pagination.
         always_add_rss: If True, always fetches RSS (after archive) to catch newest posts.
+        existing_urls: Set of source_urls already in content table (checked before titles)
     """
     slug = slug_from_thing(source_input)
     if not slug:
@@ -593,6 +600,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
     
     # Combined set for faster lookups
     known_titles = existing_titles | already_skipped
+    existing_urls = existing_urls or set()
     
     posts_to_fetch = []  # List of stubs that need full fetching
     posts_by_id = {}
@@ -610,8 +618,8 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 
             title_norm = normalise_title(title)
             
-            # Skip if already in database or previously skipped
-            if title_norm in known_titles:
+            # Skip if already in database (same URL, e.g. renamed, or same title) or previously skipped
+            if stub.get("canonical_url") in existing_urls or title_norm in known_titles:
                 # Remove debug logging here
                 continue
                 
@@ -681,7 +689,8 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         try:
             rss_count = 0
             # Use existing RSS iterator but with pre-filtering
-            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit, existing_titles=existing_titles, already_skipped=already_skipped):
+            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit, existing_titles=existing_titles,
+                                          already_skipped=already_skipped, existing_urls=existing_urls):
                 if post and post.get('_id'):
                     # Check if this title is already known before adding
                     title_norm = normalise_title(post.get('title', ''))
@@ -965,6 +974,7 @@ def main(limit: int | None = None):
     # --- Connect to DB and fetch existing titles FIRST ---
     conn = None
     existing_titles = set()
+    existing_urls = set()
     already_skipped = set()
     
     try:
@@ -976,8 +986,11 @@ def main(limit: int | None = None):
         with conn.cursor() as cur:
             # Fetch existing titles BEFORE processing any feeds
             print("[INFO] Fetching existing data...")
-            cur.execute("SELECT title_norm FROM content")
-            existing_titles = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT title_norm, source_url FROM content")
+            content_rows = cur.fetchall()
+            existing_titles = {row[0] for row in content_rows}
+            # Dedup by source_url first (catches renamed posts), then by title_norm.
+            existing_urls = {row[1] for row in content_rows if row[1]}
             print(f"   → {len(existing_titles):,} titles in content table")
 
             # Fetch already skipped titles
@@ -1015,6 +1028,7 @@ def main(limit: int | None = None):
             cutoff=CUTOFF_DATE,
             existing_titles=existing_titles,
             already_skipped=already_skipped,
+            existing_urls=existing_urls,
             rss_limit=40, # Max RSS posts per feed if needed
             archive_batch=20, # Archive API page size
             always_add_rss=ALWAYS_FETCH_RSS_NET
@@ -1089,8 +1103,12 @@ def main(limit: int | None = None):
                      skipped_missing_data_count += 1
                      continue # Skip to the next post
 
-                # --- Normalize title and check against existing DB titles (EARLY OUT) ---
+                # --- Check source_url, then normalized title, against existing DB rows (EARLY OUT) ---
                 # Note: This check should be much faster now since most titles were already filtered out
+                if url in existing_urls:
+                    logging.info(f"  -> Skipping post (source_url already in DB): '{title[:60]}...'")
+                    skipped_in_db_count += 1
+                    continue
                 if title_norm in existing_titles:
                     logging.info(f"  -> Skipping post (already in DB): '{title[:60]}...'")
                     skipped_in_db_count += 1
@@ -1368,6 +1386,7 @@ def main(limit: int | None = None):
                     conn.commit()
                     affected_rows_count += 1
                     existing_titles.add(title_norm)
+                    existing_urls.add(url)
                     logging.info(f"  -> DB insert OK: '{title[:60]}...'")
                 except psycopg2.DatabaseError as e:
                     logging.error(f"  -> DB insert FAILED for '{title[:60]}...': {e}")

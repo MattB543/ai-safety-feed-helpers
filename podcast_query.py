@@ -24,6 +24,7 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 import sys
+from collections import Counter
 from urllib.parse import urlparse
 from typing import Optional, List, Dict, Any, Tuple, Set
 
@@ -270,6 +271,8 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         return # Stop iteration if no entries
 
     logging.info(f"Found {len(feed_data.entries)} entries in feed '{source_name}'.")
+    # Some feeds put the show's homepage in every item's <link>; such links can't identify an episode.
+    link_counts = Counter((e.get("link") or "").strip() for e in feed_data.entries)
     feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
     significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
     if feed_title and significant and not any(w in feed_title.lower() for w in significant):
@@ -365,6 +368,7 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
             "post_id": post_id,
             "title": title,
             "link": link,
+            "link_is_unique": link_counts[link] <= 1,  # safe to dedup on source_url
             "published_parsed": entry.get("published_parsed"), # Keep as struct_time for now
             "html_body": html_body,
             "audio_url": audio_url, # Still yield audio_url
@@ -453,9 +457,12 @@ def main():
 
         # -------- 2. Fetch Existing Titles --------
         with conn.cursor() as cur:
-            print("Fetching existing normalized titles from database...")
-            cur.execute("SELECT title_norm FROM content WHERE title_norm IS NOT NULL") # Ensure not null
-            existing_title_norms = {row[0] for row in cur.fetchall() if row[0]} # Filter None just in case
+            print("Fetching existing normalized titles and URLs from database...")
+            cur.execute("SELECT title_norm, source_url FROM content")
+            content_rows = cur.fetchall()
+            existing_title_norms = {row[0] for row in content_rows if row[0]} # Filter None just in case
+            # Dedup by source_url first (catches renamed episodes), then by title_norm.
+            existing_urls = {row[1] for row in content_rows if row[1]}
             print(f"--> Found {len(existing_title_norms):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_title_norms)} existing titles.")
 
@@ -517,6 +524,9 @@ def main():
                 # --- End DEBUG ---
 
                 # Check if already processed or known to be skipped
+                if entry_data.get('link_is_unique') and link in existing_urls:
+                    logging.debug(f"  SKIP (silent): source_url of '{title[:70]}...' already in content.")
+                    continue
                 if title_norm in existing_title_norms or title_norm in already_skipped or post_id in skipped_post_ids:
                     logging.debug(f"  SKIP (silent): Normalized title '{title_norm[:70]}...' already in content or skipped_posts cache.")
                     # No counter increment for this type of skip, as it's a pre-existing state.
@@ -777,6 +787,7 @@ def main():
                         # Add to set to prevent reprocessing duplicates later in this run
                         # even if ON CONFLICT ignored the insert.
                         existing_title_norms.add(title_norm)
+                        existing_urls.add(link)
                         successful_insertions_in_feed += 1 # Increment feed-specific counter
                 except (psycopg2.DatabaseError, Psycopg2OpError) as db_err:
                     logging.error(f"  DB ERROR: Failed to insert post '{title[:70]}...' (ID: {post_id}). Error: {db_err}", exc_info=False) # Keep log concise

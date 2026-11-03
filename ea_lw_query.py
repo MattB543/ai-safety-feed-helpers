@@ -567,11 +567,14 @@ def main(limit: int | None = None):
 
         # -------- 5. Fetch Existing Titles --------
         with conn.cursor() as cur: # Use 'with' for automatic cursor closing
-            print("Fetching existing normalized titles from database...")
-            cur.execute("SELECT title_norm FROM content")
+            print("Fetching existing normalized titles and URLs from database...")
+            cur.execute("SELECT title_norm, source_url FROM content")
             # Fetchall can be memory intensive for huge tables, but likely okay here.
             # Consider server-side cursors or LIMIT/OFFSET for very large tables.
-            existing_titles = {row[0] for row in cur.fetchall()}
+            content_rows = cur.fetchall()
+            existing_titles = {row[0] for row in content_rows}
+            # Dedup by source_url first (catches renamed posts), then by title_norm.
+            existing_urls = {row[1] for row in content_rows if row[1]}
             print(f"--> Found {len(existing_titles):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_titles)} existing titles.")
 
@@ -601,6 +604,10 @@ def main(limit: int | None = None):
                 if norm_title in already_skipped or str(post_id) in skipped_post_ids: # Check this first
                     print(f"  -> Skipping (already marked as skipped or failed this run): Normalized title '{norm_title}'.")
                     logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - already marked as skipped (in skipped_posts or this run).")
+                    continue # Skip to the next post
+                if url in existing_urls:
+                    print(f"  -> Skipping (already in content table): same source_url ({url}).")
+                    logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - source_url already in content table.")
                     continue # Skip to the next post
                 if norm_title in existing_titles:
                     print(f"  -> Skipping (already in content table): Normalized title '{norm_title}'.")
