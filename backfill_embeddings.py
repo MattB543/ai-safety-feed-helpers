@@ -13,13 +13,16 @@ backfill_sentence_summary.py first so the full vector has something to embed.
 
 Exit codes: 0 = done (some rows may have failed; they are retried next run),
 1 = database error or every row attempted failed. Rows that fail 3 times are
-skipped from then on (common.RetryState).
+skipped from then on (common.RetryState); attempts are counted before the API call,
+and a batch UPDATE that hits a bad row is retried row by row so one row can't block
+the rest.
 """
 
 import logging
 import os
 import sys
 
+import psycopg2
 from psycopg2 import extras
 from dotenv import load_dotenv
 
@@ -36,6 +39,32 @@ if not DB_URL:
     sys.exit("Set AI_SAFETY_FEED_DB_URL")
 
 BATCH = 100  # rows per embeddings request (2 vectors per row)
+
+
+UPDATE_SQL = "UPDATE content SET embedding_short=%s, embedding_full=%s WHERE id=%s"
+
+
+def write_updates(conn, updates: list[tuple]) -> list:
+    """Write (short, full, id) updates; on a DB error retry row by row. Returns the ids written."""
+    try:
+        with conn.cursor() as cur:
+            extras.execute_batch(cur, UPDATE_SQL, updates)
+        conn.commit()
+        return [rid for _, _, rid in updates]
+    except psycopg2.Error as e:
+        conn.rollback()
+        logging.warning("Batch UPDATE failed (%s); retrying %d rows one by one.", e, len(updates))
+    written = []
+    for update in updates:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(UPDATE_SQL, update)
+            conn.commit()
+            written.append(update[2])
+        except psycopg2.Error as e:
+            conn.rollback()
+            logging.error("[%s] UPDATE failed: %s", update[2], e)
+    return written
 
 
 def main() -> int:
@@ -80,6 +109,7 @@ def main() -> int:
             if not ids:
                 continue
 
+            retry_state.begin(ids)  # saved now: still counts if this run gets killed
             try:
                 vectors = generate_embeddings_batch(shorts, fulls)
             except Exception as e:
@@ -93,16 +123,11 @@ def main() -> int:
                 for rid, (emb_short, emb_full) in zip(ids, vectors)
                 if emb_short is not None and emb_full is not None
             ]
-            with conn.cursor() as cur:
-                extras.execute_batch(
-                    cur,
-                    "UPDATE content SET embedding_short=%s, embedding_full=%s WHERE id=%s",
-                    updates,
-                )
-            conn.commit()
-            updated += len(updates)
-            done_ids.extend(rid for _, _, rid in updates)
-            missing = [rid for rid, (s, f) in zip(ids, vectors) if s is None or f is None]
+            written = write_updates(conn, updates)
+            updated += len(written)
+            done_ids.extend(written)
+            retry_state.succeeded(written)
+            missing = [rid for rid in ids if rid not in set(written)]
             failed += len(missing)
             failed_ids.extend(missing)
             logging.info("Updated %d rows (running total %d)", len(updates), updated)
@@ -112,7 +137,6 @@ def main() -> int:
         aborted = True
     finally:
         conn.close()
-        retry_state.record(failed=failed_ids, succeeded=done_ids)
     logging.info("Done: %d updated, %d skipped, %d failed", updated, skipped, failed)
     if aborted or (failed and not updated):
         return EXIT_FAILED

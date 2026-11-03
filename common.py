@@ -13,8 +13,9 @@ What lives here:
   • record_skip(): one row into skipped_posts.
   • iso_to_dt(), disable_unreachable_local_proxies().
   • EXIT_* codes the stage scripts return to run_pipeline.py.
-  • RetryState: per-row failure counts (logs/retry_state.json) so rows that keep
+  • RetryState: per-row attempt counts (logs/retry_state.json) so rows that keep
     failing are skipped instead of starving the backlog.
+  • write_json_atomic(): unique temp file + os.replace.
 
 The parked scripts (arxiv, twitter) and archive/ keep their own copies on purpose.
 """
@@ -25,6 +26,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -119,52 +122,152 @@ def disable_unreachable_local_proxies() -> None:
 # ────────────────────────── Poison-row tracking ──────────────────────────
 RETRY_STATE_PATH = os.path.join(LOG_DIR, "retry_state.json")
 MAX_ROW_FAILURES = 3
+_LOCK_WAIT_SEC = 10
+_LOCK_STALE_SEC = 60
+
+
+def _validated_state(data, path: str) -> dict[str, dict[str, int]]:
+    """Keep only {stage: {"<int id>": <int count >= 0>}} entries; log and drop anything else."""
+    if not isinstance(data, dict):
+        logging.warning("%s is not a JSON object; ignoring it.", path)
+        return {}
+    clean: dict[str, dict[str, int]] = {}
+    dropped = 0
+    for stage, rows in data.items():
+        if not isinstance(stage, str) or not isinstance(rows, dict):
+            dropped += 1
+            continue
+        good = {}
+        for rid, n in rows.items():
+            if isinstance(rid, str) and rid.isdigit() and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+                good[rid] = n
+            else:
+                dropped += 1
+        clean[stage] = good
+    if dropped:
+        logging.warning("Dropped %d malformed entr%s from %s.", dropped, "y" if dropped == 1 else "ies", path)
+    return clean
+
+
+def write_json_atomic(path: str, data) -> None:
+    """Write JSON to a unique temp file in the same folder, then os.replace it into place."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1, sort_keys=True, ensure_ascii=False)
+        for attempt in range(10):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:  # Windows: a reader has the target open for a moment
+                if attempt == 9:
+                    raise
+                time.sleep(0.1)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 class RetryState:
     """
-    Per-stage failure counts for content rows, kept in logs/retry_state.json
-    ({stage: {row_id: failures}}). The backfill/novelty loops always pick the newest
-    unfinished rows, so a row that fails every time would be re-selected forever and
-    starve older ones. Rows with MAX_ROW_FAILURES or more failures are skipped (and
-    logged). A success clears the row. Delete the file (or the stage's entry) to give
-    skipped rows another try, e.g. after an API outage.
+    Per-stage attempt counts for content rows, kept in logs/retry_state.json
+    ({stage: {row_id: failed_attempts}}). The backfill/novelty loops always pick the
+    newest unfinished rows, so a row that fails every time would be re-selected forever
+    and starve older ones.
+
+    Usage: begin(ids) BEFORE the external work (it is saved at once, so a row whose call
+    hangs and gets the process killed at the stage deadline still counts), then
+    succeeded(ids) after the row's update is committed. Rows with MAX_ROW_FAILURES or
+    more unfinished attempts are skipped (and logged). Every write reloads the file and
+    merges under a lock file, so concurrent runs don't lose each other's counts.
+    Delete the file (or the stage's entry) to give skipped rows another try, e.g. after
+    an API outage.
     """
 
     def __init__(self, stage: str, path: str = RETRY_STATE_PATH):
         self.stage = stage
         self.path = path
-        self._all: dict[str, dict[str, int]] = {}
+        self.counts: dict[str, int] = {}
+        self._update(lambda rows: None)
+
+    def _load(self) -> dict[str, dict[str, int]]:
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                self._all = {k: v for k, v in data.items() if isinstance(v, dict)}
+            with open(self.path, encoding="utf-8") as f:
+                return _validated_state(json.load(f), self.path)
         except FileNotFoundError:
-            pass
+            return {}
         except (OSError, ValueError) as e:
-            logging.warning("Could not read %s (%s); starting with empty retry state.", path, e)
-        self.counts: dict[str, int] = self._all.setdefault(stage, {})
+            logging.warning("Could not read %s (%s); starting with empty retry state.", self.path, e)
+            return {}
+
+    def _acquire_lock(self) -> int | None:
+        lock = self.path + ".lock"
+        os.makedirs(os.path.dirname(lock) or ".", exist_ok=True)
+        deadline = time.monotonic() + _LOCK_WAIT_SEC
+        while True:
+            try:
+                return os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(lock) > _LOCK_STALE_SEC:
+                        os.remove(lock)  # left behind by a killed process
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    logging.warning("Could not lock %s within %ds; updating it unlocked.", lock, _LOCK_WAIT_SEC)
+                    return None
+                time.sleep(0.05)
+
+    def _update(self, change) -> None:
+        """Reload under the lock, apply change(rows_of_this_stage), save if anything changed."""
+        fd = self._acquire_lock()
+        try:
+            data = self._load()
+            rows = data.setdefault(self.stage, {})
+            before = dict(rows)
+            change(rows)
+            if rows != before:
+                write_json_atomic(self.path, data)
+            self.counts = dict(rows)
+        finally:
+            if fd is not None:
+                os.close(fd)
+                try:
+                    os.remove(self.path + ".lock")
+                except OSError:
+                    pass
 
     def skip_ids(self) -> list[int]:
-        """Row ids that have failed MAX_ROW_FAILURES or more times in this stage (logged)."""
+        """Row ids with MAX_ROW_FAILURES or more unfinished attempts in this stage (logged)."""
+        self._update(lambda rows: None)
         ids = sorted(int(k) for k, n in self.counts.items() if n >= MAX_ROW_FAILURES)
         if ids:
             logging.warning("Skipping %d row(s) that failed %d+ times in %s: %s (see %s)",
                             len(ids), MAX_ROW_FAILURES, self.stage, ids, os.path.basename(self.path))
         return ids
 
-    def record(self, failed: Iterable = (), succeeded: Iterable = ()) -> None:
-        """Count one failure for each failed id, clear succeeded ids, and save."""
-        for rid in failed:
-            self.counts[str(rid)] = self.counts.get(str(rid), 0) + 1
-        for rid in succeeded:
-            self.counts.pop(str(rid), None)
-        self.save()
+    def begin(self, ids: Iterable) -> None:
+        """Count an attempt for each id now; it stays counted unless succeeded() clears it."""
+        ids = [str(i) for i in ids]
 
-    def save(self) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._all, f, indent=1, sort_keys=True)
-        os.replace(tmp, self.path)
+        def change(rows):
+            for rid in ids:
+                rows[rid] = rows.get(rid, 0) + 1
+        if ids:
+            self._update(change)
+
+    def succeeded(self, ids: Iterable) -> None:
+        """Clear ids whose work has been committed."""
+        ids = [str(i) for i in ids]
+
+        def change(rows):
+            for rid in ids:
+                rows.pop(rid, None)
+        if ids:
+            self._update(change)

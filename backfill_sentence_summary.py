@@ -6,9 +6,10 @@ Backfill sentence_summary, paragraph_summary, and key_implication for rows that
 are missing them, using Gemini (google-genai SDK, model from GEMINI_TEXT_MODEL,
 default gemini-3.8-flash).
 
-Exit codes (run_pipeline.py loops on them): 0 = nothing left, 3 = a full batch was
-processed and more rows may remain, 1 = database error or every row in the batch failed.
-Rows that fail 3 times are skipped from then on (common.RetryState).
+Exit codes (run_pipeline.py loops on them): 0 = nothing left to try this run, 3 = more
+eligible rows remain, 1 = database error or every row in the batch failed. Rows that fail
+3 times are skipped from then on (common.RetryState); failures are counted before the API
+calls, so a run killed at the stage deadline still counts.
 """
 
 import os
@@ -175,6 +176,18 @@ The implication should represent a direct consequence of the content's argument,
         return None
     return result
 
+# Rows needing work; %s = ids to leave out (retry-skipped, or already failed this run).
+ELIGIBLE_SQL = """
+    FROM   content
+    WHERE  (
+               sentence_summary IS NULL
+            OR paragraph_summary IS NULL
+            OR key_implication IS NULL
+           )
+           AND (full_content_markdown IS NOT NULL OR full_content IS NOT NULL)
+           AND id <> ALL(%s::bigint[])
+"""
+
 # ───── Main routine ───────────────────────────────────────────
 def main():
     t0 = time.time()
@@ -196,14 +209,7 @@ def main():
         cur.execute("""
             SELECT id, title, sentence_summary, paragraph_summary, key_implication,
                    full_content_markdown, full_content
-            FROM   content
-            WHERE  (
-                       sentence_summary IS NULL
-                    OR paragraph_summary IS NULL
-                    OR key_implication IS NULL
-                   )
-                   AND (full_content_markdown IS NOT NULL OR full_content IS NOT NULL)
-                   AND id <> ALL(%s::bigint[])
+        """ + ELIGIBLE_SQL + """
             ORDER  BY published_date DESC NULLS LAST
             LIMIT  %s
         """, (retry_state.skip_ids(), BATCH_SIZE))
@@ -219,6 +225,7 @@ def main():
         for row in rows:
             row_id = row["id"]
             try:
+                retry_state.begin([row_id])  # saved now: still counts if this run gets killed
                 logging.info(f"[{row_id}] Processing '{row['title'][:60]}...'")
 
                 # Determine what content to use for analysis
@@ -279,7 +286,11 @@ def main():
 
                 # Done only if every missing field is now filled; a partial update still counts as a failure.
                 missing = [k for k in ("sentence_summary", "paragraph_summary", "key_implication") if row[k] is None]
-                (done_ids if all(k in updates for k in missing) else failed_ids).append(row_id)
+                if all(k in updates for k in missing):
+                    done_ids.append(row_id)
+                    retry_state.succeeded([row_id])
+                else:
+                    failed_ids.append(row_id)
 
                 # Small delay to avoid rate limiting
                 time.sleep(0.5)
@@ -295,8 +306,13 @@ def main():
         if len(failed_ids) == len(rows):
             logging.error("Every row in the batch failed (%d).", len(rows))
             exit_code = EXIT_FAILED
-        elif len(rows) >= BATCH_SIZE:
-            exit_code = EXIT_MORE_WORK
+        else:
+            # More work only if eligible rows remain beyond the ones that just failed
+            # (those are retried on a later run, up to the RetryState limit).
+            cur.execute("SELECT count(*) AS n " + ELIGIBLE_SQL, (retry_state.skip_ids() + failed_ids,))
+            remaining = cur.fetchone()["n"]
+            logging.info(f"{remaining} eligible row(s) remain.")
+            exit_code = EXIT_MORE_WORK if remaining else EXIT_DONE
 
     except psycopg2.Error as db_err:
         logging.error(f"Database error: {db_err}", exc_info=True)
@@ -309,7 +325,6 @@ def main():
             conn.rollback()
         exit_code = EXIT_FAILED
     finally:
-        retry_state.record(failed=failed_ids, succeeded=done_ids)
         if cur:
             cur.close()
         if conn:
