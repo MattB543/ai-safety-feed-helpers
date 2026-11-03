@@ -15,7 +15,7 @@ Python scripts that fill the `content` table behind [aisafetyfeed.com](https://a
 | `backfill_embeddings` | `backfill_embeddings.py` | Fills missing `embedding_short` / `embedding_full` |
 | `novelty` | `novelty_analysis.py` | Novelty score + "what's new" note against nearest earlier posts, 21 rows per run, looped |
 
-The three scrapers run the relevance gate, one structured analysis call (`llm_common.analyze_content`) and embeddings per post, then insert. Before inserting they dedup on `source_url` first and then on `title_norm` (lowercased, whitespace collapsed). Rejected posts go to `skipped_posts` so they aren't re-checked.
+The three scrapers run the relevance gate, one structured analysis call (`llm_common.analyze_content`) and embeddings per post, then insert. Before inserting they dedup on `source_url` first and then on `title_norm` (lowercased, whitespace collapsed). Podcasts only treat a `source_url` match as a duplicate when the stored audio URL matches too, because a show homepage can be shared by many episodes. Rejected posts go to `skipped_posts` so they aren't re-checked.
 
 `nightly_refresh.py` then runs `rewrite_titles.py --mode titles` (cleaned titles) and `rewrite_titles.py --mode images-auto` (Gemini illustrations uploaded to Cloudinary).
 
@@ -24,9 +24,9 @@ Shared code: `llm_common.py` (Azure OpenAI client, analysis, relevance gate, emb
 ### Exit codes and failure handling
 
 - Stage scripts exit `0` when done (or nothing left), `3` when more work remains (`run_pipeline.py` runs them again, up to a max loop count), and anything else on failure. A stage that hits its loop cap with work left is reported `INCOMPLETE`.
-- Every stage runs even if an earlier one failed. The enrichment stages always run, since they also pick up older unfinished rows. `run_pipeline.py` exits 1 if any stage wasn't `OK`.
+- Every stage runs even if an earlier one failed. The enrichment stages always run, since they also pick up older unfinished rows. `run_pipeline.py` exits 1 if any stage wasn't `OK`. The scrapers also fail when any feed or publication can't be fetched at all (for Substack, only when both the archive API and the RSS fallback fail).
 - Each stage has a wall-clock deadline (`STAGE_DEADLINE_MIN`: podcast 90 min, others 45). On expiry the child is killed and reported `TIMEOUT`.
-- Poison rows: the summary/embedding/novelty backfills record per-row failures in `logs/retry_state.json` and skip rows that have failed 3 or more times (logged each run). Delete the file, or one stage's entry, to retry them, e.g. after an API outage.
+- Poison rows: the summary/embedding/novelty backfills count an attempt per row in `logs/retry_state.json` before calling the API, and clear it once the row's update is committed. So a call that hangs until the deadline kill still counts. Rows with 3 or more unfinished attempts are skipped (logged each run). Writes are merged under a lock file (`retry_state.json.lock`, removed automatically if stale). Delete the file, or one stage's entry, to retry them, e.g. after an API outage.
 - Podcast transcripts are cached in `cache/transcripts/<sha1 of audio url>.json` (with a `truncated` flag), so a failed analysis or insert doesn't pay for transcription twice. Delete a file to force a fresh transcription.
 
 ## Nightly runbook
