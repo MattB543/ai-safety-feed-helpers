@@ -12,16 +12,21 @@ What lives here:
     existing content.title_norm values (whitespace collapsed, lowercased).
   • record_skip(): one row into skipped_posts.
   • iso_to_dt(), disable_unreachable_local_proxies().
+  • EXIT_* codes the stage scripts return to run_pipeline.py.
+  • RetryState: per-row failure counts (logs/retry_state.json) so rows that keep
+    failing are skipped instead of starving the backlog.
 
 The parked scripts (arxiv, twitter) and archive/ keep their own copies on purpose.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from datetime import datetime, timezone
+from typing import Iterable
 
 import psycopg2
 from dotenv import load_dotenv
@@ -29,6 +34,12 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(HERE, "logs")
+
+# Exit codes the stage scripts return to run_pipeline.py (instead of matching stdout).
+EXIT_DONE = 0        # finished, or nothing left to do
+EXIT_FAILED = 1      # fatal error, or every item attempted this run failed
+EXIT_MORE_WORK = 3   # a full batch was processed and more rows may remain: run again
 
 
 # ────────────────────────── Database ──────────────────────────
@@ -103,3 +114,57 @@ def disable_unreachable_local_proxies() -> None:
             removed.append(f"{key}={value}")
     if removed:
         logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
+
+
+# ────────────────────────── Poison-row tracking ──────────────────────────
+RETRY_STATE_PATH = os.path.join(LOG_DIR, "retry_state.json")
+MAX_ROW_FAILURES = 3
+
+
+class RetryState:
+    """
+    Per-stage failure counts for content rows, kept in logs/retry_state.json
+    ({stage: {row_id: failures}}). The backfill/novelty loops always pick the newest
+    unfinished rows, so a row that fails every time would be re-selected forever and
+    starve older ones. Rows with MAX_ROW_FAILURES or more failures are skipped (and
+    logged). A success clears the row. Delete the file (or the stage's entry) to give
+    skipped rows another try, e.g. after an API outage.
+    """
+
+    def __init__(self, stage: str, path: str = RETRY_STATE_PATH):
+        self.stage = stage
+        self.path = path
+        self._all: dict[str, dict[str, int]] = {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._all = {k: v for k, v in data.items() if isinstance(v, dict)}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            logging.warning("Could not read %s (%s); starting with empty retry state.", path, e)
+        self.counts: dict[str, int] = self._all.setdefault(stage, {})
+
+    def skip_ids(self) -> list[int]:
+        """Row ids that have failed MAX_ROW_FAILURES or more times in this stage (logged)."""
+        ids = sorted(int(k) for k, n in self.counts.items() if n >= MAX_ROW_FAILURES)
+        if ids:
+            logging.warning("Skipping %d row(s) that failed %d+ times in %s: %s (see %s)",
+                            len(ids), MAX_ROW_FAILURES, self.stage, ids, os.path.basename(self.path))
+        return ids
+
+    def record(self, failed: Iterable = (), succeeded: Iterable = ()) -> None:
+        """Count one failure for each failed id, clear succeeded ids, and save."""
+        for rid in failed:
+            self.counts[str(rid)] = self.counts.get(str(rid), 0) + 1
+        for rid in succeeded:
+            self.counts.pop(str(rid), None)
+        self.save()
+
+    def save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._all, f, indent=1, sort_keys=True)
+        os.replace(tmp, self.path)

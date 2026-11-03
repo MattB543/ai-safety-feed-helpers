@@ -48,6 +48,7 @@ from llm_common import (
 )
 # Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
 from common import (
+    EXIT_DONE, EXIT_FAILED,
     disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
 )
 
@@ -202,8 +203,8 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
         limit: The maximum number of posts to retrieve.
 
     Returns:
-        A list of post dictionaries, or an empty list if fetching fails or
-        no posts are found.
+        A list of post dictionaries (possibly empty), or None if the fetch
+        failed (the caller reports that as a stage failure).
     """
     # Determine the view clause based on whether a tag_id is provided
     if tag_id:
@@ -263,7 +264,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                         # Final attempt failed
                         logging.error(f"Query failed for {source_desc}: 429 Client Error: Too Many Requests after {max_retries} attempts")
                         print(f"ERROR: Query failed for {source_desc}: Rate limit (429) persisted after {max_retries} attempts.")
-                        return []
+                        return None
 
                 response.raise_for_status() # Raise HTTPError for other bad responses (4xx or 5xx)
 
@@ -275,7 +276,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                     print(f"ERROR: GraphQL API ({source_desc}) returned errors. Check logs.")
                     # Optionally log the failed query for debugging (be careful with sensitive data if any)
                     # logging.debug(f"Failed GraphQL query was:\n{query}")
-                    return [] # Return empty list on GraphQL errors
+                    return None
 
                 # Check for expected data structure
                 if "data" not in result or "posts" not in result["data"] or "results" not in result["data"]["posts"]:
@@ -283,7 +284,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                      print(f"WARNING: Unexpected response structure from {source_desc}. Check logs.")
                      # Log the actual data received for debugging
                      # logging.debug(f"Response data received: {json.dumps(result.get('data', {}), indent=2)}")
-                     return [] # Return empty list if structure is wrong
+                     return None
 
                 posts_data = result["data"]["posts"]["results"]
                 print(f"Successfully fetched {len(posts_data)} posts from {source_desc}.")
@@ -305,19 +306,19 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                     continue
                 logging.error(f"Query failed for {source_desc} after {max_retries} attempts: {e}")
                 print(f"ERROR: Query failed for {source_desc} after {max_retries} attempts: {e}")
-                return []
+                return None
             except requests.exceptions.HTTPError as e:
                 # Handle other HTTP errors (not 429, which is handled above)
                 logging.error(f"Query failed for {source_desc}: {e}", exc_info=True)
                 print(f"ERROR: Query failed for {source_desc}: {e}")
                 if hasattr(e, 'response') and e.response is not None:
                     logging.error(f"Response status code: {e.response.status_code}")
-                return []
+                return None
 
     except requests.exceptions.Timeout:
         logging.error(f"Query failed for {source_desc}: Request timed out.")
         print(f"ERROR: Query failed for {source_desc}: Request timed out.")
-        return []
+        return None
     except requests.exceptions.RequestException as e:
         logging.error(f"Query failed for {source_desc}: {e}", exc_info=True)
         print(f"ERROR: Query failed for {source_desc}: {e}")
@@ -325,19 +326,19 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
             logging.error(f"Response status code: {e.response.status_code}")
             # Avoid logging potentially large response bodies directly unless debugging
             # logging.debug(f"Response body (truncated): {e.response.text[:500]}...")
-        return []
+        return None
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response from {source_desc}: {e}")
         print(f"ERROR: Failed to decode JSON response from {source_desc}. Check logs.")
         # Log the response text that failed to parse
         # if hasattr(response, 'text'):
         #     logging.debug(f"Response text was (truncated): {response.text[:500]}...")
-        return []
+        return None
     except Exception as e:
         # Catch any other unexpected errors during the fetch process
         logging.error(f"An unexpected error occurred fetching posts from {source_desc}: {e}", exc_info=True)
         print(f"ERROR: An unexpected error occurred fetching posts from {source_desc}. Check logs.")
-        return []
+        return None
 
 # ================================================================
 #                     Source‑Specific Filtering
@@ -499,6 +500,8 @@ def choose_highest_score(posts: list[dict]) -> list[dict]:
 def main(limit: int | None = None):
     """
     Main execution function (limit: process at most N new posts; for canary runs).
+    Returns EXIT_FAILED if a forum fetch failed, the database failed, or every post
+    that needed work failed (nothing inserted or recorded); otherwise EXIT_DONE.
     1. Fetches posts from EA, LW, AF.
     2. Filters posts based on criteria.
     3. Deduplicates posts by title, keeping highest score.
@@ -519,11 +522,15 @@ def main(limit: int | None = None):
     lw_raw = get_forum_posts(LW_API_URL, LW_AI_SAFETY_TAG_ID, limit=DEFAULT_LIMIT)
     # Alignment Forum posts arrive via the LessWrong query with af=true (see filter_lw_posts).
     # The separate AF endpoint was rate-limited on every run and is no longer queried.
+    fetch_failed = [name for name, raw in (("EA Forum", ea_raw), ("LessWrong", lw_raw)) if raw is None]
+    if fetch_failed:
+        # Keep going with whatever was fetched; the run still exits non-zero at the end.
+        print(f"ERROR: fetch failed for {', '.join(fetch_failed)}; continuing with the other source.")
 
     # -------- 2. Filter Data --------
     print("\n--- Filtering Posts ---")
-    ea_posts = filter_ea_posts(ea_raw, EA_AI_SAFETY_TAG_ID)
-    lw_posts = filter_lw_posts(lw_raw)
+    ea_posts = filter_ea_posts(ea_raw or [], EA_AI_SAFETY_TAG_ID)
+    lw_posts = filter_lw_posts(lw_raw or [])
 
     # -------- 3. Combine & Deduplicate --------
     combined_filtered_posts = ea_posts + lw_posts
@@ -536,7 +543,7 @@ def main(limit: int | None = None):
     if not unique_posts:
         print("\nNo unique posts remaining after filtering and deduplication. Nothing to process. Exiting.")
         logging.info("No unique posts remaining after filtering and deduplication. Exiting.")
-        return # Exit gracefully if no posts left
+        return EXIT_FAILED if fetch_failed else EXIT_DONE
 
     # -------- 4. Database Connection & Setup --------
     conn = None
@@ -548,6 +555,7 @@ def main(limit: int | None = None):
     embedding_failures_count = 0 # Track embedding generation failures
     total_skipped_recorded_in_db_count = 0 # New counter for skips recorded in DB
     new_posts_started = 0 # For --limit
+    fatal_error = False # DB connection/unexpected error: report the stage as failed
 
     try:
         print("\n--- Connecting to Database ---")
@@ -828,17 +836,20 @@ def main(limit: int | None = None):
         # Errors during connection itself
         logging.critical(f"FATAL: Database connection failed: {e}", exc_info=True)
         print(f"FATAL ERROR: Database connection failed: {e}")
+        fatal_error = True
         # Cannot proceed without DB connection
     except psycopg2.DatabaseError as e:
         # Other database errors (e.g., during initial title fetch)
         logging.error(f"Database error occurred outside batch processing: {e}", exc_info=True)
         print(f"ERROR: Database error occurred: {e}")
+        fatal_error = True
         if conn:
             conn.rollback() # Rollback any potential changes if connection exists
     except Exception as e:
         # Catch-all for unexpected errors in the main processing block
         logging.error(f"An unexpected error occurred in the main processing loop: {e}", exc_info=True)
         print(f"ERROR: An unexpected error occurred: {e}")
+        fatal_error = True
         if conn:
             conn.rollback() # Rollback on general errors too
     finally:
@@ -867,9 +878,16 @@ def main(limit: int | None = None):
     print("================================================================")
     logging.info(f"Script finished. Duration: {duration:.2f}s. Processed: {processed_count}. DB Success: {affected_rows_count}. DB Fail: {total_db_failures}. Analysis Fail: {failed_analysis_count}. Embedding Fail: {embedding_failures_count}. Recorded Skips: {total_skipped_recorded_in_db_count}.")
 
+    succeeded = affected_rows_count + total_skipped_recorded_in_db_count
+    failed = failed_analysis_count + embedding_failures_count + total_db_failures
+    if fatal_error or fetch_failed or (failed and not succeeded):
+        print("EXIT: stage FAILED (fetch/database error, or every post needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
+
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="EA Forum / LessWrong / Alignment Forum ingestion")
     ap.add_argument("--limit", type=int, default=None, help="Process at most N new posts (canary runs)")
-    main(limit=ap.parse_args().limit)
+    sys.exit(main(limit=ap.parse_args().limit))

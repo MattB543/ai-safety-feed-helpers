@@ -42,7 +42,10 @@ from llm_common import (
 )
 from gemini_transcribe import transcribe_audio_gemini, gemini_transcription_configured
 # Shared non-LLM helpers (DB connection, title_norm, skips, proxy cleanup).
-from common import disable_unreachable_local_proxies, get_db_connection, normalise_title, record_skip
+from common import (
+    EXIT_DONE, EXIT_FAILED,
+    disable_unreachable_local_proxies, get_db_connection, normalise_title, record_skip,
+)
 
 # ================================================================
 #                      Environment & Setup
@@ -390,6 +393,8 @@ def make_serializable(obj):
         return repr(obj) # Represent as string
 
 def main():
+    """Returns EXIT_FAILED on a DB connection failure or when something failed and nothing
+    succeeded (no insert, no recorded skip); otherwise EXIT_DONE."""
     start_time = time.time()
     print("================================================================")
     print(f"Starting Podcast Feed Ingestion Script at {datetime.now(timezone.utc)}")
@@ -416,6 +421,7 @@ def main():
     total_db_insert_failures = 0
     total_gate_errors = 0
     total_transcription_failures = 0
+    fatal_error = False
 
     try:
         # -------- 1. Database Connection & Setup --------
@@ -778,6 +784,7 @@ def main():
     except Psycopg2OpError as e:
         logging.critical(f"FATAL: Database connection failed: {e}", exc_info=True)
         print(f"FATAL ERROR: Database connection failed: {e}")
+        fatal_error = True
     except KeyboardInterrupt:
          logging.warning("KeyboardInterrupt received. Attempting graceful shutdown.")
          print("\nKeyboard interrupt detected. Shutting down...")
@@ -799,6 +806,13 @@ def main():
         print(f"DB insert failures:               {total_db_insert_failures}")
         print(f"Elapsed:                          {time.time() - start_time:.0f}s")
 
+    succeeded = total_inserted_count + total_skipped_count
+    failed = total_failed_analysis_count + total_gate_errors + total_transcription_failures + total_db_insert_failures
+    if fatal_error or (failed and not succeeded):
+        print("EXIT: stage FAILED (database error, or every episode needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Podcast RSS ingestion")
@@ -808,4 +822,4 @@ if __name__ == "__main__":
     if _args.max_inserts_per_feed:
         TARGET_INSERTIONS_PER_FEED = _args.max_inserts_per_feed
     MAX_FEEDS = _args.max_feeds
-    main()
+    sys.exit(main())

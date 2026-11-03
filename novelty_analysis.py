@@ -5,6 +5,10 @@ novelty_analysis.py
 Compute a "uniqueness / novelty" score plus a short
 'what-this-adds' note for the newest posts that still lack them,
 using **Azure OpenAI**.
+
+Exit codes (run_pipeline.py loops on them): 0 = nothing left, 3 = a full batch was
+processed and more rows may remain, 1 = database error or every row in the batch failed.
+Rows that fail 3 times are skipped from then on (common.RetryState).
 """
 
 # ───── Imports ────────────────────────────────────────────────
@@ -19,7 +23,7 @@ load_dotenv(override=True)
 from llm_common import (  # noqa: E402
     AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
 )
-from common import get_db_connection  # noqa: E402
+from common import EXIT_DONE, EXIT_FAILED, EXIT_MORE_WORK, RetryState, get_db_connection  # noqa: E402
 
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL = os.getenv("AI_SAFETY_FEED_DB_URL")
@@ -255,6 +259,10 @@ def main():
     conn = None
     cur  = None
     processed_count = 0
+    retry_state = RetryState("novelty")
+    failed_ids, done_ids = [], []
+    refs = []
+    exit_code = EXIT_DONE
     try:
         conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=extras.RealDictCursor)
@@ -267,13 +275,14 @@ def main():
             FROM   content
             WHERE  novelty_score IS NULL
                    AND embedding_full IS NOT NULL
+                   AND id <> ALL(%s::bigint[])
             ORDER  BY published_date DESC NULLS LAST
             LIMIT  %s
-        """, (BATCH,))
+        """, (retry_state.skip_ids(), BATCH))
         refs = cur.fetchall()
         if not refs:
             logging.info("Nothing to back‑fill – all caught up.")
-            return
+            return EXIT_DONE
 
         logging.info("Fetched %d refs to process.", len(refs))
 
@@ -319,6 +328,7 @@ def main():
                 # for a later run instead of falling through to the "no overlaps" prompt.
                 if overlap_ids is None or (isinstance(overlap_ids, dict) and "error" in overlap_ids):
                     logging.warning("   → Overlap call failed or reported an error for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    failed_ids.append(rid)
                     continue
                 if isinstance(overlap_ids, dict):
                     ids_raw = overlap_ids.get("ids", overlap_ids.get("result"))
@@ -326,6 +336,7 @@ def main():
                     ids_raw = overlap_ids
                 if not isinstance(ids_raw, list):
                     logging.warning("   → Unexpected overlap response format for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    failed_ids.append(rid)
                     continue
                 candidate_ids = {c["id"] for c in cands}
                 overlap_int_ids = set()
@@ -338,6 +349,7 @@ def main():
                         overlap_int_ids.add(value)
                 if ids_raw and not overlap_int_ids:
                     logging.warning("   → Overlap response for [%s] contained no valid candidate IDs: %s. Leaving row for a later run.", rid, ids_raw)
+                    failed_ids.append(rid)
                     continue
 
                 overlaps = [c for c in cands if c["id"] in overlap_int_ids]
@@ -377,6 +389,7 @@ def main():
 
                 if nov is None:
                     logging.warning("   → LLM call failed or returned invalid JSON for [%s]. Skipping DB update.", rid)
+                    failed_ids.append(rid)
                     continue
 
                 if isinstance(nov, list) and len(nov) == 1 and isinstance(nov[0], dict):
@@ -391,6 +404,7 @@ def main():
                 if (isinstance(raw_score, bool) or not isinstance(raw_score, (int, float))
                         or not isinstance(note, str) or not note.strip()):
                     logging.warning("   → Novelty response malformed for [%s]: %s. Leaving row for a later run.", rid, nov)
+                    failed_ids.append(rid)
                     continue
                 score = max(0, min(100, int(round(raw_score))))
                 note = note.strip()
@@ -405,29 +419,40 @@ def main():
                 conn.commit()
                 logging.info("   → DB updated successfully for [%s].", rid)
                 processed_count += 1
+                done_ids.append(rid)
 
             except Exception as e:
                 logging.error("Failed to process ref [%s]: %s", rid, e, exc_info=True)
                 if conn:
                     conn.rollback()
+                failed_ids.append(rid)
 
         logging.info("Finished processing. Successfully updated %d/%d refs in %.1fs",
                      processed_count, len(refs), time.time() - t0)
+        if processed_count == 0:
+            logging.error("Every ref in the batch failed (%d).", len(refs))
+            exit_code = EXIT_FAILED
+        elif len(refs) >= BATCH:
+            exit_code = EXIT_MORE_WORK
 
     except psycopg2.Error as db_err:
         logging.error("Database error occurred: %s", db_err, exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     except Exception as e:
         logging.error("An unexpected error occurred: %s", e, exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     finally:
+        retry_state.record(failed=failed_ids, succeeded=done_ids)
         if cur:
             cur.close()
         if conn:
             conn.close()
         logging.info("Database connection closed.")
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

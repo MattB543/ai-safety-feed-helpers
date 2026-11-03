@@ -166,3 +166,6 @@ url_counts_*.csv
 # One-off reports kept locally, not tracked
 ai_safety_november_2025.md
 tag_frequency_report.csv
+
+# Pipeline logs, image cost reports and the poison-row retry state (logs/retry_state.json)
+logs/

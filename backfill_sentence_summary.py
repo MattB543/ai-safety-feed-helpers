@@ -5,6 +5,10 @@ backfill_sentence_summary.py
 Backfill sentence_summary, paragraph_summary, and key_implication for rows that
 are missing them, using Gemini (google-genai SDK, model from GEMINI_TEXT_MODEL,
 default gemini-3.8-flash).
+
+Exit codes (run_pipeline.py loops on them): 0 = nothing left, 3 = a full batch was
+processed and more rows may remain, 1 = database error or every row in the batch failed.
+Rows that fail 3 times are skipped from then on (common.RetryState).
 """
 
 import os
@@ -17,7 +21,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai import errors as genai_errors
-from common import get_db_connection
+from common import EXIT_DONE, EXIT_FAILED, EXIT_MORE_WORK, RetryState, get_db_connection
 from tenacity import (
     before_sleep_log,
     retry,
@@ -178,6 +182,10 @@ def main():
     cur = None
     processed_count = 0
     skipped_count = 0
+    retry_state = RetryState("backfill_summary")
+    failed_ids, done_ids = [], []
+    rows = []
+    exit_code = EXIT_DONE
 
     try:
         conn = get_db_connection()
@@ -195,14 +203,15 @@ def main():
                     OR key_implication IS NULL
                    )
                    AND (full_content_markdown IS NOT NULL OR full_content IS NOT NULL)
+                   AND id <> ALL(%s::bigint[])
             ORDER  BY published_date DESC NULLS LAST
             LIMIT  %s
-        """, (BATCH_SIZE,))
+        """, (retry_state.skip_ids(), BATCH_SIZE))
 
         rows = cur.fetchall()
         if not rows:
             logging.info("✓ All rows have summary/key-implication fields - nothing to backfill.")
-            return
+            return EXIT_DONE
 
         logging.info(f"Found {len(rows)} rows to process (model: {GEMINI_MODEL}).")
 
@@ -217,6 +226,7 @@ def main():
                 if not content or content.isspace():
                     logging.warning(f"[{row_id}] Skipping - no usable content")
                     skipped_count += 1
+                    failed_ids.append(row_id)
                     continue
 
                 # Generate missing summaries
@@ -267,6 +277,10 @@ def main():
                     logging.warning(f"[{row_id}] No updates generated - all API calls failed")
                     skipped_count += 1
 
+                # Done only if every missing field is now filled; a partial update still counts as a failure.
+                missing = [k for k in ("sentence_summary", "paragraph_summary", "key_implication") if row[k] is None]
+                (done_ids if all(k in updates for k in missing) else failed_ids).append(row_id)
+
                 # Small delay to avoid rate limiting
                 time.sleep(0.5)
 
@@ -275,23 +289,33 @@ def main():
                 if conn:
                     conn.rollback()
                 skipped_count += 1
+                failed_ids.append(row_id)
 
         logging.info(f"✓ Finished: {processed_count} updated, {skipped_count} skipped in {time.time() - t0:.1f}s")
+        if len(failed_ids) == len(rows):
+            logging.error("Every row in the batch failed (%d).", len(rows))
+            exit_code = EXIT_FAILED
+        elif len(rows) >= BATCH_SIZE:
+            exit_code = EXIT_MORE_WORK
 
     except psycopg2.Error as db_err:
         logging.error(f"Database error: {db_err}", exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     except Exception as e:
         logging.error(f"Unexpected error: {e}", exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     finally:
+        retry_state.record(failed=failed_ids, succeeded=done_ids)
         if cur:
             cur.close()
         if conn:
             conn.close()
         logging.info("Database connection closed.")
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

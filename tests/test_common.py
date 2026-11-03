@@ -23,3 +23,16 @@ def test_iso_to_dt():
     assert iso_to_dt("2026-11-03T10:00:00") == datetime(2026, 11, 3, 10, tzinfo=timezone.utc)
     assert iso_to_dt("not a date") is None
     assert iso_to_dt(None) is None
+
+
+def test_retry_state_skips_rows_after_three_failures(tmp_path):
+    from common import RetryState
+
+    path = str(tmp_path / "retry_state.json")
+    for _ in range(3):
+        RetryState("novelty", path).record(failed=[7, 8])
+    RetryState("novelty", path).record(failed=[9], succeeded=[8])
+    state = RetryState("novelty", path)
+    assert state.skip_ids() == [7]
+    assert state.counts == {"7": 3, "9": 1}
+    assert RetryState("backfill_summary", path).skip_ids() == []

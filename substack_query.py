@@ -37,11 +37,14 @@ from llm_common import (
 )
 # Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
 from common import (
+    EXIT_DONE, EXIT_FAILED,
     disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
 )
 
 # --- Top Level Buffer ---
 SKIPPED_BUFFER = deque()   # (post_id, title_norm, url)
+# Fetch-phase failures left for the next run (gate unavailable, full-post fetch failed); used for the exit code.
+FETCH_RETRY_LATER = {"gate_error": 0, "fetch_failed": 0}
 
 def buffer_skip(post_id, title, url):
     """Add a post to the skip buffer, avoiding duplicates."""
@@ -556,6 +559,7 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         verdict = is_ai_safety_post(post_dict["title"], post_dict["htmlBody"])
         if verdict is None:
             print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
+            FETCH_RETRY_LATER["gate_error"] += 1
             continue                      # not recorded as skipped
         if not verdict:
             print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
@@ -646,6 +650,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
             elif result == "gate_error":
                 outcomes["gate_error"] += 1
+                FETCH_RETRY_LATER["gate_error"] += 1
                 print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
             elif result == "unusable":
                 outcomes["unusable"] += 1
@@ -654,6 +659,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 print(f"   [SKIP] Paywalled or missing fields: '{title[:50]}...'")
             else:
                 outcomes["fetch_failed"] += 1
+                FETCH_RETRY_LATER["fetch_failed"] += 1
                 print(f"   [FAIL] Failed to fetch: '{title[:50]}...'")
 
         print(f"   [OK] Archive fetch complete: {successful_fetches} kept, "
@@ -941,6 +947,8 @@ def backfill_missing_analysis(batch_size=10):
 
 def main(limit: int | None = None):
     # limit: process at most N new posts (canary runs)
+    # Returns EXIT_FAILED when something failed and nothing succeeded (no insert, no recorded
+    # skip); fatal DB errors sys.exit(1) directly. Otherwise EXIT_DONE.
     # Setup logging (already done at the top)
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1029,7 +1037,11 @@ def main(limit: int | None = None):
 
     if not unique_posts:
         print(f"[INFO] No new posts to process ({early_skip_count} skips recorded).")
-        return
+        retry_later = sum(FETCH_RETRY_LATER.values())
+        if retry_later and not early_skip_count:
+            print(f"EXIT: stage FAILED ({retry_later} gate/fetch failures and nothing succeeded).")
+            return EXIT_FAILED
+        return EXIT_DONE
 
     # --- Process Posts and Insert into Database ---
     processed_count = 0
@@ -1391,6 +1403,14 @@ def main(limit: int | None = None):
     print(f"Posts prepared for DB insertion:        {posts_to_insert}")
     print(f"DB rows affected (estimate):            {affected_rows_count}") # Estimate based on batch success/retries
     print(f"DB insert failures (individual rows):   {total_failures}")
+    print(f"Gate/fetch failures (retry next run):   {FETCH_RETRY_LATER['gate_error'] + FETCH_RETRY_LATER['fetch_failed']}")
+
+    succeeded = affected_rows_count + total_skipped_by_record_count
+    failed = failed_analysis_count + total_failures + sum(FETCH_RETRY_LATER.values())
+    if failed and not succeeded:
+        print("EXIT: stage FAILED (every post needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
 
 
 if __name__ == "__main__":
@@ -1437,4 +1457,4 @@ Examples:
     if args.backfill:
         backfill_missing_analysis(batch_size=args.batch_size)
     else:
-        main(limit=args.limit)
+        sys.exit(main(limit=args.limit))
