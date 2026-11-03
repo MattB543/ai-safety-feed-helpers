@@ -162,3 +162,7 @@ test_*.txt
 tweets_export.md
 url_counts_*.csv
 *_leaderboard_*_x_links.txt
+
+# One-off reports kept locally, not tracked
+ai_safety_november_2025.md
+tag_frequency_report.csv
