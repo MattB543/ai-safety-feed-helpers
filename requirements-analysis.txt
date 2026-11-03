@@ -1,0 +1,8 @@
+# One-off analysis scripts in analysis/ (embedding_analysis.py topic modelling etc.).
+# Not needed for the nightly pipeline. Install on top of requirements.txt.
+bertopic>=0.15.0
+umap-learn>=0.5.3
+hdbscan>=0.8.29
+scikit-learn>=1.0.0
+plotly>=5.0.0
+matplotlib>=3.5.0
