@@ -403,11 +403,18 @@ def handle_auto_image_generation(rows):
                  GEMINI_USAGE["calls"], GEMINI_USAGE["images"], GEMINI_USAGE["prompt_tokens"], GEMINI_USAGE["output_tokens"], gemini_image_cost_usd(), GEMINI_IMAGE_USD_EACH)
     logging.info("ESTIMATED TOTAL ≈ $%.3f (%s per image incl. concept extraction). Per-item breakdown: %s; local copies: %s/",
                  total, f"${total / max(updated, 1):.3f}", csv_filename, images_dir)
+    if rows and not updated:
+        logging.error("Every image in this run failed (%d).", len(rows))
+        return 1
+    return 0
 
 
 def main():
+    """Exit code (used by nightly_refresh.py): 1 on a DB error, a missing column, or when a
+    'titles' / 'images-auto' run updated nothing although rows needed work; otherwise 0."""
     t0 = time.time()
     conn = cur = None
+    exit_code = 0
     updated = 0
 
     parser = argparse.ArgumentParser(description="Generate cleaned titles and/or images for content.")
@@ -462,7 +469,7 @@ def main():
         if not cur.fetchone():
             logging.error("The 'image_prompt' column does not exist in the 'content' table.")
             logging.error("Please run: ALTER TABLE content ADD COLUMN image_prompt text;")
-            return
+            return 1
 
         # 1️⃣  Select rows based on mode
         select_query = ""
@@ -700,15 +707,20 @@ def main():
 
         logging.info("Done — processed %d items, updated %d rows in %.1fs",
                      len(rows), updated, time.time() - t0)
+        if mode == "titles" and not updated:
+            logging.error("Every title in this run failed (%d).", len(rows))
+            exit_code = 1
 
     except psycopg2.Error as db_err:
         logging.error("Database error: %s", db_err, exc_info=True)
+        exit_code = 1
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
         logging.info("Database connection closed.")
+    return exit_code
 
 
 def handle_batch_image_generation(rows):
@@ -962,4 +974,4 @@ def _show_temp_image(b64_bytes: bytes, variant_idx: int):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)
