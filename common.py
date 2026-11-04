@@ -55,6 +55,9 @@ def get_db_connection(*, register_vectors: bool = False):
     if register_vectors:
         from pgvector.psycopg2 import register_vector
         register_vector(conn)
+        # register_vector runs a query, which opens a transaction; end it so callers
+        # can still set conn.autocommit (psycopg2 refuses inside a transaction).
+        conn.commit()
     return conn
 
 
