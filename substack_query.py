@@ -20,7 +20,6 @@ from markdownify import markdownify # Add markdownify import
 import psycopg2 # Add psycopg2 import
 from psycopg2 import extras # Import extras for batch insertion
 from dotenv import load_dotenv # Add dotenv import
-from pgvector.psycopg2 import register_vector # Add pgvector import
 import feedparser # Add feedparser import
 from urllib.parse import urlparse # Add urlparse import
 from bs4 import BeautifulSoup # Add BeautifulSoup import
@@ -36,41 +35,19 @@ from llm_common import (
     LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
     generate_embeddings, is_ai_safety_content, check_llm_or_exit,
 )
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break feed/API requests.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
+# Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
+from common import (
+    EXIT_DONE, EXIT_FAILED,
+    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, parse_feed_response,
+    record_skip,
+)
 
 # --- Top Level Buffer ---
 SKIPPED_BUFFER = deque()   # (post_id, title_norm, url)
-
-# --- Helper for title normalization ---
-def normalise_title(t: str) -> str:
-    """Normalize title: lowercase, replace multiple spaces with single, strip leading/trailing."""
-    if not isinstance(t, str): return "" # Handle non-string input
-    return re.sub(r'\s+', ' ', t).strip().lower()
-
-def clean_title_for_storage(title: str | None) -> str | None:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r'\s+', ' ', title).strip()
+# Fetch-phase failures left for the next run (gate unavailable, full-post fetch failed); used for the exit code.
+FETCH_RETRY_LATER = {"gate_error": 0, "fetch_failed": 0}
+# Publications where the archive API failed AND the RSS fallback failed (any makes the stage exit 1).
+FEED_FAILURES: list = []
 
 def buffer_skip(post_id, title, url):
     """Add a post to the skip buffer, avoiding duplicates."""
@@ -83,7 +60,7 @@ def buffer_skip(post_id, title, url):
              url)
         )
 
-def flush_skip_buffer(db_url: str) -> list:
+def flush_skip_buffer() -> list:
     """
     Insert buffered gate/cutoff/paywall skips in their OWN transaction, so they
     persist even when this run accepts no posts. Returns the rows written.
@@ -91,7 +68,7 @@ def flush_skip_buffer(db_url: str) -> list:
     if not SKIPPED_BUFFER:
         return []
     rows = list(SKIPPED_BUFFER)
-    conn = psycopg2.connect(db_url)
+    conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             extras.execute_values(
@@ -205,23 +182,6 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-# --- Helper SQL & function for skipping posts ---
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
-    """
-    Insert one row into skipped_posts and keep the caller side-effect-free
-    (no commit here – caller decides when to commit or roll back).
-    """
-    cur.execute(SKIP_INSERT_SQL,
-                (str(post_id) if post_id else "N/A",
-                 str(title_norm),
-                 source_url))
-
 # --- Relevance gate (shared implementation in llm_common) ---
 GATE_SNIPPET_BYTES = 8000
 
@@ -229,8 +189,8 @@ GATE_SNIPPET_BYTES = 8000
 # comment highlights). They mention AI often enough to fool the LLM gate on a short
 # snippet, so reject them by title before spending a model call.
 NON_ARTICLE_TITLE_RE = re.compile(
-    r"^\s*(open (hidden )?(open )?thread|mantic monday|links for \w+|model city monday|"
-    r"highlights from the comments|meetups everywhere|classifieds thread|berkeley meetup)",
+    r"^\s*(open (hidden )?(open )?thread\b|mantic monday\b|links for \w+|model city monday\b|"
+    r"highlights from the comments\b|meetups everywhere\b|classifieds thread\b|berkeley meetup\b)",
     re.IGNORECASE,
 )
 
@@ -256,23 +216,6 @@ def safe_int_or_zero(value):
     if value is None: return 0
     try: return int(value)
     except (ValueError, TypeError): return 0
-
-# Helper to parse ISO date strings reliably
-def iso_to_dt(iso_string: str) -> datetime | None:
-    """Converts ISO 8601 string to timezone-aware datetime object (UTC)."""
-    if not iso_string:
-        return None
-    try:
-        # Handle 'Z' suffix for UTC
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        # Ensure timezone is UTC if naive
-        if dt_obj.tzinfo is None:
-            return dt_obj.replace(tzinfo=timezone.utc)
-        # Convert to UTC if it has another timezone
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError):
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'")
-        return None
 
 # Helper to extract Substack slug from URL or pass through if already a slug
 def slug_from_thing(source: str) -> str | None:
@@ -506,7 +449,8 @@ def fetch_single_post(slug: str, stub: dict, headers: dict):
     post_dict["source_type"] = source_name_for(slug)
     return post_dict
 
-def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None):
+def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_titles: set = None, already_skipped: set = None,
+                      existing_urls: set = None):
     """
     Yields post objects parsed from a Substack RSS feed for a given slug,
     up to a limit and respecting the cutoff date.
@@ -518,12 +462,14 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         limit: Maximum number of posts to process
         existing_titles: Set of normalized titles already in content table (for early filtering)
         already_skipped: Set of normalized titles already in skipped_posts table (for early filtering)
+        existing_urls: Set of source_urls already in content table (checked before titles)
     """
     # Initialize sets if not provided (backward compatibility)
     if existing_titles is None:
         existing_titles = set()
     if already_skipped is None:
         already_skipped = set()
+    existing_urls = existing_urls or set()
     
     known_titles = existing_titles | already_skipped
     
@@ -537,21 +483,26 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         )
     }
     try:
-        # Feedparser handles network errors internally to some extent
-        # Pass request_headers to feedparser.parse
-        d = feedparser.parse(feed_url, request_headers=headers)
+        # Fetch with requests (feedparser's built-in fetch has no timeout), then parse the bytes.
+        resp = requests.get(feed_url, headers=headers, timeout=45)
+        resp.raise_for_status()
+        d = parse_feed_response(resp)
         if d.bozo: # Check if feedparser encountered issues
              logging.warning(f"Error parsing RSS feed for '{slug}': {d.bozo_exception}")
              # Optionally return here if strict error handling is needed
              # return
     except Exception as e:
-         # Catch unexpected errors during parsing setup
+         # Raised so fetch_substack_optimized can tell a failed RSS fallback from an empty result.
          logging.error(f"Unexpected error initializing feedparser for '{slug}': {e}")
-         return # Stop iteration for this feed
+         raise RuntimeError(f"RSS fetch failed for '{slug}': {e}") from e
 
     if not d or not d.entries:
+        if d and not d.bozo and d.get("feed"):
+            # Well-formed feed that simply has no items: nothing to yield, not a failure.
+            logging.info(f"RSS feed for '{slug}' is valid but has no entries.")
+            return
         print(f"[WARN] RSS feed for '{slug}' is empty or could not be fetched.")
-        return # Nothing to iterate
+        raise RuntimeError(f"RSS feed for '{slug}' is empty or could not be parsed")
 
     count = 0
     for entry in d.entries:
@@ -580,6 +531,8 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
             continue # Skip posts older than cutoff
 
         # --- EARLY DATABASE CHECK (NEW) ---
+        if link in existing_urls:
+            continue # Same source_url already in content (e.g. a renamed post)
         title_norm = normalise_title(title)
         if title_norm in known_titles:
             # Remove debug logging here
@@ -619,6 +572,7 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
         verdict = is_ai_safety_post(post_dict["title"], post_dict["htmlBody"])
         if verdict is None:
             print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
+            FETCH_RETRY_LATER["gate_error"] += 1
             continue                      # not recorded as skipped
         if not verdict:
             print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
@@ -631,7 +585,8 @@ def iter_substack_rss(slug: str, cutoff: datetime, limit: int = 25, existing_tit
 # --- Substack Orchestration Function ---
 def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_titles: set, 
                            already_skipped: set, rss_limit: int = 25, 
-                           archive_batch: int = 100, always_add_rss: bool = False):
+                           archive_batch: int = 100, always_add_rss: bool = False,
+                           existing_urls: set | None = None):
     """
     Optimized version that checks database before fetching full posts.
     
@@ -643,6 +598,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         rss_limit: Max posts to fetch via RSS fallback.
         archive_batch: Batch size for archive pagination.
         always_add_rss: If True, always fetches RSS (after archive) to catch newest posts.
+        existing_urls: Set of source_urls already in content table (checked before titles)
     """
     slug = slug_from_thing(source_input)
     if not slug:
@@ -651,6 +607,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
     
     # Combined set for faster lookups
     known_titles = existing_titles | already_skipped
+    existing_urls = existing_urls or set()
     
     posts_to_fetch = []  # List of stubs that need full fetching
     posts_by_id = {}
@@ -668,8 +625,8 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 
             title_norm = normalise_title(title)
             
-            # Skip if already in database or previously skipped
-            if title_norm in known_titles:
+            # Skip if already in database (same URL, e.g. renamed, or same title) or previously skipped
+            if stub.get("canonical_url") in existing_urls or title_norm in known_titles:
                 # Remove debug logging here
                 continue
                 
@@ -709,6 +666,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 print(f"   [SKIP] Not AI safety (gate): '{title[:50]}...'")
             elif result == "gate_error":
                 outcomes["gate_error"] += 1
+                FETCH_RETRY_LATER["gate_error"] += 1
                 print(f"   [RETRY] Gate unavailable, will retry next run: '{title[:50]}...'")
             elif result == "unusable":
                 outcomes["unusable"] += 1
@@ -717,6 +675,7 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
                 print(f"   [SKIP] Paywalled or missing fields: '{title[:50]}...'")
             else:
                 outcomes["fetch_failed"] += 1
+                FETCH_RETRY_LATER["fetch_failed"] += 1
                 print(f"   [FAIL] Failed to fetch: '{title[:50]}...'")
 
         print(f"   [OK] Archive fetch complete: {successful_fetches} kept, "
@@ -737,7 +696,8 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         try:
             rss_count = 0
             # Use existing RSS iterator but with pre-filtering
-            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit, existing_titles=existing_titles, already_skipped=already_skipped):
+            for post in iter_substack_rss(slug, cutoff=cutoff, limit=rss_limit, existing_titles=existing_titles,
+                                          already_skipped=already_skipped, existing_urls=existing_urls):
                 if post and post.get('_id'):
                     # Check if this title is already known before adding
                     title_norm = normalise_title(post.get('title', ''))
@@ -749,6 +709,9 @@ def fetch_substack_optimized(source_input: str, cutoff: datetime, existing_title
         except Exception as e:
             print(f"   [ERROR] RSS failed: {e}")
             logging.error(f"RSS fetch FAILED for '{slug}': {e}")
+            if archive_failed:
+                FEED_FAILURES.append(slug)
+                print(f"   [FAIL] Both the archive API and RSS failed for {slug}.")
 
     # STEP 4: Return sorted results
     final_posts = list(posts_by_id.values())
@@ -821,12 +784,6 @@ def choose_highest_score(posts):
     print(f"   [OK] Kept {len(unique_posts)} unique posts (removed {removed_count} duplicates)")
     return unique_posts
 
-# --- Helper for title normalization ---
-def normalise_title(t: str) -> str:
-    """Normalize title: lowercase, replace multiple spaces with single, strip leading/trailing."""
-    if not isinstance(t, str): return "" # Handle non-string input
-    return re.sub(r'\s+', ' ', t).strip().lower()
-
 # --- Backfill Function for Missing Analysis ---
 
 def backfill_missing_analysis(batch_size=10):
@@ -848,9 +805,8 @@ def backfill_missing_analysis(batch_size=10):
     
     try:
         print("[DB] Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True)
         print("[OK] Database connected")
-        register_vector(conn)
         
         with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
             # Find Substack posts missing analysis
@@ -1011,6 +967,9 @@ def backfill_missing_analysis(batch_size=10):
 
 def main(limit: int | None = None):
     # limit: process at most N new posts (canary runs)
+    # Returns EXIT_FAILED when a publication could not be fetched at all (archive and RSS
+    # fallback both failed) or when something failed and nothing succeeded (no insert, no
+    # recorded skip); fatal DB errors sys.exit(1) directly. Otherwise EXIT_DONE.
     # Setup logging (already done at the top)
     # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1026,20 +985,23 @@ def main(limit: int | None = None):
     # --- Connect to DB and fetch existing titles FIRST ---
     conn = None
     existing_titles = set()
+    existing_urls = set()
     already_skipped = set()
     
     try:
         print("\n[DB] Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # Register pgvector type with the connection
         print("[OK] Database connected")
-        register_vector(conn) # Register pgvector type with the connection
         print("[OK] pgvector registered")
 
         with conn.cursor() as cur:
             # Fetch existing titles BEFORE processing any feeds
             print("[INFO] Fetching existing data...")
-            cur.execute("SELECT title_norm FROM content")
-            existing_titles = {row[0] for row in cur.fetchall()}
+            cur.execute("SELECT title_norm, source_url FROM content")
+            content_rows = cur.fetchall()
+            existing_titles = {row[0] for row in content_rows}
+            # Dedup by source_url first (catches renamed posts), then by title_norm.
+            existing_urls = {row[1] for row in content_rows if row[1]}
             print(f"   → {len(existing_titles):,} titles in content table")
 
             # Fetch already skipped titles
@@ -1077,6 +1039,7 @@ def main(limit: int | None = None):
             cutoff=CUTOFF_DATE,
             existing_titles=existing_titles,
             already_skipped=already_skipped,
+            existing_urls=existing_urls,
             rss_limit=40, # Max RSS posts per feed if needed
             archive_batch=20, # Archive API page size
             always_add_rss=ALWAYS_FETCH_RSS_NET
@@ -1084,7 +1047,7 @@ def main(limit: int | None = None):
         substack_posts_all.extend(posts_for_feed)
         # Persist this feed's gate/cutoff/paywall skips right away (own transaction), so a
         # killed run does not lose them and progress is visible in the DB.
-        flushed = flush_skip_buffer(DATABASE_URL)
+        flushed = flush_skip_buffer()
         early_skips.extend(flushed)
         already_skipped.update(t for _, t, _ in flushed)
         print(f"   [DB] {len(flushed)} skips recorded for this feed; {len(substack_posts_all)} candidate posts so far", flush=True)
@@ -1100,7 +1063,14 @@ def main(limit: int | None = None):
 
     if not unique_posts:
         print(f"[INFO] No new posts to process ({early_skip_count} skips recorded).")
-        return
+        retry_later = sum(FETCH_RETRY_LATER.values())
+        if FEED_FAILURES:
+            print(f"EXIT: stage FAILED (could not fetch: {', '.join(FEED_FAILURES)}).")
+            return EXIT_FAILED
+        if retry_later and not early_skip_count:
+            print(f"EXIT: stage FAILED ({retry_later} gate/fetch failures and nothing succeeded).")
+            return EXIT_FAILED
+        return EXIT_DONE
 
     # --- Process Posts and Insert into Database ---
     processed_count = 0
@@ -1119,9 +1089,8 @@ def main(limit: int | None = None):
         # Establish a new connection for processing
         logging.info("\n--- Database Operations ---")
         logging.info("Connecting to the database for processing...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # Register pgvector type with the connection
         logging.info("Database connection successful.")
-        register_vector(conn) # Register pgvector type with the connection
         logging.info("pgvector type registered with psycopg2 connection.")
 
         with conn.cursor() as cur:
@@ -1148,8 +1117,12 @@ def main(limit: int | None = None):
                      skipped_missing_data_count += 1
                      continue # Skip to the next post
 
-                # --- Normalize title and check against existing DB titles (EARLY OUT) ---
+                # --- Check source_url, then normalized title, against existing DB rows (EARLY OUT) ---
                 # Note: This check should be much faster now since most titles were already filtered out
+                if url in existing_urls:
+                    logging.info(f"  -> Skipping post (source_url already in DB): '{title[:60]}...'")
+                    skipped_in_db_count += 1
+                    continue
                 if title_norm in existing_titles:
                     logging.info(f"  -> Skipping post (already in DB): '{title[:60]}...'")
                     skipped_in_db_count += 1
@@ -1427,6 +1400,7 @@ def main(limit: int | None = None):
                     conn.commit()
                     affected_rows_count += 1
                     existing_titles.add(title_norm)
+                    existing_urls.add(url)
                     logging.info(f"  -> DB insert OK: '{title[:60]}...'")
                 except psycopg2.DatabaseError as e:
                     logging.error(f"  -> DB insert FAILED for '{title[:60]}...': {e}")
@@ -1463,6 +1437,15 @@ def main(limit: int | None = None):
     print(f"Posts prepared for DB insertion:        {posts_to_insert}")
     print(f"DB rows affected (estimate):            {affected_rows_count}") # Estimate based on batch success/retries
     print(f"DB insert failures (individual rows):   {total_failures}")
+    print(f"Gate/fetch failures (retry next run):   {FETCH_RETRY_LATER['gate_error'] + FETCH_RETRY_LATER['fetch_failed']}")
+
+    succeeded = affected_rows_count + total_skipped_by_record_count
+    print(f"Publications that could not be fetched: {len(FEED_FAILURES)} {FEED_FAILURES or ''}")
+    failed = failed_analysis_count + total_failures + sum(FETCH_RETRY_LATER.values())
+    if FEED_FAILURES or (failed and not succeeded):
+        print("EXIT: stage FAILED (a publication could not be fetched, or every post needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
 
 
 if __name__ == "__main__":
@@ -1509,4 +1492,4 @@ Examples:
     if args.backfill:
         backfill_missing_analysis(batch_size=args.batch_size)
     else:
-        main(limit=args.limit)
+        sys.exit(main(limit=args.limit))

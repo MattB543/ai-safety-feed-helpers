@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PARKED: not part of the nightly pipeline (writes the tweets tables only); see "Parked for a future iteration" in README.md.
 """
 twitter_scraper.py
 ──────────────────

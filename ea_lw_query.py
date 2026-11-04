@@ -34,7 +34,6 @@ from markdownify import markdownify
 from bs4 import BeautifulSoup
 import psycopg2
 from psycopg2 import extras # Explicit import for batch insertion
-from pgvector.psycopg2 import register_vector # <<< ADD THIS IMPORT
 from dotenv import load_dotenv
 
 # ================================================================
@@ -47,26 +46,11 @@ from llm_common import (
     LLMContentFiltered, LLMError, analyze_content, build_embedding_text,
     generate_embeddings, check_llm_or_exit,
 )
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break outbound fetches in sandboxed runs.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
+# Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
+from common import (
+    EXIT_DONE, EXIT_FAILED,
+    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
+)
 
 # --- Essential Environment Variables ---
 DATABASE_URL = os.environ.get("AI_SAFETY_FEED_DB_URL")
@@ -152,71 +136,10 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-# SQL and helper for recording skipped posts
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: str | None):
-    """Insert one row into skipped_posts (no commit)."""
-    # Ensure post_id and source_url are strings, handle None for source_url
-    cur.execute(SKIP_INSERT_SQL, (
-        str(post_id) if post_id is not None else 'N/A',
-        str(title_norm),
-        str(source_url) if source_url is not None else None
-    ))
-
 # ================================================================
 #                         Utility Helpers
 # ================================================================
-
-def normalise_title(title: str) -> str:
-    """
-    Normalizes a title string for consistent comparison and database indexing.
-    Converts to lowercase, replaces multiple whitespace chars with a single space,
-    and strips leading/trailing whitespace.
-
-    Args:
-        title: The original title string.
-
-    Returns:
-        The normalized title string.
-    """
-    if not title: return ""
-    return re.sub(r"\s+", " ", title).strip().lower()
-
-def clean_title_for_storage(title: str | None) -> str | None:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r"\s+", " ", title).strip()
-
-def iso_to_dt(iso_string: str | None) -> datetime | None:
-    """
-    Safely converts an ISO 8601 timestamp string to a timezone-aware
-    datetime object (UTC). Handles 'Z' notation and naive datetimes.
-
-    Args:
-        iso_string: The ISO 8601 formatted string.
-
-    Returns:
-        A timezone-aware datetime object (UTC) or None if parsing fails.
-    """
-    if not iso_string:
-        return None
-    try:
-        # Handle 'Z' suffix for UTC and ensure timezone awareness
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        if dt_obj.tzinfo is None:
-            # Assume UTC if timezone is naive
-            return dt_obj.replace(tzinfo=timezone.utc)
-        # Convert to UTC if it has another timezone
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError) as e:
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'. Error: {e}")
-        return None
+# normalise_title, iso_to_dt and record_skip live in common.py.
 
 def safe_int_or_zero(value: any) -> int:
     """
@@ -280,8 +203,8 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
         limit: The maximum number of posts to retrieve.
 
     Returns:
-        A list of post dictionaries, or an empty list if fetching fails or
-        no posts are found.
+        A list of post dictionaries (possibly empty), or None if the fetch
+        failed (the caller reports that as a stage failure).
     """
     # Determine the view clause based on whether a tag_id is provided
     if tag_id:
@@ -341,7 +264,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                         # Final attempt failed
                         logging.error(f"Query failed for {source_desc}: 429 Client Error: Too Many Requests after {max_retries} attempts")
                         print(f"ERROR: Query failed for {source_desc}: Rate limit (429) persisted after {max_retries} attempts.")
-                        return []
+                        return None
 
                 response.raise_for_status() # Raise HTTPError for other bad responses (4xx or 5xx)
 
@@ -353,7 +276,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                     print(f"ERROR: GraphQL API ({source_desc}) returned errors. Check logs.")
                     # Optionally log the failed query for debugging (be careful with sensitive data if any)
                     # logging.debug(f"Failed GraphQL query was:\n{query}")
-                    return [] # Return empty list on GraphQL errors
+                    return None
 
                 # Check for expected data structure
                 if "data" not in result or "posts" not in result["data"] or "results" not in result["data"]["posts"]:
@@ -361,7 +284,7 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                      print(f"WARNING: Unexpected response structure from {source_desc}. Check logs.")
                      # Log the actual data received for debugging
                      # logging.debug(f"Response data received: {json.dumps(result.get('data', {}), indent=2)}")
-                     return [] # Return empty list if structure is wrong
+                     return None
 
                 posts_data = result["data"]["posts"]["results"]
                 print(f"Successfully fetched {len(posts_data)} posts from {source_desc}.")
@@ -383,19 +306,19 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                     continue
                 logging.error(f"Query failed for {source_desc} after {max_retries} attempts: {e}")
                 print(f"ERROR: Query failed for {source_desc} after {max_retries} attempts: {e}")
-                return []
+                return None
             except requests.exceptions.HTTPError as e:
                 # Handle other HTTP errors (not 429, which is handled above)
                 logging.error(f"Query failed for {source_desc}: {e}", exc_info=True)
                 print(f"ERROR: Query failed for {source_desc}: {e}")
                 if hasattr(e, 'response') and e.response is not None:
                     logging.error(f"Response status code: {e.response.status_code}")
-                return []
+                return None
 
     except requests.exceptions.Timeout:
         logging.error(f"Query failed for {source_desc}: Request timed out.")
         print(f"ERROR: Query failed for {source_desc}: Request timed out.")
-        return []
+        return None
     except requests.exceptions.RequestException as e:
         logging.error(f"Query failed for {source_desc}: {e}", exc_info=True)
         print(f"ERROR: Query failed for {source_desc}: {e}")
@@ -403,19 +326,19 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
             logging.error(f"Response status code: {e.response.status_code}")
             # Avoid logging potentially large response bodies directly unless debugging
             # logging.debug(f"Response body (truncated): {e.response.text[:500]}...")
-        return []
+        return None
     except json.JSONDecodeError as e:
         logging.error(f"Failed to decode JSON response from {source_desc}: {e}")
         print(f"ERROR: Failed to decode JSON response from {source_desc}. Check logs.")
         # Log the response text that failed to parse
         # if hasattr(response, 'text'):
         #     logging.debug(f"Response text was (truncated): {response.text[:500]}...")
-        return []
+        return None
     except Exception as e:
         # Catch any other unexpected errors during the fetch process
         logging.error(f"An unexpected error occurred fetching posts from {source_desc}: {e}", exc_info=True)
         print(f"ERROR: An unexpected error occurred fetching posts from {source_desc}. Check logs.")
-        return []
+        return None
 
 # ================================================================
 #                     Source‑Specific Filtering
@@ -577,6 +500,8 @@ def choose_highest_score(posts: list[dict]) -> list[dict]:
 def main(limit: int | None = None):
     """
     Main execution function (limit: process at most N new posts; for canary runs).
+    Returns EXIT_FAILED if a forum fetch failed, the database failed, or every post
+    that needed work failed (nothing inserted or recorded); otherwise EXIT_DONE.
     1. Fetches posts from EA, LW, AF.
     2. Filters posts based on criteria.
     3. Deduplicates posts by title, keeping highest score.
@@ -597,11 +522,15 @@ def main(limit: int | None = None):
     lw_raw = get_forum_posts(LW_API_URL, LW_AI_SAFETY_TAG_ID, limit=DEFAULT_LIMIT)
     # Alignment Forum posts arrive via the LessWrong query with af=true (see filter_lw_posts).
     # The separate AF endpoint was rate-limited on every run and is no longer queried.
+    fetch_failed = [name for name, raw in (("EA Forum", ea_raw), ("LessWrong", lw_raw)) if raw is None]
+    if fetch_failed:
+        # Keep going with whatever was fetched; the run still exits non-zero at the end.
+        print(f"ERROR: fetch failed for {', '.join(fetch_failed)}; continuing with the other source.")
 
     # -------- 2. Filter Data --------
     print("\n--- Filtering Posts ---")
-    ea_posts = filter_ea_posts(ea_raw, EA_AI_SAFETY_TAG_ID)
-    lw_posts = filter_lw_posts(lw_raw)
+    ea_posts = filter_ea_posts(ea_raw or [], EA_AI_SAFETY_TAG_ID)
+    lw_posts = filter_lw_posts(lw_raw or [])
 
     # -------- 3. Combine & Deduplicate --------
     combined_filtered_posts = ea_posts + lw_posts
@@ -614,7 +543,7 @@ def main(limit: int | None = None):
     if not unique_posts:
         print("\nNo unique posts remaining after filtering and deduplication. Nothing to process. Exiting.")
         logging.info("No unique posts remaining after filtering and deduplication. Exiting.")
-        return # Exit gracefully if no posts left
+        return EXIT_FAILED if fetch_failed else EXIT_DONE
 
     # -------- 4. Database Connection & Setup --------
     conn = None
@@ -626,23 +555,26 @@ def main(limit: int | None = None):
     embedding_failures_count = 0 # Track embedding generation failures
     total_skipped_recorded_in_db_count = 0 # New counter for skips recorded in DB
     new_posts_started = 0 # For --limit
+    fatal_error = False # DB connection/unexpected error: report the stage as failed
 
     try:
         print("\n--- Connecting to Database ---")
         logging.info(f"Connecting to database using URL: {DATABASE_URL[:20]}...") # Log partial URL
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # pgvector type handler registered
         conn.autocommit = False # Ensure transactions are handled manually
-        register_vector(conn) # <<< REGISTER VECTOR TYPE HANDLER
         print("Database connection successful.")
         logging.info("Database connection successful.")
 
         # -------- 5. Fetch Existing Titles --------
         with conn.cursor() as cur: # Use 'with' for automatic cursor closing
-            print("Fetching existing normalized titles from database...")
-            cur.execute("SELECT title_norm FROM content")
+            print("Fetching existing normalized titles and URLs from database...")
+            cur.execute("SELECT title_norm, source_url FROM content")
             # Fetchall can be memory intensive for huge tables, but likely okay here.
             # Consider server-side cursors or LIMIT/OFFSET for very large tables.
-            existing_titles = {row[0] for row in cur.fetchall()}
+            content_rows = cur.fetchall()
+            existing_titles = {row[0] for row in content_rows}
+            # Dedup by source_url first (catches renamed posts), then by title_norm.
+            existing_urls = {row[1] for row in content_rows if row[1]}
             print(f"--> Found {len(existing_titles):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_titles)} existing titles.")
 
@@ -672,6 +604,10 @@ def main(limit: int | None = None):
                 if norm_title in already_skipped or str(post_id) in skipped_post_ids: # Check this first
                     print(f"  -> Skipping (already marked as skipped or failed this run): Normalized title '{norm_title}'.")
                     logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - already marked as skipped (in skipped_posts or this run).")
+                    continue # Skip to the next post
+                if url in existing_urls:
+                    print(f"  -> Skipping (already in content table): same source_url ({url}).")
+                    logging.info(f"  Skipping post ID {post_id} (Title: {title[:70]}...) - source_url already in content table.")
                     continue # Skip to the next post
                 if norm_title in existing_titles:
                     print(f"  -> Skipping (already in content table): Normalized title '{norm_title}'.")
@@ -907,17 +843,20 @@ def main(limit: int | None = None):
         # Errors during connection itself
         logging.critical(f"FATAL: Database connection failed: {e}", exc_info=True)
         print(f"FATAL ERROR: Database connection failed: {e}")
+        fatal_error = True
         # Cannot proceed without DB connection
     except psycopg2.DatabaseError as e:
         # Other database errors (e.g., during initial title fetch)
         logging.error(f"Database error occurred outside batch processing: {e}", exc_info=True)
         print(f"ERROR: Database error occurred: {e}")
+        fatal_error = True
         if conn:
             conn.rollback() # Rollback any potential changes if connection exists
     except Exception as e:
         # Catch-all for unexpected errors in the main processing block
         logging.error(f"An unexpected error occurred in the main processing loop: {e}", exc_info=True)
         print(f"ERROR: An unexpected error occurred: {e}")
+        fatal_error = True
         if conn:
             conn.rollback() # Rollback on general errors too
     finally:
@@ -946,9 +885,16 @@ def main(limit: int | None = None):
     print("================================================================")
     logging.info(f"Script finished. Duration: {duration:.2f}s. Processed: {processed_count}. DB Success: {affected_rows_count}. DB Fail: {total_db_failures}. Analysis Fail: {failed_analysis_count}. Embedding Fail: {embedding_failures_count}. Recorded Skips: {total_skipped_recorded_in_db_count}.")
 
+    succeeded = affected_rows_count + total_skipped_recorded_in_db_count
+    failed = failed_analysis_count + embedding_failures_count + total_db_failures
+    if fatal_error or fetch_failed or (failed and not succeeded):
+        print("EXIT: stage FAILED (fetch/database error, or every post needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
+
 
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="EA Forum / LessWrong / Alignment Forum ingestion")
     ap.add_argument("--limit", type=int, default=None, help="Process at most N new posts (canary runs)")
-    main(limit=ap.parse_args().limit)
+    sys.exit(main(limit=ap.parse_args().limit))

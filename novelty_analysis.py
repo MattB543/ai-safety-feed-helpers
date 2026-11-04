@@ -5,23 +5,29 @@ novelty_analysis.py
 Compute a "uniqueness / novelty" score plus a short
 'what-this-adds' note for the newest posts that still lack them,
 using **Azure OpenAI**.
+
+Exit codes (run_pipeline.py loops on them): 0 = nothing left to try this run, 3 = more
+eligible rows remain, 1 = database error or every row in the batch failed. Rows that fail
+3 times are skipped from then on (common.RetryState); failures are counted before the API
+calls, so a run killed at the stage deadline still counts.
 """
 
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, psycopg2
 from psycopg2 import extras
-from openai import AzureOpenAI
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv(override=True)
 
+# Azure settings and the client constructor are shared with the scrapers.
+from llm_common import (  # noqa: E402
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
+)
+from common import EXIT_DONE, EXIT_FAILED, EXIT_MORE_WORK, RetryState, get_db_connection  # noqa: E402
+
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL = os.getenv("AI_SAFETY_FEED_DB_URL")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
 MODEL = AZURE_OPENAI_DEPLOYMENT
 BATCH = 21
 K_NEIGHBOURS = 20
@@ -45,13 +51,8 @@ logging.basicConfig(
 )
 
 # ───── Azure OpenAI client ────────────────────────────────────
-client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT,
-    api_version=AZURE_OPENAI_API_VERSION,
-    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
-    timeout=180,
-)
+# SDK default retries (2) on purpose: this script has no tenacity layer of its own.
+client = make_azure_client(timeout=180)
 
 
 def extract_response_text(response) -> str:
@@ -253,14 +254,26 @@ def build_novelty_prompt(
                                  ref_content  = ref_content,
                                  overlap_blocks="\n".join(blocks))
 
+# Refs needing a score; %s = ids to leave out (retry-skipped, or already failed this run).
+ELIGIBLE_SQL = """
+    FROM   content
+    WHERE  novelty_score IS NULL
+           AND embedding_full IS NOT NULL
+           AND id <> ALL(%s::bigint[])
+"""
+
 # ───── Main routine ───────────────────────────────────────────
 def main():
     t0   = time.time()
     conn = None
     cur  = None
     processed_count = 0
+    retry_state = RetryState("novelty")
+    failed_ids, done_ids = [], []
+    refs = []
+    exit_code = EXIT_DONE
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=extras.RealDictCursor)
 
         # 1️⃣  newest refs lacking novelty_score
@@ -268,16 +281,14 @@ def main():
         cur.execute("""
             SELECT id, title, sentence_summary, paragraph_summary,
                    embedding_full, full_content_markdown, published_date
-            FROM   content
-            WHERE  novelty_score IS NULL
-                   AND embedding_full IS NOT NULL
+        """ + ELIGIBLE_SQL + """
             ORDER  BY published_date DESC NULLS LAST
             LIMIT  %s
-        """, (BATCH,))
+        """, (retry_state.skip_ids(), BATCH))
         refs = cur.fetchall()
         if not refs:
             logging.info("Nothing to back‑fill – all caught up.")
-            return
+            return EXIT_DONE
 
         logging.info("Fetched %d refs to process.", len(refs))
 
@@ -285,6 +296,7 @@ def main():
         for ref in refs:
             rid = ref["id"]
             try:
+                retry_state.begin([rid])  # saved now: still counts if this run gets killed
                 logging.info("[%s] analysing…", rid)
 
                 # 2️⃣  nearest neighbours
@@ -323,6 +335,7 @@ def main():
                 # for a later run instead of falling through to the "no overlaps" prompt.
                 if overlap_ids is None or (isinstance(overlap_ids, dict) and "error" in overlap_ids):
                     logging.warning("   → Overlap call failed or reported an error for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    failed_ids.append(rid)
                     continue
                 if isinstance(overlap_ids, dict):
                     ids_raw = overlap_ids.get("ids", overlap_ids.get("result"))
@@ -330,6 +343,7 @@ def main():
                     ids_raw = overlap_ids
                 if not isinstance(ids_raw, list):
                     logging.warning("   → Unexpected overlap response format for [%s]: %s. Leaving row for a later run.", rid, overlap_ids)
+                    failed_ids.append(rid)
                     continue
                 candidate_ids = {c["id"] for c in cands}
                 overlap_int_ids = set()
@@ -342,6 +356,7 @@ def main():
                         overlap_int_ids.add(value)
                 if ids_raw and not overlap_int_ids:
                     logging.warning("   → Overlap response for [%s] contained no valid candidate IDs: %s. Leaving row for a later run.", rid, ids_raw)
+                    failed_ids.append(rid)
                     continue
 
                 overlaps = [c for c in cands if c["id"] in overlap_int_ids]
@@ -381,6 +396,7 @@ def main():
 
                 if nov is None:
                     logging.warning("   → LLM call failed or returned invalid JSON for [%s]. Skipping DB update.", rid)
+                    failed_ids.append(rid)
                     continue
 
                 if isinstance(nov, list) and len(nov) == 1 and isinstance(nov[0], dict):
@@ -395,6 +411,7 @@ def main():
                 if (isinstance(raw_score, bool) or not isinstance(raw_score, (int, float))
                         or not isinstance(note, str) or not note.strip()):
                     logging.warning("   → Novelty response malformed for [%s]: %s. Leaving row for a later run.", rid, nov)
+                    failed_ids.append(rid)
                     continue
                 score = max(0, min(100, int(round(raw_score))))
                 note = note.strip()
@@ -409,29 +426,45 @@ def main():
                 conn.commit()
                 logging.info("   → DB updated successfully for [%s].", rid)
                 processed_count += 1
+                done_ids.append(rid)
+                retry_state.succeeded([rid])
 
             except Exception as e:
                 logging.error("Failed to process ref [%s]: %s", rid, e, exc_info=True)
                 if conn:
                     conn.rollback()
+                failed_ids.append(rid)
 
         logging.info("Finished processing. Successfully updated %d/%d refs in %.1fs",
                      processed_count, len(refs), time.time() - t0)
+        if processed_count == 0:
+            logging.error("Every ref in the batch failed (%d).", len(refs))
+            exit_code = EXIT_FAILED
+        else:
+            # More work only if eligible refs remain beyond the ones that just failed
+            # (those are retried on a later run, up to the RetryState limit).
+            cur.execute("SELECT count(*) AS n " + ELIGIBLE_SQL, (retry_state.skip_ids() + failed_ids,))
+            remaining = cur.fetchone()["n"]
+            logging.info("%d eligible ref(s) remain.", remaining)
+            exit_code = EXIT_MORE_WORK if remaining else EXIT_DONE
 
     except psycopg2.Error as db_err:
         logging.error("Database error occurred: %s", db_err, exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     except Exception as e:
         logging.error("An unexpected error occurred: %s", e, exc_info=True)
         if conn:
             conn.rollback()
+        exit_code = EXIT_FAILED
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
         logging.info("Database connection closed.")
+    return exit_code
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

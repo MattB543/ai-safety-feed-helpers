@@ -6,9 +6,10 @@ Bring the live feed fully up to date in one go (what the nightly scheduled task 
 
   1. run_pipeline.py                        scrape + summaries/tags/embeddings + novelty
   2. rewrite_titles.py --mode titles        cleaned titles for every row missing one
-  3. rewrite_titles.py --mode images-auto   images for rows created by THIS run only
+  3. rewrite_titles.py --mode images-auto   images for rows created in the last 14 days
+                                            that still lack one (capped at IMAGE_BATCH)
 
-Steps 2-3 run even if step 1 aborts, so rows it already inserted still get titles/images.
+Steps 2-3 run even if step 1 fails, so rows it already inserted still get titles/images.
 While running it asks Windows not to idle-sleep: after a wake-timer wake the machine
 otherwise drops back to sleep after ~2 minutes without user input.
 
@@ -17,12 +18,14 @@ Usage:
   (scheduled via register_nightly_task.ps1, which launches it with pythonw.exe so no window opens)
 
 Logs: logs/nightly_<timestamp>.log (one line per step) and logs/nightly_<timestamp>_<step>.log
-      plus run_pipeline.py's own run_full_<timestamp>_* logs.
+      plus run_pipeline.py's own logs/run_full_<timestamp>_* logs. logs/*.log files older
+      than LOG_RETENTION_DAYS are deleted at the start of each run.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import glob
 import os
 import socket
 import subprocess
@@ -39,6 +42,11 @@ LOG = os.path.join(LOG_DIR, f"nightly_{TS}.log")
 PYTHON = os.path.join(os.path.dirname(sys.executable), "python.exe") if os.name == "nt" else sys.executable
 TITLE_BATCH = 500
 IMAGE_BATCH = 200          # cost guard: ~$0.043 per image
+# Images are generated for rows created in this window that still lack one, so a failed or
+# capped night is picked up the next night. Older posts are deliberately not backfilled
+# for now (Matt's decision, 2026-11-03).
+IMAGE_LOOKBACK_DAYS = 14
+LOG_RETENTION_DAYS = 30
 NETWORK_WAIT_SEC = 300     # Wi-Fi can take a while to come back after a wake
 
 
@@ -69,6 +77,20 @@ def wait_for_network() -> bool:
             time.sleep(10)
 
 
+def prune_old_logs() -> int:
+    """Delete logs/*.log files older than LOG_RETENTION_DAYS. Returns how many were removed."""
+    cutoff = time.time() - LOG_RETENTION_DAYS * 86400
+    removed = 0
+    for path in glob.glob(os.path.join(LOG_DIR, "*.log")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def run_step(name: str, args: list[str]) -> int:
     step_log = os.path.join(LOG_DIR, f"nightly_{TS}_{name}.log")
     log(f"START {name}: {' '.join(args)} -> {os.path.basename(step_log)}")
@@ -85,9 +107,9 @@ def run_step(name: str, args: list[str]) -> int:
 def main() -> int:
     os.makedirs(LOG_DIR, exist_ok=True)
     keep_awake()
-    # Margin for clock skew between this machine and the DB server, which sets created_at.
-    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat(timespec="seconds")
-    log(f"NIGHTLY START python={PYTHON} images for rows created since {since}")
+    pruned = prune_old_logs()
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=IMAGE_LOOKBACK_DAYS)).isoformat(timespec="seconds")
+    log(f"NIGHTLY START python={PYTHON} images for rows created since {since}; pruned {pruned} old log(s)")
     if not wait_for_network():
         log(f"NIGHTLY ABORTED: no network after {NETWORK_WAIT_SEC}s")
         return 1

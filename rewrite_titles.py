@@ -37,7 +37,6 @@ Environment variables (same as the other backfills):
 # ───── Imports ────────────────────────────────────────────────
 import os, sys, time, json, logging, re, psycopg2
 from psycopg2 import extras
-from openai import AzureOpenAI
 from dotenv import load_dotenv
 import argparse # Added import
 from PIL import Image
@@ -56,21 +55,19 @@ load_dotenv(override=True)  # Load environment variables from .env file
 
 import cloudinary, cloudinary.uploader, requests
 
+# Azure settings (already stripped) and the client constructor are shared with the scrapers.
+from llm_common import (
+    AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_ENDPOINT, make_azure_client,
+)
+from common import LOG_DIR, get_db_connection
+
 # ───── Runtime settings ───────────────────────────────────────
 DB_URL         = os.getenv("AI_SAFETY_FEED_DB_URL")
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("AZURE_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION") or "2024-12-01-preview"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
 # Strip potential whitespace from keys
 if DB_URL: DB_URL = DB_URL.strip()
-if AZURE_OPENAI_API_KEY: AZURE_OPENAI_API_KEY = AZURE_OPENAI_API_KEY.strip()
-if AZURE_OPENAI_ENDPOINT: AZURE_OPENAI_ENDPOINT = AZURE_OPENAI_ENDPOINT.strip()
-if AZURE_OPENAI_DEPLOYMENT: AZURE_OPENAI_DEPLOYMENT = AZURE_OPENAI_DEPLOYMENT.strip()
-if AZURE_OPENAI_API_VERSION: AZURE_OPENAI_API_VERSION = AZURE_OPENAI_API_VERSION.strip()
 if GEMINI_API_KEY: GEMINI_API_KEY = GEMINI_API_KEY.strip()
 if CLOUDINARY_URL: CLOUDINARY_URL = CLOUDINARY_URL.strip()
 
@@ -128,12 +125,7 @@ logging.basicConfig(
 
 # ───── LLM/Image clients ───────────────────────────────────────
 try:
-    text_client = AzureOpenAI(
-        api_key=AZURE_OPENAI_API_KEY,
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version=AZURE_OPENAI_API_VERSION,
-        azure_deployment=MODEL,
-    )
+    text_client = make_azure_client()  # SDK default timeout/retries
     image_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     sys.exit(f"Failed to initialize Azure/Gemini clients: {e}")
@@ -361,7 +353,7 @@ def handle_auto_image_generation(rows):
     updated = 0
     conn = cur = None
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         for row in rows:
             cid = row["id"]
@@ -398,7 +390,8 @@ def handle_auto_image_generation(rows):
             cur.close()
         if conn:
             conn.close()
-    csv_filename = f"image_cost_{timestamp}.csv"
+    os.makedirs(LOG_DIR, exist_ok=True)
+    csv_filename = os.path.join(LOG_DIR, f"image_cost_{timestamp}.csv")
     with open(csv_filename, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(cost_rows[0].keys()) if cost_rows else ["id"])
         writer.writeheader()
@@ -410,11 +403,18 @@ def handle_auto_image_generation(rows):
                  GEMINI_USAGE["calls"], GEMINI_USAGE["images"], GEMINI_USAGE["prompt_tokens"], GEMINI_USAGE["output_tokens"], gemini_image_cost_usd(), GEMINI_IMAGE_USD_EACH)
     logging.info("ESTIMATED TOTAL ≈ $%.3f (%s per image incl. concept extraction). Per-item breakdown: %s; local copies: %s/",
                  total, f"${total / max(updated, 1):.3f}", csv_filename, images_dir)
+    if rows and not updated:
+        logging.error("Every image in this run failed (%d).", len(rows))
+        return 1
+    return 0
 
 
 def main():
+    """Exit code (used by nightly_refresh.py): 1 on a DB error, a missing column, or when a
+    'titles' / 'images-auto' run updated nothing although rows needed work; otherwise 0."""
     t0 = time.time()
     conn = cur = None
+    exit_code = 0
     updated = 0
 
     parser = argparse.ArgumentParser(description="Generate cleaned titles and/or images for content.")
@@ -457,7 +457,7 @@ def main():
         return handle_interactive_upload(images_dir)
 
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur  = conn.cursor(cursor_factory=extras.RealDictCursor)
 
         # Check if image_prompt column exists
@@ -469,7 +469,7 @@ def main():
         if not cur.fetchone():
             logging.error("The 'image_prompt' column does not exist in the 'content' table.")
             logging.error("Please run: ALTER TABLE content ADD COLUMN image_prompt text;")
-            return
+            return 1
 
         # 1️⃣  Select rows based on mode
         select_query = ""
@@ -707,15 +707,20 @@ def main():
 
         logging.info("Done — processed %d items, updated %d rows in %.1fs",
                      len(rows), updated, time.time() - t0)
+        if mode == "titles" and not updated:
+            logging.error("Every title in this run failed (%d).", len(rows))
+            exit_code = 1
 
     except psycopg2.Error as db_err:
         logging.error("Database error: %s", db_err, exc_info=True)
+        exit_code = 1
     finally:
         if cur:
             cur.close()
         if conn:
             conn.close()
         logging.info("Database connection closed.")
+    return exit_code
 
 
 def handle_batch_image_generation(rows):
@@ -733,7 +738,7 @@ def handle_batch_image_generation(rows):
     # Database connection for saving image prompts
     conn = cur = None
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         
         for row in rows:
@@ -866,7 +871,7 @@ def handle_interactive_upload(images_dir: str = None):
     updated = 0
     
     try:
-        conn = psycopg2.connect(DB_URL)
+        conn = get_db_connection()
         cur = conn.cursor(cursor_factory=extras.RealDictCursor)
         
         # Process each content ID
@@ -969,4 +974,4 @@ def _show_temp_image(b64_bytes: bytes, variant_idx: int):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

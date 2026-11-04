@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PARKED: not part of the nightly pipeline (still writes the dead `posts` table); see "Parked for a future iteration" in README.md.
 """
 Ingest "AI Safety" papers from ArXiv, enrich with
 Semantic Scholar, summarise with Gemini, embed with OpenAI & Gemini,
@@ -74,9 +75,9 @@ print(f"  S2_API_KEY: {'SET' if S2_API_KEY else 'MISSING'}")
 if not all([DATABASE_URL, OPENAI_API_KEY, GEMINI_API_KEY]):
     print("ERROR: Missing required environment variables!")
     print("Required variables:")
-    print(f"  AI_SAFETY_FEED_DB_URL: {DATABASE_URL}")
-    print(f"  OPEN_AI_FREE_CREDITS_KEY: {OPENAI_API_KEY}")
-    print(f"  GEMINI_API_KEY: {GEMINI_API_KEY}")
+    print(f"  AI_SAFETY_FEED_DB_URL: {'SET' if DATABASE_URL else 'MISSING'}")
+    print(f"  OPEN_AI_FREE_CREDITS_KEY: {'SET' if OPENAI_API_KEY else 'MISSING'}")
+    print(f"  GEMINI_API_KEY: {'SET' if GEMINI_API_KEY else 'MISSING'}")
     raise SystemExit("Missing one or more required API / DB keys")
 
 print("Environment setup completed successfully...")

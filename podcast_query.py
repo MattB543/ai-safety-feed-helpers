@@ -24,16 +24,16 @@ import time
 import logging
 from datetime import datetime, timezone, timedelta
 import sys
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from typing import Optional, List, Dict, Any, Tuple, Set
 
 import feedparser
+import requests
 from bs4 import BeautifulSoup
 from markdownify import markdownify
 import psycopg2
 from psycopg2 import extras # For batch insertion
 from psycopg2 import OperationalError as Psycopg2OpError # Alias for clarity
-from pgvector.psycopg2 import register_vector # <-- ADDED for pgvector
 from dotenv import load_dotenv
 
 # --- AI/ML helpers (shared) ---
@@ -42,31 +42,17 @@ from llm_common import (
     generate_embeddings, is_ai_safety_content, check_llm_or_exit,
 )
 from gemini_transcribe import transcribe_audio_gemini, gemini_transcription_configured
+# Shared non-LLM helpers (DB connection, title_norm, skips, proxy cleanup).
+from common import (
+    EXIT_DONE, EXIT_FAILED,
+    disable_unreachable_local_proxies, get_db_connection, is_duplicate_episode_url, normalise_title,
+    parse_feed_response, record_skip,
+)
 
 # ================================================================
 #                      Environment & Setup
 # ================================================================
 load_dotenv(override=True)  # Load .env BEFORE using env vars, override OS environment
-
-LOCAL_PROXY_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost)(?::\d+)?/?$", re.IGNORECASE)
-
-def disable_unreachable_local_proxies() -> None:
-    """
-    Disable loopback proxy env vars that can break feed/API requests.
-    Keeps non-local proxy settings untouched.
-    """
-    proxy_keys = (
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
-        "http_proxy", "https_proxy", "all_proxy",
-    )
-    removed = []
-    for key in proxy_keys:
-        value = os.environ.get(key)
-        if value and LOCAL_PROXY_RE.match(value.strip()):
-            os.environ.pop(key, None)
-            removed.append(f"{key}={value}")
-    if removed:
-        logging.warning("Disabled local proxy env vars for network fetches: %s", ", ".join(removed))
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, # Changed default to INFO
@@ -118,13 +104,16 @@ def is_ai_safety_post(title: str, html_body: str) -> Optional[bool]:
 
 
 # Ingest only posts published on/after this date (UTC, inclusive)
-CUTOFF_DATE = datetime(2025, 1, 1, tzinfo=timezone.utc)
+CUTOFF_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 # Successful insertions per feed per run (a cost cap; raise via env once Gemini transcription cost is acceptable)
 TARGET_INSERTIONS_PER_FEED = int(os.environ.get("PODCAST_MAX_INSERTS_PER_FEED", "2"))
 # Process only the first N feeds (canary runs); None = all
 MAX_FEEDS = None
 # Safety limit: Max posts to *check* per feed if target not reached
 MAX_POSTS_PER_FEED = 100
+RSS_TIMEOUT = (15, 60)  # (connect, read) seconds; feedparser's own fetch has no timeout
+# Feeds that could not be fetched or had no entries this run (any makes the stage exit 1).
+FEED_FETCH_FAILURES: List[str] = []
 
 # --- Source Feeds ---
 SOURCE_FEEDS = {
@@ -134,8 +123,6 @@ SOURCE_FEEDS = {
     "https://axrp.net/feed.xml": "AXRP",
     "https://anchor.fm/s/1e4a0eac/podcast/rss": "Machine Learning Street Talk",
     "https://futureoflife.org/podcast/feed/": "FLI Podcast",
-    # NOTE: subscriber feed; currently returns HTML (token expired?). Refresh the uid from your account.
-    "https://samharris.org/subscriber-rss/?uid=PNIypzHCbq78upz": "Making Sense with Sam Harris",
     "https://lexfridman.com/feed/podcast/": "Lex Fridman Podcast",
     "https://anchor.fm/s/ebbe3a98/podcast/rss": "For Humanity: An AI Safety Podcast",
     "https://podcast.clearerthinking.org/rss.xml": "Clearer Thinking",
@@ -150,6 +137,15 @@ SOURCE_FEEDS = {
     "https://feeds.simplecast.com/rZ0cYk12": "Your Undivided Attention",
     "https://feeds.megaphone.fm/RINTP3108857801": "Cognitive Revolution",
 }
+
+# Making Sense is a subscriber feed keyed by a personal uid, read from .env and never logged
+# (feed URLs are logged without their query string). If the feed returns HTML instead of RSS,
+# the uid has probably expired: refresh it from the samharris.org account.
+SAM_HARRIS_RSS_UID = (os.environ.get("SAM_HARRIS_RSS_UID") or "").strip()
+if SAM_HARRIS_RSS_UID:
+    SOURCE_FEEDS["https://samharris.org/subscriber-rss/?uid=" + SAM_HARRIS_RSS_UID] = "Making Sense with Sam Harris"
+else:
+    logging.info("SAM_HARRIS_RSS_UID not set: skipping the Making Sense with Sam Harris subscriber feed.")
 
 # ================================================================
 #                      Database Configuration
@@ -178,54 +174,10 @@ VALUES ({', '.join(['%s'] * NUM_DB_COLS)})
 ON CONFLICT (title_norm) DO NOTHING;
 """
 
-SKIP_INSERT_SQL = """
-INSERT INTO skipped_posts (post_id, title_norm, source_url)
-VALUES (%s, %s, %s)
-ON CONFLICT DO NOTHING;
-"""
-
-def record_skip(cur, post_id: str, title_norm: str, source_url: Optional[str]):
-    """Insert one row into skipped_posts (no commit)."""
-    cur.execute(SKIP_INSERT_SQL, (post_id, title_norm, source_url))
-
 # ================================================================
 #                          Utility Helpers
 # ================================================================
-
-def normalise_title(title: str) -> str:
-    """Normalizes a title string to match the database `title_norm` generation.
-
-    This involves:
-    1. Lowercasing the title.
-    2. Replacing one or more whitespace characters with a single space.
-    3. Stripping leading/trailing whitespace.
-    """
-    if not title: return ""
-    # 1. Lowercase
-    normalized = title.lower()
-    # 2. Replace multiple whitespace chars with a single space
-    normalized = re.sub(r'\s+', ' ', normalized)
-    # 3. Strip leading/trailing whitespace
-    normalized = normalized.strip()
-    return normalized
-
-def clean_title_for_storage(title: Optional[str]) -> Optional[str]:
-    """Create a stable display-safe title variant for the cleaned_title column."""
-    if not title:
-        return None
-    return re.sub(r'\s+', ' ', title).strip()
-
-def iso_to_dt(iso_string: Optional[str]) -> Optional[datetime]:
-    """Converts ISO 8601 string to timezone-aware datetime object (UTC)."""
-    if not iso_string: return None
-    try:
-        dt_obj = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
-        if dt_obj.tzinfo is None:
-            return dt_obj.replace(tzinfo=timezone.utc)
-        return dt_obj.astimezone(timezone.utc)
-    except (ValueError, TypeError) as e:
-        logging.warning(f"Could not parse ISO date string: '{iso_string}'. Error: {e}")
-        return None
+# normalise_title and record_skip live in common.py.
 
 def struct_time_to_dt(st: Optional[time.struct_time]) -> Optional[datetime]:
     """Converts feedparser's time.struct_time to timezone-aware datetime (UTC)."""
@@ -280,12 +232,18 @@ def extract_audio_url(entry):
     
     return None
 
+def redact_feed_url(text: str, feed_url: str) -> str:
+    """Remove a feed URL's query string (e.g. a subscriber uid) from text that is about to be logged."""
+    query = urlparse(feed_url).query
+    return text.replace(query, "<redacted>") if query else text
+
 def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
     """
     Simplified iterator: Fetches and yields basic info for each entry in an RSS feed.
     Handles feed parsing errors gracefully.
     """
-    logging.info(f"Fetching RSS feed: {source_name} ({feed_url})")
+    log_url = redact_feed_url(feed_url, feed_url)
+    logging.info(f"Fetching RSS feed: {source_name} ({log_url})")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8",
@@ -294,33 +252,46 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         "Cache-Control": "no-cache",
     }
     feed_data = None
+    status_code = 'N/A'
     try:
-        # Consider adding timeout via requests if feedparser hangs
-        feed_data = feedparser.parse(feed_url, request_headers=headers, agent=headers["User-Agent"])
+        # Fetch with requests (feedparser's built-in fetch has no timeout), then parse the bytes.
+        resp = requests.get(feed_url, headers=headers, timeout=RSS_TIMEOUT)
+        status_code = resp.status_code
+        resp.raise_for_status()
+        feed_data = parse_feed_response(resp)
         if feed_data.bozo:
              logging.warning(f"Feed '{source_name}' is not well-formed: {feed_data.bozo_exception}")
              # Continue processing if entries exist despite bozo flag
 
     except Exception as e:
-         logging.error(f"Fatal error fetching or parsing feed '{source_name}' ({feed_url}): {e}", exc_info=True)
+         # No exc_info: request tracebacks contain the full URL (and so any subscriber uid).
+         logging.error(f"Fatal error fetching or parsing feed '{source_name}' ({log_url}): {redact_feed_url(f'{type(e).__name__}: {e}', feed_url)}")
+         FEED_FETCH_FAILURES.append(source_name)
          return # Stop iteration for this feed on fatal error
 
     if not feed_data or not feed_data.entries:
-        status_code = feed_data.get('status', 'N/A') if feed_data else 'N/A'
-        logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', []))} entries.")
+        if feed_data and not feed_data.bozo and feed_data.get("feed"):
+            # Well-formed feed that simply has no items: nothing to do, not a failure.
+            logging.info(f"RSS feed for '{source_name}' is valid but has no entries.")
+            return
+        logging.warning(f"RSS feed for '{source_name}' is empty or could not be parsed fully. Status: {status_code}. Contains {len(feed_data.get('entries', [])) if feed_data else 0} entries.")
+        FEED_FETCH_FAILURES.append(source_name)
         return # Stop iteration if no entries
 
     logging.info(f"Found {len(feed_data.entries)} entries in feed '{source_name}'.")
     feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
     significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
     if feed_title and significant and not any(w in feed_title.lower() for w in significant):
-        logging.warning(f"FEED MISMATCH: configured '{source_name}' but the feed calls itself '{feed_title}' ({feed_url}). The feed may have moved.")
+        logging.warning(f"FEED MISMATCH: configured '{source_name}' but the feed calls itself '{feed_title}' ({log_url}). The feed may have moved.")
 
     for i, entry in enumerate(feed_data.entries):
         # --- Basic Data Extraction ---
         title = entry.get("title", "").strip()
         link = (entry.get("link") or "").strip()
         audio_url = extract_audio_url(entry)
+        if audio_url:
+            # feedparser resolves <link> against the feed URL but not enclosure URLs.
+            audio_url = urljoin(resp.url, audio_url)
         if not link:
             # Some feeds have no per-episode web page; fall back to the audio URL or GUID
             # so the episode is not silently dropped.
@@ -453,6 +424,9 @@ def make_serializable(obj):
         return repr(obj) # Represent as string
 
 def main():
+    """Returns EXIT_FAILED on a DB connection failure, when any feed could not be fetched or
+    parsed, or when something failed and nothing succeeded (no insert, no recorded skip);
+    otherwise EXIT_DONE."""
     start_time = time.time()
     print("================================================================")
     print(f"Starting Podcast Feed Ingestion Script at {datetime.now(timezone.utc)}")
@@ -479,22 +453,30 @@ def main():
     total_db_insert_failures = 0
     total_gate_errors = 0
     total_transcription_failures = 0
+    total_skip_write_failures = 0
+    fatal_error = False
 
     try:
         # -------- 1. Database Connection & Setup --------
         print("\n--- Connecting to Database ---")
         logging.info(f"Connecting to database...")
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = get_db_connection(register_vectors=True) # pgvector type handler registered
         conn.autocommit = False # Manual transaction control
-        register_vector(conn) # <-- ADDED for pgvector
         print("Database connection successful.")
         logging.info("Database connection successful.")
 
         # -------- 2. Fetch Existing Titles --------
         with conn.cursor() as cur:
-            print("Fetching existing normalized titles from database...")
-            cur.execute("SELECT title_norm FROM content WHERE title_norm IS NOT NULL") # Ensure not null
-            existing_title_norms = {row[0] for row in cur.fetchall() if row[0]} # Filter None just in case
+            print("Fetching existing normalized titles and URLs from database...")
+            cur.execute("SELECT title_norm, source_url, audio_url FROM content")
+            content_rows = cur.fetchall()
+            existing_title_norms = {row[0] for row in content_rows if row[0]} # Filter None just in case
+            # Dedup by source_url + audio_url first (catches renamed episodes), then by title_norm.
+            # One link can be a show homepage shared by many episodes, so keep every audio URL.
+            stored_audio_by_url = {}
+            for row in content_rows:
+                if row[1] and row[2]:
+                    stored_audio_by_url.setdefault(row[1], set()).add(row[2])
             print(f"--> Found {len(existing_title_norms):,} existing titles in the database.")
             logging.info(f"Fetched {len(existing_title_norms)} existing titles.")
 
@@ -556,6 +538,9 @@ def main():
                 # --- End DEBUG ---
 
                 # Check if already processed or known to be skipped
+                if is_duplicate_episode_url(link, entry_data.get('audio_url'), stored_audio_by_url):
+                    logging.debug(f"  SKIP (silent): source_url + audio_url of '{title[:70]}...' already in content.")
+                    continue
                 if title_norm in existing_title_norms or title_norm in already_skipped or post_id in skipped_post_ids:
                     logging.debug(f"  SKIP (silent): Normalized title '{title_norm[:70]}...' already in content or skipped_posts cache.")
                     # No counter increment for this type of skip, as it's a pre-existing state.
@@ -576,11 +561,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (empty title_norm) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post ID {post_id} (empty title_norm). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -593,11 +579,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (invalid date) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (invalid date). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
                 if published_dt < CUTOFF_DATE:
@@ -607,11 +594,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (before cutoff) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (before cutoff). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -629,11 +617,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (guardrail fail) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (guardrail fail). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue
 
@@ -654,9 +643,11 @@ def main():
                 # --- 3d. Attempt Transcription with Gemini ---
                 transcription_failed = False
                 if transcription_configured and audio_url:
-                    tr = transcribe_audio_gemini(audio_url, title)
+                    tr = transcribe_audio_gemini(audio_url, title)  # reuses cache/transcripts/ when present
                     transcript_text = tr.text if tr.ok else None
                     transcription_failed = (tr.status == "failed")
+                    if tr.ok and tr.truncated:
+                        logging.warning(f"  Transcript for '{title[:70]}' is truncated (output-token limit); ingesting the partial transcript.")
                     if transcription_failed:
                         logging.warning(f"  Transcription failed ({tr.reason}); episode will be retried next run.")
                 elif not audio_url:
@@ -718,11 +709,12 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                         logging.debug(f"  Recorded skip for '{title_norm[:70]}...' (no usable content) and added to already_skipped cache.")
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for post '{title_norm[:70]}...' (no usable content). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     posts_skipped_in_feed += 1
                     continue # Skip AI analysis and DB insertion
 
@@ -739,10 +731,11 @@ def main():
                             record_skip(skip_cur, post_id, title_norm, link)
                         conn.commit()
                         already_skipped.add(title_norm); skipped_post_ids.add(post_id)
+                        total_skipped_count += 1
                     except (psycopg2.DatabaseError, Psycopg2OpError) as db_err_skip:
                         logging.error(f"  DB ERROR: Failed to record skip for '{title_norm[:70]}...' (content filter). Error: {db_err_skip}", exc_info=False)
                         if conn: conn.rollback()
-                    total_skipped_count += 1
+                        total_skip_write_failures += 1
                     total_failed_analysis_count += 1
                     continue
                 except (LLMError, ValueError) as e:
@@ -814,6 +807,8 @@ def main():
                         # Add to set to prevent reprocessing duplicates later in this run
                         # even if ON CONFLICT ignored the insert.
                         existing_title_norms.add(title_norm)
+                        if audio_url:
+                            stored_audio_by_url.setdefault(link, set()).add(audio_url)
                         successful_insertions_in_feed += 1 # Increment feed-specific counter
                 except (psycopg2.DatabaseError, Psycopg2OpError) as db_err:
                     logging.error(f"  DB ERROR: Failed to insert post '{title[:70]}...' (ID: {post_id}). Error: {db_err}", exc_info=False) # Keep log concise
@@ -842,6 +837,7 @@ def main():
     except Psycopg2OpError as e:
         logging.critical(f"FATAL: Database connection failed: {e}", exc_info=True)
         print(f"FATAL ERROR: Database connection failed: {e}")
+        fatal_error = True
     except KeyboardInterrupt:
          logging.warning("KeyboardInterrupt received. Attempting graceful shutdown.")
          print("\nKeyboard interrupt detected. Shutting down...")
@@ -861,7 +857,17 @@ def main():
         print(f"Gate unavailable (retry later):   {total_gate_errors}")
         print(f"Transcription failed (retry later): {total_transcription_failures}")
         print(f"DB insert failures:               {total_db_insert_failures}")
+        print(f"Skip writes failed:               {total_skip_write_failures}")
+        print(f"Feeds failed to fetch/parse:      {len(FEED_FETCH_FAILURES)} {FEED_FETCH_FAILURES or ''}")
         print(f"Elapsed:                          {time.time() - start_time:.0f}s")
+
+    succeeded = total_inserted_count + total_skipped_count
+    failed = (total_failed_analysis_count + total_gate_errors + total_transcription_failures
+              + total_db_insert_failures + total_skip_write_failures)
+    if fatal_error or FEED_FETCH_FAILURES or (failed and not succeeded):
+        print("EXIT: stage FAILED (database error, a feed could not be fetched, or every episode needing work failed).")
+        return EXIT_FAILED
+    return EXIT_DONE
 
 if __name__ == "__main__":
     import argparse
@@ -872,4 +878,4 @@ if __name__ == "__main__":
     if _args.max_inserts_per_feed:
         TARGET_INSERTIONS_PER_FEED = _args.max_inserts_per_feed
     MAX_FEEDS = _args.max_feeds
-    main()
+    sys.exit(main())
