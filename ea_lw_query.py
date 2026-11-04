@@ -49,7 +49,8 @@ from llm_common import (
 # Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
 from common import (
     EXIT_DONE, EXIT_FAILED,
-    disable_unreachable_local_proxies, get_db_connection, iso_to_dt, normalise_title, record_skip,
+    disable_unreachable_local_proxies, get_db_connection, is_bot_checkpoint, iso_to_dt,
+    normalise_title, record_skip,
 )
 
 # --- Essential Environment Variables ---
@@ -81,6 +82,13 @@ LW_AI_SAFETY_TAG_ID = "yBXKqk8wEg6eM8w5y"
 
 
 DEFAULT_LIMIT = 3000 # Max posts to fetch per source initially
+
+# get_forum_posts() result when the site serves a bot checkpoint instead of the API.
+# As of 2026-11 the EA Forum puts a Vercel "Security Checkpoint" in front of every
+# scripted request (GraphQL and RSS alike), so no query parameters get through; the
+# forum team would have to allow this client. A blocked source is skipped and logged
+# as BLOCKED, but doesn't fail the stage on its own.
+FORUM_BLOCKED = object()
 BATCH_SIZE    = 3   # Rows per database INSERT batch
 
 # Ingest only posts published on/after this date (UTC, inclusive)
@@ -190,7 +198,7 @@ POST_FIELDS = """
   }
 """
 
-def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAULT_LIMIT) -> list[dict]:
+def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAULT_LIMIT):
     """
     Queries a forum's GraphQL API for posts.
 
@@ -203,8 +211,9 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
         limit: The maximum number of posts to retrieve.
 
     Returns:
-        A list of post dictionaries (possibly empty), or None if the fetch
-        failed (the caller reports that as a stage failure).
+        A list of post dictionaries (possibly empty), None if the fetch
+        failed (the caller reports that as a stage failure), or FORUM_BLOCKED
+        if the site answered with a bot checkpoint.
     """
     # Determine the view clause based on whether a tag_id is provided
     if tag_id:
@@ -251,6 +260,12 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
         for attempt in range(max_retries):
             try:
                 response = requests.post(api_url, json={"query": query}, headers=headers, timeout=90)
+
+                # A bot checkpoint isn't a rate limit: retrying only burns minutes.
+                if is_bot_checkpoint(response):
+                    logging.warning(f"{source_desc} BLOCKED by the site's bot checkpoint (HTTP {response.status_code}); skipping it this run.")
+                    print(f"WARNING: {source_desc} BLOCKED by the site's bot checkpoint (HTTP {response.status_code}); skipping it this run.")
+                    return FORUM_BLOCKED
 
                 # Handle rate limiting with retry
                 if response.status_code == 429:
@@ -522,15 +537,19 @@ def main(limit: int | None = None):
     lw_raw = get_forum_posts(LW_API_URL, LW_AI_SAFETY_TAG_ID, limit=DEFAULT_LIMIT)
     # Alignment Forum posts arrive via the LessWrong query with af=true (see filter_lw_posts).
     # The separate AF endpoint was rate-limited on every run and is no longer queried.
-    fetch_failed = [name for name, raw in (("EA Forum", ea_raw), ("LessWrong", lw_raw)) if raw is None]
+    fetched = (("EA Forum", ea_raw), ("LessWrong", lw_raw))
+    fetch_failed = [name for name, raw in fetched if raw is None]
+    blocked = [name for name, raw in fetched if raw is FORUM_BLOCKED]
     if fetch_failed:
         # Keep going with whatever was fetched; the run still exits non-zero at the end.
         print(f"ERROR: fetch failed for {', '.join(fetch_failed)}; continuing with the other source.")
+    if blocked:
+        print(f"WARNING: {', '.join(blocked)} BLOCKED by a bot checkpoint; skipped this run (not a stage failure).")
 
     # -------- 2. Filter Data --------
     print("\n--- Filtering Posts ---")
-    ea_posts = filter_ea_posts(ea_raw or [], EA_AI_SAFETY_TAG_ID)
-    lw_posts = filter_lw_posts(lw_raw or [])
+    ea_posts = filter_ea_posts(ea_raw if isinstance(ea_raw, list) else [], EA_AI_SAFETY_TAG_ID)
+    lw_posts = filter_lw_posts(lw_raw if isinstance(lw_raw, list) else [])
 
     # -------- 3. Combine & Deduplicate --------
     combined_filtered_posts = ea_posts + lw_posts

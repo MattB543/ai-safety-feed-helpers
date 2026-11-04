@@ -57,7 +57,7 @@ NOTABLE = re.compile(
     r"DB rows affected|Rows inserted|Entries examined|Analysis/embedding failures|Gate unavailable|"
     r"Transcription failed|DB insert failures|Total execution time|Elapsed:|rows need embeddings|"
     r"Done: \d+ updated|nothing to backfill|Fetched \d+ refs|Finished processing|all caught up|Leaving row|"
-    r"failed \d\+ times|truncated|cached transcript"
+    r"failed \d\+ times|truncated|cached transcript|BLOCKED"
 )
 CHATTY = re.compile(r"Processing Post:|DB insert OK|SUCCESS: DB insert|Analysis complete:|AI analysis finished|score=")
 CHATTY_EVERY = 25

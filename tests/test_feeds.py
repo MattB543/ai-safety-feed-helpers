@@ -52,3 +52,20 @@ def test_valid_empty_feed_is_distinguishable_from_html():
     assert not empty.entries and not empty.bozo and empty.get("feed")
     html = parse_feed_response(_HtmlResponse())
     assert not html.entries and (html.bozo or not html.get("feed"))
+
+
+class _Resp:
+    def __init__(self, status, ctype, text="", extra=None):
+        self.status_code, self.text = status, text
+        self.headers = {"Content-Type": ctype, **(extra or {})}
+
+
+def test_bot_checkpoint_is_not_a_rate_limit():
+    from common import is_bot_checkpoint
+    page = "<!DOCTYPE html><html><head><title>Vercel Security Checkpoint</title></head></html>"
+    assert is_bot_checkpoint(_Resp(429, "text/html; charset=utf-8", page))
+    assert is_bot_checkpoint(_Resp(403, "text/plain", "", {"x-vercel-mitigated": "challenge"}))
+    # A real rate limit (JSON or plain) still goes through the normal retry path.
+    assert not is_bot_checkpoint(_Resp(429, "application/json", '{"error":"rate limited"}'))
+    assert not is_bot_checkpoint(_Resp(429, "text/html", "<html>Too Many Requests</html>"))
+    assert not is_bot_checkpoint(_Resp(200, "text/html", page))

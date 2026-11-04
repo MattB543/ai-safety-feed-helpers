@@ -286,6 +286,18 @@ def parse_feed_response(resp):
     return feedparser.parse(resp.content, response_headers=headers)
 
 
+def is_bot_checkpoint(resp) -> bool:
+    """True if resp is a CDN bot-challenge page (e.g. Vercel's "Security Checkpoint", which
+    the EA Forum has served to scripts since Nov 2026) rather than a real API answer.
+    Retrying doesn't help: the site has to allow the client."""
+    if resp.status_code not in (403, 429):
+        return False
+    if resp.headers.get("x-vercel-mitigated") == "challenge":
+        return True
+    return ("text/html" in resp.headers.get("Content-Type", "")
+            and "Security Checkpoint" in resp.text[:5000])
+
+
 def is_duplicate_episode_url(link: str | None, audio_url: str | None, stored_audio_by_url: dict) -> bool:
     """
     True if a podcast entry's link is already stored as some row's source_url AND one of the
