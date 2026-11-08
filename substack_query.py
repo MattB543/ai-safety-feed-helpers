@@ -357,24 +357,28 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
         )
     }
-    offset = 0
+    list_url = f"https://{slug}/api/v1/archive"
+    # Since Nov 2026 this endpoint pages with nextCursor and rejects `offset` with a 400.
+    params = {"sort": "new", "limit": batch}
+    page = 1
     while True:
-        list_url = f"https://{slug}/api/v1/archive?sort=new&search=&offset={offset}&limit={batch}"
         # Remove debug logging here
         try:
-            page_response = requests.get(list_url, timeout=45, headers=headers)
+            page_response = requests.get(list_url, params=params, timeout=45, headers=headers)
             page_response.raise_for_status()
             json_response = page_response.json()
+            next_cursor = None
             if isinstance(json_response, list):
                 stubs = json_response
             elif isinstance(json_response, dict):
                 stubs = json_response.get("posts", [])
+                next_cursor = json_response.get("nextCursor")
             else:
-                logging.warning(f"Unexpected JSON response type ({type(json_response).__name__}) for '{slug}' at offset {offset}. Assuming empty.")
+                logging.warning(f"Unexpected JSON response type ({type(json_response).__name__}) for '{slug}' on page {page}. Assuming empty.")
                 stubs = []
             time.sleep(1)  # Shorter delay for list fetching
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            logging.error(f"Failed fetching/decoding archive page for '{slug}' at offset {offset}: {e}")
+            logging.error(f"Failed fetching/decoding archive page for '{slug}' on page {page}: {e}")
             raise
 
         if not stubs:
@@ -395,10 +399,11 @@ def iter_substack_archive_stubs(slug: str, cutoff: datetime, batch: int = 35):
 
             yield stub
 
-        if reached_cutoff:
+        if reached_cutoff or not next_cursor:
             break
 
-        offset += len(stubs)
+        params["cursor"] = next_cursor
+        page += 1
 
 def fetch_single_post(slug: str, stub: dict, headers: dict):
     """
