@@ -286,10 +286,23 @@ def parse_feed_response(resp):
     return feedparser.parse(resp.content, response_headers=headers)
 
 
+EA_FORUM_HOST = "forum.effectivealtruism.org"
+EA_FORUM_BOT_HOST = "forum-bots.effectivealtruism.org"
+
+
+def canonicalize_ea_post(post: dict) -> None:
+    """Point a post fetched from the EA Forum's bot mirror back at the real forum. The
+    mirror writes its own host into pageUrl and body links; stored source_urls must keep
+    the canonical host so readers land on the forum and dedup matches existing rows."""
+    for field in ("pageUrl", "htmlBody"):
+        if post.get(field):
+            post[field] = post[field].replace(EA_FORUM_BOT_HOST, EA_FORUM_HOST)
+
+
 def is_bot_checkpoint(resp) -> bool:
     """True if resp is a CDN bot-challenge page (e.g. Vercel's "Security Checkpoint", which
-    the EA Forum has served to scripts since Nov 2026) rather than a real API answer.
-    Retrying doesn't help: the site has to allow the client."""
+    the EA Forum's main host has served to scripts since Nov 2026) rather than a real API
+    answer. Retrying doesn't help: the site has to allow the client."""
     if resp.status_code not in (403, 429):
         return False
     if resp.headers.get("x-vercel-mitigated") == "challenge":

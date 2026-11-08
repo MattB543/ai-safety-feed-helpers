@@ -69,3 +69,17 @@ def test_bot_checkpoint_is_not_a_rate_limit():
     assert not is_bot_checkpoint(_Resp(429, "application/json", '{"error":"rate limited"}'))
     assert not is_bot_checkpoint(_Resp(429, "text/html", "<html>Too Many Requests</html>"))
     assert not is_bot_checkpoint(_Resp(200, "text/html", page))
+
+
+def test_ea_mirror_links_are_rewritten_to_the_forum():
+    from common import canonicalize_ea_post
+    post = {"pageUrl": "https://forum-bots.effectivealtruism.org/posts/abc/title",
+            "htmlBody": '<a href="https://forum-bots.effectivealtruism.org/posts/def/x">x</a>'
+                        '<a href="https://example.com/forum-bots">y</a>'}
+    canonicalize_ea_post(post)
+    assert post["pageUrl"] == "https://forum.effectivealtruism.org/posts/abc/title"
+    assert post["htmlBody"] == ('<a href="https://forum.effectivealtruism.org/posts/def/x">x</a>'
+                                '<a href="https://example.com/forum-bots">y</a>')
+    empty = {"pageUrl": "https://forum.effectivealtruism.org/posts/z", "htmlBody": None}
+    canonicalize_ea_post(empty)
+    assert empty["pageUrl"].startswith("https://forum.effectivealtruism.org/") and empty["htmlBody"] is None

@@ -49,8 +49,8 @@ from llm_common import (
 # Shared non-LLM helpers (DB connection, title_norm, skips, dates, proxy cleanup).
 from common import (
     EXIT_DONE, EXIT_FAILED,
-    disable_unreachable_local_proxies, get_db_connection, is_bot_checkpoint, iso_to_dt,
-    normalise_title, record_skip,
+    canonicalize_ea_post, disable_unreachable_local_proxies, get_db_connection,
+    is_bot_checkpoint, iso_to_dt, normalise_title, record_skip,
 )
 
 # --- Essential Environment Variables ---
@@ -74,7 +74,9 @@ disable_unreachable_local_proxies()
 # ================================================================
 #                     Forum‑specific constants
 # ================================================================
-EA_API_URL = "https://forum.effectivealtruism.org/graphql"
+# The EA Forum's read-only mirror "intended for bots and agents" (its robots.txt). The main
+# host answers scripted requests with a bot checkpoint. See canonicalize_ea_post for links.
+EA_API_URL = "https://forum-bots.effectivealtruism.org/graphql"
 EA_AI_SAFETY_TAG_ID = "oNiQsBHA3i837sySD"
 
 LW_API_URL = "https://www.lesswrong.com/graphql"
@@ -83,11 +85,9 @@ LW_AI_SAFETY_TAG_ID = "yBXKqk8wEg6eM8w5y"
 
 DEFAULT_LIMIT = 3000 # Max posts to fetch per source initially
 
-# get_forum_posts() result when the site serves a bot checkpoint instead of the API.
-# As of 2026-11 the EA Forum puts a Vercel "Security Checkpoint" in front of every
-# scripted request (GraphQL and RSS alike), so no query parameters get through; the
-# forum team would have to allow this client. A blocked source is skipped and logged
-# as BLOCKED, but doesn't fail the stage on its own.
+# get_forum_posts() result when the site serves a bot checkpoint instead of the API
+# (a Vercel "Security Checkpoint" page; no query parameters get past one). A blocked
+# source is skipped and logged as BLOCKED, but doesn't fail the stage on its own.
 FORUM_BLOCKED = object()
 BATCH_SIZE    = 3   # Rows per database INSERT batch
 
@@ -370,6 +370,8 @@ def filter_ea_posts(posts: list[dict], tag_id: str) -> list[dict]:
         if not p or not p.get('pageUrl') or not p.get('postedAt'):
             logging.debug(f"Skipping EA post due to missing essential fields: {p.get('_id', 'N/A')}")
             continue
+
+        canonicalize_ea_post(p)
 
         # 1. Filter by date
         posted_at_dt = iso_to_dt(p.get("postedAt"))
