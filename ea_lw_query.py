@@ -294,7 +294,8 @@ def get_forum_posts(api_url: str, tag_id: str | None = None, limit: int = DEFAUL
                     return None
 
                 # Check for expected data structure
-                if "data" not in result or "posts" not in result["data"] or "results" not in result["data"]["posts"]:
+                if ("data" not in result or "posts" not in result["data"] or "results" not in result["data"]["posts"]
+                        or not isinstance(result["data"]["posts"]["results"], list)):
                      logging.warning(f"Unexpected response structure from {source_desc}. 'data.posts.results' not found.")
                      print(f"WARNING: Unexpected response structure from {source_desc}. Check logs.")
                      # Log the actual data received for debugging
