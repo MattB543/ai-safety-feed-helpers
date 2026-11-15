@@ -120,9 +120,10 @@ SOURCE_FEEDS = {
     "https://feeds.fame.so/ai-government-and-the-future": "AI, Government, and the Future",
     "https://feeds.feedburner.com/80000HoursPodcast": "80,000 Hours Podcast",
     "https://api.substack.com/feed/podcast/69345.rss": "Dwarkesh Podcast",
-    "https://axrp.net/feed.xml": "AXRP",
     "https://anchor.fm/s/1e4a0eac/podcast/rss": "Machine Learning Street Talk",
-    "https://futureoflife.org/podcast/feed/": "FLI Podcast",
+    # The show's Transistor feed (iTunes feedUrl). futureoflife.org/podcast/feed/ is the
+    # WordPress post feed: no audio and empty bodies, so every episode became a permanent skip.
+    "https://feeds.transistor.fm/future-of-life-institute-podcast-4e4d1fa5-a878-4cb2-91be-91c3ce266dfd": "FLI Podcast",
     "https://lexfridman.com/feed/podcast/": "Lex Fridman Podcast",
     "https://anchor.fm/s/ebbe3a98/podcast/rss": "For Humanity: An AI Safety Podcast",
     "https://podcast.clearerthinking.org/rss.xml": "Clearer Thinking",
@@ -279,6 +280,13 @@ def iter_rss_feed(feed_url: str, source_name: str) -> Dict[str, Any]:
         return # Stop iteration if no entries
 
     logging.info(f"Found {len(feed_data.entries)} entries in feed '{source_name}'.")
+    if not any(extract_audio_url(e) for e in feed_data.entries):
+        # A podcast feed where nothing has audio is almost certainly the wrong URL (e.g. a
+        # site's blog/post feed). Processing it would record every episode as a permanent skip.
+        logging.warning(f"NO AUDIO: none of the {len(feed_data.entries)} entries in '{source_name}' has an audio URL "
+                        f"({log_url}); probably not the podcast feed. Skipping the feed and failing the stage.")
+        FEED_FETCH_FAILURES.append(source_name)
+        return
     feed_title = (feed_data.feed.get("title") or "").strip() if getattr(feed_data, "feed", None) else ""
     significant = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", source_name)]
     if feed_title and significant and not any(w in feed_title.lower() for w in significant):
